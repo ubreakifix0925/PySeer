@@ -101,6 +101,12 @@ spd support transform type vip is_fly is_ride
 
 后端 `/api/pets/move`：`kind='storage'`→发 **2304**(PET_RELEASE) 取仓库到背包（位置码 1→第一/2→第二）；`kind='bag'`→发 **41462**(换位) `[fromSort,catchTime,toSort,0]`（目标空位 catchTime=0）。
 
+### 脚本页（第三个页签“脚本”）
+- **左侧**：展示默认脚本目录（`webui.py` 同目录下的 `scripts/`，`SCRIPTS_DIR`）里的所有 `.py` 脚本，点击选中后点“运行选中脚本”即可后台启动（`subprocess` 子进程，`PYTHONPATH` 已含项目根目录，可 `import seerlib`）；脚本的 stdout/stderr 实时打进日志，运行中可点“停止脚本”。
+- **右侧**：原登录页的“③ 发包测试”与“② 日志输出”板块整体移到这里（左半放脚本列表，右半放发包/日志），登录页仅保留“① 登录操作”。
+- **自动跳转**：登录成功后（状态 `ready`）自动切换到“脚本”页。
+- 后端接口：`GET /api/scripts`（列目录+是否运行中）、`POST /api/scripts/run`（{name}，含路径穿越校验）、`POST /api/scripts/stop`。
+
 ---
 
 ## 5. 脚本库 `seerlib.py`（供赛尔号脚本用）

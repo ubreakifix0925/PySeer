@@ -51,6 +51,11 @@ _CMDMAP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cmdmap.
 _ADDR_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "webui_addr.json")
 _HEAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "refs", "head")  # 精灵头像(按物种id)目录
 _EFFECT_ICON_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "refs", "effecticon")  # 魂印/效果图标目录
+# "脚本"页左侧默认脚本存放路径: 用户把 .py 脚本放进该目录即可在页面选择运行
+SCRIPTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts")
+
+# 当前正在运行的用户脚本子进程 (供"脚本"页启动/停止)
+_SCRIPT_PROC = None
 
 _SEQ = 0  # 日志单调递增序号, 前端按它去重
 _FILTER_DEFAULT = {40002, 2192, 41228, 4047, 4475, 41080, 9134, 2604, 9019,
@@ -402,6 +407,73 @@ def _start_listener(client):
     threading.Thread(target=_loop, daemon=True, name="seer-listen").start()
 
 
+# ---- "脚本"页: 默认脚本目录的列出与运行 ----
+def list_scripts():
+    """列出默认脚本目录(SCRIPTS_DIR)下的所有 .py 脚本文件名."""
+    try:
+        os.makedirs(SCRIPTS_DIR, exist_ok=True)
+        return sorted(f for f in os.listdir(SCRIPTS_DIR)
+                      if f.endswith(".py") and os.path.isfile(os.path.join(SCRIPTS_DIR, f)))
+    except OSError as e:
+        log("error", f"读取脚本目录失败: {e}")
+        return []
+
+
+def _script_env():
+    """构造脚本子进程环境: 把项目根目录放进 PYTHONPATH, 使脚本可 import seerlib."""
+    env = dict(os.environ)
+    proj = os.path.dirname(os.path.abspath(__file__))
+    env["PYTHONPATH"] = proj + os.pathsep + (env.get("PYTHONPATH") or "")
+    return env
+
+
+def _run_script(name, path):
+    """后台线程: 用 subprocess 运行选中脚本, 把 stdout/stderr 实时打进日志."""
+    global _SCRIPT_PROC
+    import subprocess, sys
+    log("info", f"▶ 开始运行脚本 {name} ...")
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, path],
+            cwd=SCRIPTS_DIR,
+            env=_script_env(),
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1, encoding="utf-8", errors="replace",
+        )
+        _SCRIPT_PROC = proc
+        if proc.stdout:
+            for line in proc.stdout:
+                line = line.rstrip("\n")
+                if line:
+                    log("script", f"[{name}] {line}")
+        rc = proc.wait()
+        log("info", f"✔ 脚本 {name} 结束, 退出码 {rc}")
+    except Exception as e:
+        log("error", f"运行脚本 {name} 出错: {e}")
+    finally:
+        _SCRIPT_PROC = None
+
+
+def _stop_script():
+    """终止当前正在运行的脚本子进程 (若有)."""
+    global _SCRIPT_PROC
+    proc = _SCRIPT_PROC
+    if proc is not None and proc.poll() is None:
+        try:
+            proc.terminate()
+            try:
+                proc.wait(timeout=3)
+            except Exception:
+                proc.kill()
+            log("info", "已停止脚本")
+            return True
+        except Exception as e:
+            log("error", f"停止脚本失败: {e}")
+            return False
+    log("info", "当前无脚本在运行")
+    return False
+
+
 # ---- 登录线程 ----
 def run_login(account, password, host, port, session=None):
     set_status("logging_in", "正在连接...", account=account)
@@ -670,6 +742,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, "image/png", data)
             else:
                 self._send(404, "text/plain", b"not found")
+        elif path == "/api/scripts":
+            # "脚本"页: 默认脚本目录下的脚本列表 + 当前是否在运行
+            running = _SCRIPT_PROC is not None and _SCRIPT_PROC.poll() is None
+            self._send(200, "application/json",
+                       json.dumps({"ok": True, "dir": SCRIPTS_DIR,
+                                   "scripts": list_scripts(), "running": running},
+                                  ensure_ascii=False).encode("utf-8"))
         elif path == "/api/stream":
             self.handle_sse()
         else:
@@ -1081,6 +1160,24 @@ class Handler(BaseHTTPRequestHandler):
             log("info", f"已更新并保存过滤包id名单: {sorted(_FILTER_IDS)}")
             return self._send_json({"ok": True, "ids": sorted(_FILTER_IDS)})
 
+        elif path == "/api/scripts/run":
+            # 运行默认脚本目录下的一个 .py 脚本 (后台子进程, 输出实时进日志)
+            name = str(data.get("name", "")).strip()
+            if not name:
+                return self._send_json({"ok": False, "error": "缺少脚本名"}, 400)
+            base = os.path.realpath(SCRIPTS_DIR)
+            target = os.path.realpath(os.path.join(SCRIPTS_DIR, name))
+            if os.path.commonpath([base, target]) != base or not os.path.isfile(target):
+                return self._send_json({"ok": False, "error": "非法或不存在脚本"}, 400)
+            if _SCRIPT_PROC is not None and _SCRIPT_PROC.poll() is None:
+                return self._send_json({"ok": False, "error": "已有脚本在运行"}, 400)
+            threading.Thread(target=_run_script, args=(name, target), daemon=True).start()
+            return self._send_json({"ok": True, "name": name})
+
+        elif path == "/api/scripts/stop":
+            # 停止当前正在运行的脚本子进程
+            return self._send_json({"ok": True, "stopped": _stop_script()})
+
         return self._send_json({"ok": False, "error": "unknown"}, 404)
 
 
@@ -1104,7 +1201,7 @@ PAGE = r"""<!DOCTYPE html>
  input[type=text],input[type=password],input[type=number],textarea{width:100%;padding:6px 8px;background:#0d1117;border:1px solid #30363d;color:#d8dee9;border-radius:6px;font:12px/1.4 Menlo,monospace}
  button{margin:8px 6px 0 0;padding:6px 12px;background:#238636;border:0;color:#fff;border-radius:6px;cursor:pointer;font-size:12px}
  button.off{background:#6e7681} button:disabled{opacity:.5;cursor:not-allowed}
- #log{width:100%;min-height:340px;height:calc(100vh - 470px);overflow:auto;background:#0d1117;padding:8px;border:1px solid #30363d;border-radius:6px;font:12px/1.5 Menlo,monospace;white-space:pre-wrap}
+ #log{width:100%;min-height:180px;max-height:56vh;overflow:auto;background:#0d1117;padding:8px;border:1px solid #30363d;border-radius:6px;font:12px/1.5 Menlo,monospace;white-space:pre-wrap}
  .lvl-info{color:#9aa5b1}.lvl-ok{color:#3fb950}.lvl-packet{color:#58a6ff}.lvl-error{color:#f85149}.lvl-tip{color:#d29922}.lvl-status{color:#e3b341}
  #resp{width:100%;min-height:120px;background:#0d1117;padding:8px;border:1px solid #30363d;border-radius:6px;font:12px Menlo,monospace;color:#a5d6a7}
  .rowflex{display:flex;gap:6px}.rowflex>*{flex:1}
@@ -1118,6 +1215,9 @@ PAGE = r"""<!DOCTYPE html>
  .tabs .tab.active{background:#0e1117;color:#58a6ff;border-color:#58a6ff}
  .tab-panel{display:none}
  .tab-panel.active{display:block}
+.script-item{display:block;width:100%;text-align:left;padding:6px 8px;border:0;border-bottom:1px solid #21262d;background:transparent;color:#d8dee9;font:12px Menlo,monospace;cursor:pointer}
+.script-item:hover{background:#1c2533}
+.script-item.sel{background:#1f2937;color:#58a6ff}
  .bagwrap{display:flex;gap:12px;padding:12px}
  .avrow{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin:0 0 12px}
  .av-btn{display:block;min-width:0;margin:0;padding:6px;background:#21262d;border:1px solid #30363d;border-radius:8px;text-align:center;cursor:pointer;color:#d8dee9;overflow:hidden;font:12px Menlo,monospace;line-height:1.2;touch-action:none;-webkit-tap-highlight-color:transparent}
@@ -1177,10 +1277,11 @@ PAGE = r"""<!DOCTYPE html>
 <div class="tabs">
   <button class="tab active" data-tab="login">登录</button>
   <button class="tab" data-tab="bag">背包</button>
+  <button class="tab" data-tab="scripts">脚本</button>
 </div>
 <div id="tab-login" class="tab-panel active">
 <main>
-  <div class="card" style="flex:1.2">
+  <div class="card" style="flex:1.2;max-width:560px">
     <h2>① 登录操作</h2>
     <label>米米号(账号)<sup style="color:#f85149">*</sup> <span style="color:#8b949e">可下拉选择已保存的</span></label>
     <input id="account" type="text" list="credList" placeholder="输入 或 选择已保存的米米号" autofocus>
@@ -1193,59 +1294,7 @@ PAGE = r"""<!DOCTYPE html>
     <button id="loginBtn">登录</button><button id="discBtn" class="off" disabled>断开</button>
     <button id="delCredBtn" class="off" style="display:none">删除已选账号</button>
   </div>
-
-  <div class="card" style="flex:1.4">
-    <h2>③ 发包测试</h2>
-    <label>命令（全部）<sup style="color:#888">选一个跳到下面</sup></label>
-    <select id="cmdRef"><option value="">— 从全部 2910 条命令中选择 —</option></select>
-    <label>命令号 / 名字（可输入过滤）</label><input id="cmd" type="text" list="cmdList" placeholder="如 40001 或 ENTER_MAP" value="40001">
-    <datalist id="cmdList"></datalist>
-    <label>包体参数（十进制，逗号/空格分隔）<sup style="color:#888">自动转标准包体</sup></label>
-    <input id="body" type="text" placeholder="十进制参数, 逗号/空格分隔; 可留空(空包体)。如 0 10 725 172  → 000000000000000A000002D5000000A0" value="">
-    <div class="rowflex" style="align-items:center;gap:8px">
-      <label style="margin:0"><input id="rawHex" type="checkbox"> 原样HEX</label>
-      <div style="margin-left:auto"><label style="margin:0">预览</label><code id="bodyPrev" style="display:inline-block;margin-left:6px;padding:2px 6px;background:#0d1117;border:1px solid #30363d;border-radius:4px;color:#79c0ff;font:11px Menlo,monospace;word-break:break-all">—</code></div>
-    </div>
-    <button id="sendBtn" disabled>发送</button>
-    <button id="petbagBtn" class="off" disabled title="发送命令 43706 GET_PET_INFO_BY_ONCE, 查询背包内所有精灵(含能力值)">查询背包精灵(43706)</button>
-    <div style="margin-top:8px"><label>服务器响应（实时，内容可选中复制；受过滤包id/收发复选框约束）</label>
-      <div id="sendStatus" style="font-size:12px;color:#8b949e;margin:2px 0 6px">—</div>
-      <div id="pktWrap" style="max-height:240px;overflow:auto;border:1px solid #30363d;border-radius:6px;background:#0d1117">
-        <table id="pktTable" style="width:100%;table-layout:fixed;border-collapse:collapse;font:12px Menlo,monospace;user-select:text;cursor:text">
-          <colgroup>
-            <col style="width:60px">
-            <col style="width:84px">
-            <col style="width:26%">
-            <col>
-          </colgroup>
-          <thead>
-            <tr style="text-align:left;background:#161b22">
-              <th style="padding:4px 8px;border:1px solid #30363d">类型</th>
-              <th style="padding:4px 8px;border:1px solid #30363d">命令号</th>
-              <th style="padding:4px 8px;border:1px solid #30363d">包体(hex)</th>
-              <th style="padding:4px 8px;border:1px solid #30363d">十进制数组</th>
-            </tr>
-          </thead>
-          <tbody id="pktBody"></tbody>
-        </table>
-      </div>
-    </div>
-  </div>
 </main>
-
-<div style="padding:0 12px 12px">
-  <div class="card">
-    <h2>② 日志输出 (实时) <button id="clearLogBtn" class="off" style="float:right;margin:0;padding:2px 10px;font-size:12px">清空输出</button></h2>
-    <div class="filterbar">
-      <label style="margin:0">过滤包id</label>
-      <input id="filterIds" type="text" spellcheck="false" placeholder="逗号分隔, 如 40002,2192,41228,4047,4475,41080,9134,2604,9019,2101,2004,3405,2601,2002,43321,1002,9908">
-      <label style="margin:0"><input id="chkSend" type="checkbox" checked> 接收send</label>
-      <label style="margin:0"><input id="chkRecv" type="checkbox" checked> 接收recv</label>
-      <button id="applyFilterBtn" class="off" style="margin:0;padding:2px 10px;font-size:12px">应用过滤</button>
-    </div>
-    <div id="log"></div>
-  </div>
-</div>
 </div><!-- /tab-login -->
 
 <div id="tab-bag" class="tab-panel">
@@ -1291,6 +1340,73 @@ PAGE = r"""<!DOCTYPE html>
     <div id="skillModalBody" style="font-size:12px;color:#d8dee9"></div>
   </div>
 </div>
+
+<div id="tab-scripts" class="tab-panel">
+  <div style="display:flex;gap:12px;padding:12px;align-items:flex-start;flex-wrap:nowrap">
+    <!-- 左半: 默认脚本目录下的脚本列表 (可选择运行) -->
+    <div class="card" style="flex:1;min-width:280px">
+      <h2>脚本 <button id="scriptRefreshBtn" class="off" style="float:right;margin:0;padding:2px 10px;font-size:12px">刷新</button></h2>
+      <div id="scriptDir" style="font-size:11px;color:#8b949e;margin:0 0 8px;word-break:break-all">—</div>
+      <div id="scriptList" style="max-height:56vh;overflow:auto;border:1px solid #30363d;border-radius:6px;background:#0d1117">
+        <div style="color:#8b949e;padding:8px">等待加载...</div>
+      </div>
+      <button id="scriptRunBtn" disabled>运行选中脚本</button>
+      <button id="scriptStopBtn" class="off" style="display:none">停止脚本</button>
+      <div id="scriptStatus" style="font-size:12px;color:#8b949e;margin-top:6px">—</div>
+    </div>
+    <!-- 右半: 发包测试 + 日志输出 -->
+    <div style="flex:1.6;min-width:400px;display:flex;flex-direction:column;gap:12px">
+      <div class="card">
+        <h2>③ 发包测试</h2>
+        <label>命令（全部）<sup style="color:#888">选一个跳到下面</sup></label>
+        <select id="cmdRef"><option value="">— 从全部 2910 条命令中选择 —</option></select>
+        <label>命令号 / 名字（可输入过滤）</label><input id="cmd" type="text" list="cmdList" placeholder="如 40001 或 ENTER_MAP" value="40001">
+        <datalist id="cmdList"></datalist>
+        <label>包体参数（十进制，逗号/空格分隔）<sup style="color:#888">自动转标准包体</sup></label>
+        <input id="body" type="text" placeholder="十进制参数, 逗号/空格分隔; 可留空(空包体)。如 0 10 725 172  → 000000000000000A000002D5000000A0" value="">
+        <div class="rowflex" style="align-items:center;gap:8px">
+          <label style="margin:0"><input id="rawHex" type="checkbox"> 原样HEX</label>
+          <div style="margin-left:auto"><label style="margin:0">预览</label><code id="bodyPrev" style="display:inline-block;margin-left:6px;padding:2px 6px;background:#0d1117;border:1px solid #30363d;border-radius:4px;color:#79c0ff;font:11px Menlo,monospace;word-break:break-all">—</code></div>
+        </div>
+        <button id="sendBtn" disabled>发送</button>
+        <button id="petbagBtn" class="off" disabled title="发送命令 43706 GET_PET_INFO_BY_ONCE, 查询背包内所有精灵(含能力值)">查询背包精灵(43706)</button>
+        <div style="margin-top:8px"><label>服务器响应（实时，内容可选中复制；受过滤包id/收发复选框约束）</label>
+          <div id="sendStatus" style="font-size:12px;color:#8b949e;margin:2px 0 6px">—</div>
+          <div id="pktWrap" style="max-height:240px;overflow:auto;border:1px solid #30363d;border-radius:6px;background:#0d1117">
+            <table id="pktTable" style="width:100%;table-layout:fixed;border-collapse:collapse;font:12px Menlo,monospace;user-select:text;cursor:text">
+              <colgroup>
+                <col style="width:60px">
+                <col style="width:84px">
+                <col style="width:26%">
+                <col>
+              </colgroup>
+              <thead>
+                <tr style="text-align:left;background:#161b22">
+                  <th style="padding:4px 8px;border:1px solid #30363d">类型</th>
+                  <th style="padding:4px 8px;border:1px solid #30363d">命令号</th>
+                  <th style="padding:4px 8px;border:1px solid #30363d">包体(hex)</th>
+                  <th style="padding:4px 8px;border:1px solid #30363d">十进制数组</th>
+                </tr>
+              </thead>
+              <tbody id="pktBody"></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+      <div class="card">
+        <h2>② 日志输出 (实时) <button id="clearLogBtn" class="off" style="float:right;margin:0;padding:2px 10px;font-size:12px">清空输出</button></h2>
+        <div class="filterbar">
+          <label style="margin:0">过滤包id</label>
+          <input id="filterIds" type="text" spellcheck="false" placeholder="逗号分隔, 如 40002,2192,41228,4047,4475,41080,9134,2604,9019,2101,2004,3405,2601,2002,43321,1002,9908">
+          <label style="margin:0"><input id="chkSend" type="checkbox" checked> 接收send</label>
+          <label style="margin:0"><input id="chkRecv" type="checkbox" checked> 接收recv</label>
+          <button id="applyFilterBtn" class="off" style="margin:0;padding:2px 10px;font-size:12px">应用过滤</button>
+        </div>
+        <div id="log"></div>
+      </div>
+    </div>
+  </div>
+</div><!-- /tab-scripts -->
 
 <script>
 const logEl=document.getElementById('log');
@@ -1402,6 +1518,7 @@ document.getElementById('delCredBtn').onclick=async()=>{
 };
 loadCreds();
 
+let _prevStatus='idle';
 async function refreshStatus(){
   try{const r=await fetch('/api/status');const s=await r.json();
     setStatus(s.status||'idle');
@@ -1411,6 +1528,10 @@ async function refreshStatus(){
     document.getElementById('teamBtn').disabled=(s.status!=='ready');
     document.getElementById('wareBtn').disabled=(s.status!=='ready');
     document.getElementById('discBtn').disabled=(s.status==='idle');
+    if(s.status==='ready' && _prevStatus!=='ready'){   // 登录完成 -> 自动跳到"脚本"页
+      activateTab('scripts');
+    }
+    _prevStatus=s.status||'idle';
   }catch(e){}
 }
 setInterval(refreshStatus,1000);refreshStatus();
@@ -1551,15 +1672,65 @@ document.getElementById('cmdRef').onchange=()=>{
 loadCmdMap();
 
 // ---- 分页切换 ----
+function activateTab(name){
+  document.querySelectorAll('.tabs .tab').forEach(x=>x.classList.remove('active'));
+  const tb=document.querySelector(`.tabs .tab[data-tab="${name}"]`); if(tb) tb.classList.add('active');
+  document.querySelectorAll('.tab-panel').forEach(p=>p.classList.remove('active'));
+  const p=document.getElementById('tab-'+name); if(p) p.classList.add('active');
+  if(name==='bag') refreshBag();
+  if(name==='scripts') loadScripts();
+}
 document.querySelectorAll('.tabs .tab').forEach(t=>{
-  t.addEventListener('click',()=>{
-    document.querySelectorAll('.tabs .tab').forEach(x=>x.classList.remove('active'));
-    t.classList.add('active');
-    document.querySelectorAll('.tab-panel').forEach(p=>p.classList.remove('active'));
-    const p=document.getElementById('tab-'+t.dataset.tab); if(p) p.classList.add('active');
-    if(t.dataset.tab==='bag') refreshBag();
-  });
+  t.addEventListener('click',()=>activateTab(t.dataset.tab));
 });
+
+// ---- "脚本"页: 列出默认目录脚本, 可选择运行 ----
+let scriptsList=[];
+const scriptRunBtn=document.getElementById('scriptRunBtn');
+const scriptStopBtn=document.getElementById('scriptStopBtn');
+const scriptStatusEl=document.getElementById('scriptStatus');
+async function loadScripts(){
+  try{
+    const r=await fetch('/api/scripts'); const j=await r.json();
+    document.getElementById('scriptDir').textContent=j.dir||'—';
+    scriptsList=j.scripts||[];
+    const box=document.getElementById('scriptList');
+    box.innerHTML='';
+    if(!scriptsList.length){
+      const d=document.createElement('div'); d.style.cssText='color:#8b949e;padding:8px';
+      d.textContent='（该目录暂无脚本, 把 .py 脚本放进上面所示的目录即可）'; box.appendChild(d);
+    }
+    scriptsList.forEach(nm=>{
+      const b=document.createElement('div');
+      b.className='script-item'; b.textContent=nm; b.dataset.name=nm;
+      b.onclick=()=>{
+        document.querySelectorAll('#scriptList .script-item').forEach(x=>x.classList.remove('sel'));
+        b.classList.add('sel');
+        scriptRunBtn.disabled=false;
+        scriptRunBtn.dataset.name=nm;
+        scriptStatusEl.textContent='已选择: '+nm; scriptStatusEl.style.color='#8b949e';
+      };
+      box.appendChild(b);
+    });
+    if(j.running){ scriptStopBtn.style.display='inline-block'; }
+  }catch(e){}
+}
+document.getElementById('scriptRefreshBtn').onclick=loadScripts;
+scriptRunBtn.onclick=async()=>{
+  const nm=scriptRunBtn.dataset.name;
+  if(!nm){ appendLog({t:now(),level:'tip',msg:'请先选择要运行的脚本'}); return; }
+  scriptStatusEl.textContent='正在启动 '+nm+' ...'; scriptStatusEl.style.color='#d29922';
+  try{
+    const r=await fetch('/api/scripts/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:nm})});
+    const j=await r.json();
+    if(j.ok){ scriptStatusEl.textContent='已启动 '+nm; scriptStatusEl.style.color='#3fb950'; scriptStopBtn.style.display='inline-block'; }
+    else{ scriptStatusEl.textContent='启动失败: '+(j.error||''); scriptStatusEl.style.color='#f85149'; scriptStopBtn.style.display='none'; }
+  }catch(e){ scriptStatusEl.textContent='启动出错: '+e; scriptStatusEl.style.color='#f85149'; }
+};
+scriptStopBtn.onclick=async()=>{
+  try{ await fetch('/api/scripts/stop',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}); }catch(e){}
+};
+loadScripts();   // 预加载脚本列表 (登录后可立即看到)
 
 // 精灵按钮文本: 仅显示名字; 无名字则显示 id 数字 (统一背包+仓库)
 function displayName(p){
