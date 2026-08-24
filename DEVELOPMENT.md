@@ -142,6 +142,10 @@ print(pkt.ints, pkt.body, v)
 | `send(cmd, params)` | 发送 SEND 包（不等待响应） | `cmd`(id 或命令名如 `ENTER_MAP`)、`params`(参数列表) | 后端应答 dict |
 | `recv(cmd, params, timeout=8)` | 发送并**等待该命令的 RECV** | 同上 + 超时 | `Packet`(`body`=完整包体hex, `ints`=十进制, `raw`=bytes) |
 | `get_value(body, index)` | 从包体取第 `index` 个值（int32 大端） | `body`(Packet/hex/bytes)、`index` | int |
+| `set_bag(ids)` | 把背包**全部**切换为指定**物种id**列表，物理重排 12 格（前6=出战，后6=待命）；读背包+仓库+**精英背包**→全部存仓库(2304)→按列表从仓库/精英取回(2304)→设首发(2308)→摆正顺序(41462) | `ids`(物种id列表，≤12) | `{"ok":True,"target":ids}` |
+| `find_pet(ids)` | **查找**指定物种 id 是否存在及所在位置，在**背包(出战/待命)+仓库+精英背包**三类来源中搜索（精英背包=2361 GET_LOVE_PET_LIST） | `ids`(id 或 id 列表) | `{str(id):{"locations":[位置...],"count":n}}` |
+
+> ⚠️ `set_bag()` 会发**真实游戏命令**（2304/2308/41462）；同一物种取池里（背包/仓库/**精英背包**）第一个未用之的；若某些物种三处都**检测不到**，则输出 `找不到指定的精灵：名称[ID=xx]，名称[ID=yy]...！`（列出**全部**缺失精灵）并`SystemExit(1)` **中止脚本**（未改动背包）；列表不足 12 时多余格位留空。`find_pet()` 是**只读查询**（含精英背包）。`set_bag()` 会把目标精灵从普通仓库或**精英背包**取出进包（精英背包与仓库一致地用 2304，对齐 WebUI 精英仓库的拖拽交互）。
 
 - 参数列表打包对齐后端 `pack_body`：数字→int32 大端；`s:文本`/`b:字节`/`h:hex`/`bytes` 均支持；`None` 自动跳过。
 - 未登录/参数错/超时/越界一律抛 `SeerError`。
