@@ -1,0 +1,21 @@
+# 默认忽略所有内容, 仅保留运行必需文件.
+# 运行必需: WebUI/webui.py + 数据更新/assets_updater.py + 脚本库/seerlib.py
+#           + 协议客户端 seer/ 包 + cmdmap.json + requirements.txt + 文档.
+# 其余(生成数据/下载缓存/逆向参考/运行时凭据/日志/字节码)一律忽略.
+*
+
+# ---- 运行必需的源码 / 配置 / 文档 ----
+!.gitignore
+!README.md
+!DEVELOPMENT.md
+!requirements.txt
+!cmdmap.json
+!*.py
+!seer/
+!seer/**
+!tools/
+!tools/**
+
+# 即便目录被保留, 运行时字节码仍忽略
+*.pyc
+**/__pycache__/

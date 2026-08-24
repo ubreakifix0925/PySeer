@@ -1,0 +1,2212 @@
+#!/usr/bin/env python3
+"""赛尔号协议调试 WebUI (纯标准库, 无需第三方依赖).
+
+功能:
+    1. 登录操作      --account/--password 填账号密码, 一键游戏登录 (会话密钥自动派生)
+    2. 日志输出      --实时 SSE 流 (登录过程/每个收发封包/命令名)
+    3. 发包测试      --登录成功后, 手动构造命令号+包体并通过当前连接发送, 读取服务器响应
+
+用法:
+    python3 webui.py [--host 127.0.0.1] [--port 8680]
+    浏览器打开 http://127.0.0.1:8680/
+"""
+
+import argparse
+import html
+import json
+import os
+import signal
+import threading
+import time
+import traceback
+import urllib.parse
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+from seer.body import decode_body, pack_body, parse_parts
+from seer.client import DEFAULT_GAME_SERVER, LoginError, SeerClient
+from seer.petinfo import format_pet, load_pet_names, merge_pet_names, parse_front, parse_full, resolve_name, set_pet_names, split_petbag_43706
+
+# ---- 全局状态 ----
+_LOCK = threading.Lock()
+_STATE = {
+    "client": None,          # 当前已登录的 SeerClient 实例
+    "status": "idle",        # idle | logging_in | ready | error
+    "detail": "",
+    "account": "",
+    "conn": "",
+}
+_LOG = []                    # 结构化日志 (供 /api/log 返回)
+_PENDING = []                # SSE 增量条目的固化字符串
+_COND = threading.Condition()  # 通知 SSE 有新日志
+_RECV_LATEST = {}            # {cmd: 最近一条 RECV 包体(hex)} 供脚本库取值
+_RECV_SEQ = {}               # {cmd: 该 cmd 的 RECV 序号} 供判断"新响应"
+_LOCK_RECV = threading.Lock()  # 保护 _RECV_LATEST/_RECV_SEQ
+
+_LOG_MAX = 5000
+_LOG_DIR = "webui_logs"
+_CRED_FILE = "webui_credentials.json"
+_FILTER_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "webui_filter.json")
+_CMDMAP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cmdmap.json")
+_HEAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "refs", "head")  # 精灵头像(按物种id)目录
+_EFFECT_ICON_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "refs", "effecticon")  # 魂印/效果图标目录
+
+_SEQ = 0  # 日志单调递增序号, 前端按它去重
+_FILTER_DEFAULT = {40002, 2192, 41228, 4047, 4475, 41080, 9134, 2604, 9019,
+                   2101, 2004, 3405, 2601, 2002, 43321, 1002, 9908}  # 默认过滤(舍弃)的包id
+
+
+def _load_filter():
+    """读取保存的过滤包id名单 (webui_filter.json); 无文件时用默认名单."""
+    try:
+        with open(_FILTER_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+            ids = d.get("ids", []) if isinstance(d, dict) else d
+            return {int(x) for x in ids}
+    except (OSError, json.JSONDecodeError, ValueError):
+        return set(_FILTER_DEFAULT)
+
+
+def _save_filter(ids):
+    """把过滤包id名单写入 webui_filter.json (用户修改后持久化)."""
+    try:
+        with open(_FILTER_FILE, "w", encoding="utf-8") as f:
+            json.dump({"ids": sorted(ids)}, f, ensure_ascii=False, indent=2)
+        return True
+    except OSError as e:
+        print(f"保存过滤名单失败: {e}")
+        return False
+
+
+_FILTER_IDS = _load_filter()  # 运行时可改, 同时持久化到 webui_filter.json
+
+# 背包精灵(43706)解析结果: 出战/待命 两只列表, 供"背包"分页展示
+_BAG = {"first": [], "second": [], "fetched": False, "version": 0}
+
+# 阵容列表(41921)解析结果: 供"切换阵容"弹窗
+_TEAMS = {"curUsedId": 0, "teams": [], "fetched": False, "version": 0}
+
+
+def _decode_utf(x):
+    for enc in ("utf-8", "gbk", "gb18030"):
+        try:
+            return x.split(b"\x00")[0].decode(enc)
+        except Exception:
+            continue
+    return ""
+
+
+# 仓库精灵列表(2303 GET_PET_LIST) 解析结果, 供"精灵仓库"分页
+_STORAGE = {"pets": [], "fetched": False, "version": 0}
+
+# 精英仓库(GET_LOVE_PET_LIST 2361 爱宠/领养, 无修炼) 解析结果
+_EXE = {"pets": [], "fetched": False, "version": 0}
+
+# 单只精灵(2301 GET_PET_INFO) 缓存: catchTime -> PetInfo dict (供仓库养成信息展示)
+_PET_INFO = {}
+
+
+def _parse_love_2361(data):
+    """解析 2361 GET_LOVE_PET_LIST 精英(爱宠)仓库列表: [count u32][PetListInfo × count].
+
+    PetListInfo = id u32 + isBright u32 + catchTime u32 (12B/条, level 由单独行存储UpDate补).
+    """
+    b = bytes(data)
+    o = 0
+    n = int.from_bytes(b[0:4], "big"); o += 4
+    pets = []
+    for _ in range(n):
+        if o + 12 > len(b):
+            break
+        pid = int.from_bytes(b[o:o + 4], "big"); o += 4
+        bright = int.from_bytes(b[o:o + 4], "big"); o += 4
+        cap = int.from_bytes(b[o:o + 4], "big"); o += 4
+        pets.append({"id": pid, "isBright": bright, "catchTime": cap})
+    return pets
+
+
+def _parse_storage_2303(data):
+    """解析 2303 仓库列表响应(分页被 on_frame 追加).
+
+    每格 16B = PetListInfo(id u32, isBright u32, catchTime u32) + level u32.
+    (来自 PetListInfo.as 与 PetManager.getStorageArgList 的 info.level=readUnsignedInt().)
+    """
+    b = bytes(data)
+    o = 0
+    n = int.from_bytes(b[0:4], "big"); o += 4
+    pets = []
+    for _ in range(n):
+        if o + 16 > len(b):
+            break
+        pid = int.from_bytes(b[o:o + 4], "big"); o += 4
+        bright = int.from_bytes(b[o:o + 4], "big"); o += 4
+        catch = int.from_bytes(b[o:o + 4], "big"); o += 4
+        lv = int.from_bytes(b[o:o + 4], "big"); o += 4
+        pets.append({"id": pid, "isBright": bright, "catchTime": catch, "level": lv})
+    return pets
+
+
+def _parse_teams_41921(data):
+    """解析 41921 阵容列表响应: [curUsedId][len][每套: id,nick(64B),12×(ct,sf),5×equip,title,key(128B)×2,share,create]."""
+    b = bytes(data)
+    o = 0
+    cur = int.from_bytes(b[0:4], "big"); o = 4
+    n = int.from_bytes(b[o:o + 4], "big"); o += 4
+    teams = []
+    for _ in range(n):
+        t = {}
+        t["id"] = int.from_bytes(b[o:o + 4], "big"); o += 4
+        nick = _decode_utf(b[o:o + 64]); o += 64
+        pet = []
+        for _ in range(12):
+            ct = int.from_bytes(b[o:o + 4], "big"); o += 4
+            sf = int.from_bytes(b[o:o + 4], "big"); o += 4
+            pet.append([ct, sf])
+        t["pet_detail"] = pet
+        equip = [int.from_bytes(b[o + 4 * j:o + 4 * j + 4], "big") for j in range(5)]; o += 20
+        t["equip"] = equip
+        t["title"] = int.from_bytes(b[o:o + 4], "big"); o += 4
+        t["lineup_key"] = _decode_utf(b[o:o + 128]); o += 128
+        t["create_key"] = _decode_utf(b[o:o + 128]); o += 128
+        t["share_time"] = int.from_bytes(b[o:o + 4], "big"); o += 4
+        t["create_time"] = int.from_bytes(b[o:o + 4], "big"); o += 4
+        t["nick"] = nick or ("阵容" + str(t["id"]))
+        teams.append(t)
+    return {"curUsedId": cur, "teams": teams}
+
+
+def _pet_bag_view(p):
+    """为背包里的精灵补充头像 URL (refs/head/<物种id>.png 存在时) 与名字."""
+    out = dict(p)
+    pid = out.get("id")
+    fname = "%s.png" % pid if isinstance(pid, int) and pid > 0 else None
+    if fname and os.path.isfile(os.path.join(_HEAD_DIR, fname)):
+        out["avatar"] = "/head/%s" % fname
+    else:
+        out["avatar"] = None
+    out["name"] = resolve_name(out)
+    out["attr"] = attr_of(out.get("id"))
+    return out
+
+
+def _storage_view(p):
+    """仓库精灵(2303)补充头像/名字/属性, 供仓库界面拖拽复制载入图片."""
+    out = dict(p)
+    pid = out.get("id")
+    fname = "%s.png" % pid if isinstance(pid, int) and pid > 0 else None
+    if fname and os.path.isfile(os.path.join(_HEAD_DIR, fname)):
+        out["avatar"] = "/head/%s" % fname
+    else:
+        out["avatar"] = None
+    out["name"] = resolve_name(out)
+    out["attr"] = attr_of(out.get("id"))
+    return out
+
+
+def _load_cmdmap():
+    """加载 Command.cs 解析出的 id->命令名 字典 (refs/seerpacket/cmdmap.json 的副本)."""
+    try:
+        with open(_CMDMAP_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+            return {int(k): v for k, v in d.items()}
+    except (OSError, json.JSONDecodeError, ValueError):
+        return {}
+
+
+CMD_MAP = _load_cmdmap()  # {int id: str name}
+CMD_NAME = {v: k for k, v in CMD_MAP.items()}  # 反向: name -> id
+
+# 精灵名表 (id->名字): 基础来自 assets_updater 自动导出的 petbook.json (从游戏图鉴 petbook.bytes 解析),
+# 再用用户可在根目录维护的 pet_names.json 覆盖同名项 (用户纠错优先).
+_PETNAMES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pet_names.json")
+_PETBOOK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "petbook.json")
+
+# 精灵属性表 (物种id->属性名, 如 "草"/"水"/"水 龙"): 来自 monsters.bytes 的 type 字段,
+# 由 assets_updater 自动导出 (参考 refs/monsters.json 结构: type 即属性, real_id==0 的基表记录为物种本体).
+_PETATTR_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pet_attr.json")
+
+
+def _read_json_map(path):
+    import json as _json
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            return _json.load(f)
+    except (OSError, ValueError, _json.JSONDecodeError):
+        return {}
+
+
+set_pet_names(_read_json_map(_PETBOOK_FILE))   # 自动导出的图鉴名字 (基础)
+merge_pet_names(_read_json_map(_PETNAMES_FILE))  # 用户覆盖 (同名优先)
+
+_PETATTR = _read_json_map(_PETATTR_FILE)  # {str 物种id: str 属性名}
+
+# 技能表 (技能id->技能数据: name/pp/typeName/power/accuracy/crit/mustHit/priority/effects):
+# 来自 moves.bytes + skill_effect.bytes, 由 assets_updater 自动导出 skills.json.
+_SKILLS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills.json")
+_SKILLS = _read_json_map(_SKILLS_FILE)   # {str 技能id: dict 技能数据}
+
+
+def skill_of(mid):
+    """技能 id -> 技能数据 dict. 查不到返回 None."""
+    if mid is None:
+        return None
+    return _SKILLS.get(str(mid)) or _SKILLS.get(mid)
+
+
+# 魂印/专属特性表 (精灵物种id -> [魂印数据 {id,tags,desc,analyze,effectId,args}]):
+# 来自 effecticon.bytes + effectag.bytes, 由 assets_updater 自动导出 soulmarks.json.
+_SOULMARKS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "soulmarks.json")
+_SOULMARKS = _read_json_map(_SOULMARKS_FILE)   # {str 物种id: [魂印数据...]}
+
+
+def soulmark_of(sid):
+    """精灵物种 id -> 魂印(专属特性)列表. 查不到返回 []."""
+    if sid is None:
+        return []
+    return _SOULMARKS.get(str(sid)) or _SOULMARKS.get(sid) or []
+
+
+def attr_of(sid):
+    """物种 id -> 属性名 (如水/火/龙/水 龙). 查不到返回 ''."""
+    if sid is None:
+        return ""
+    return _PETATTR.get(str(sid)) or _PETATTR.get(sid) or ""
+
+
+def load_creds():
+    """读取已保存的账号密码列表 [{account,password}, ...]."""
+    try:
+        with open(_CRED_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            return data.get("accounts", []) if isinstance(data, dict) else data
+    except (OSError, json.JSONDecodeError):
+        return []
+
+
+def save_creds(account, password):
+    """登录成功后保存 (或更新) 一对账号密码, 按账号去重. 返回当前列表."""
+    accounts = load_creds()
+    # 去掉同账号的旧记录
+    accounts = [a for a in accounts if a.get("account") != account]
+    accounts.append({"account": account, "password": password})
+    try:
+        with open(_CRED_FILE, "w", encoding="utf-8") as f:
+            json.dump({"accounts": accounts}, f, ensure_ascii=False, indent=2)
+    except OSError as e:
+        print(f"保存账号密码失败: {e}")
+    return accounts
+
+
+def save_logs(reason="shutdown"):
+    """把当前内存日志写入带时间戳的文件, 并清空内存日志.
+
+    仅在服务中断/退出时调用; 刷新页面与"清空输出"按钮不影响这里保存的完整日志.
+    """
+    with _COND:
+        entries = list(_LOG)
+        _LOG.clear()
+        _PENDING.clear()
+    ts = time.strftime("%Y%m%d_%H%M%S")
+    os.makedirs(_LOG_DIR, exist_ok=True)
+    path = os.path.join(_LOG_DIR, f"seer_debug_{ts}.log")
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(f"# 赛尔号协议调试日志 | 保存时间 {ts} | 原因 {reason}\n")
+            for e in entries:
+                line = f"{e.get('t', '')} [{e.get('level', 'info')}] {e.get('msg', '')}"
+                if e.get("direction"):
+                    line += f"  <- {e.get('direction')} cmd={e.get('cmd')}"
+                if e.get("body"):
+                    line += f" body={e.get('body')[:48]}"
+                f.write(line + "\n")
+        print(f"[{reason}] 日志已保存: {path} ({len(entries)} 条)")
+    except OSError as e:
+        print(f"[{reason}] 保存日志失败: {e}")
+
+
+def log(level, message, **extra):
+    global _SEQ
+    _SEQ += 1
+    entry = {
+        "seq": _SEQ,
+        "t": time.strftime("%H:%M:%S"),
+        "level": level,
+        "msg": message,
+        **extra,
+    }
+    with _COND:
+        _LOG.append(entry)
+        if len(_LOG) > _LOG_MAX:
+            _LOG.pop(0)
+        _PENDING.append(json.dumps(entry, ensure_ascii=False))
+        _COND.notify_all()
+
+
+def set_status(status, detail="", account="", conn=""):
+    with _LOCK:
+        _STATE["status"] = status
+        _STATE["detail"] = detail
+        if account:
+            _STATE["account"] = account
+        if conn:
+            _STATE["conn"] = conn
+    log("status", f"[{status}] {detail}")
+
+
+def _start_listener(client):
+    """登录后开启后台线程, 持续读取所有封包并交给 on_frame 记录 (实时监听).
+
+    /api/send 只负责发包, 不再阻塞等待应答; 服务器的一切回包都由本线程在后台读到,
+    进而实时显示到日志区与"服务器响应"表格里 (受过滤包id/收发复选框约束).
+    """
+    from seer.tcp_client import WebSocketClosed, WebSocketTimeout
+
+    def _loop():
+        log("info", "后台监听已开启, 实时接收所有约束之外的封包...")
+        while True:
+            tcp = getattr(client, "tcp", None)
+            if tcp is None or not tcp.is_open():
+                break
+            try:
+                r = client.recv_game_packet(timeout=0.5)   # 触发 on_frame
+                if r and r["cmd"] == 0x3EA:                 # 时间同步 -> 回应, 维持连接
+                    try:
+                        client.send_time_check(bytes(r["body"]).hex())
+                    except Exception:
+                        pass
+            except WebSocketTimeout:
+                continue
+            except WebSocketClosed:
+                break
+            except Exception as e:
+                log("error", f"监听异常: {e}")
+                break
+
+    threading.Thread(target=_loop, daemon=True, name="seer-listen").start()
+
+
+# ---- 登录线程 ----
+def run_login(account, password, host, port, session=None):
+    set_status("logging_in", "正在连接...", account=account)
+    global_client = SeerClient(account=account, password=password)
+    try:
+        # 把每个收发封包都打进日志 (带上命令名); 名单内的包舍弃
+        def on_frame(direction, hexstr, cmd, body):
+            try:
+                c = int(cmd)
+            except (TypeError, ValueError):
+                c = -1
+            if c in _FILTER_IDS:
+                return                      # 舍弃: 过滤名单内的包, 不写入日志
+            nm = CMD_MAP.get(c, "")
+            ints = []
+            try:
+                ints = decode_body(bytes.fromhex(body))["ints"]
+            except Exception:
+                pass
+            log("packet", f"{direction} cmd={cmd} {nm} body={body[:48]}",
+                direction=direction, cmd=cmd, body=body, ints=ints)
+            # 记录 RECV 到缓存(供脚本库 /api/send-recv 取值)
+            if direction == "RECV":
+                with _LOCK_RECV:
+                    _RECV_SEQ[c] = _RECV_SEQ.get(c, 0) + 1
+                    _RECV_LATEST[c] = body
+            # 43706(背包精灵全量)/2301(单只精灵) 应答: 解析 PetInfo 前段=能力值
+            if direction == "RECV" and c in (43706, 2301):
+                try:
+                    data = bytes.fromhex(body)
+                    if c == 43706:
+                        # [第一背包数][pet1][pet2]...[第二背包数][...]
+                        try:
+                            bag = split_petbag_43706(data)
+                            # 存入全局供"背包"分页展示 (名字用 resolve_name 回填)
+                            with _LOCK:
+                                for arr in (bag["first_bag"], bag["second_bag"]):
+                                    for p in arr:
+                                        p["name"] = resolve_name(p) or p.get("name", "")
+                                _BAG["first"] = bag["first_bag"]
+                                _BAG["second"] = bag["second_bag"]
+                                _BAG["fetched"] = True
+                                _BAG["version"] += 1
+                            log("ok", f"43706 GET_PET_INFO_BY_ONCE: 第一背包 {bag['first_count']} 只, 第二背包 {bag['second_count']} 只")
+                            for tag, arr in (("第一背包", bag["first_bag"]), ("第二背包", bag["second_bag"])):
+                                for p in arr:
+                                    log("ok", f"  [{tag}] " + format_pet(p))
+                        except Exception as e2:
+                            log("error", f"  解析 43706 批量失败: {e2}")
+                    elif c == 2301:
+                        pet, _ = parse_full(data, 0)
+                        log("ok", "  2301 GET_PET_INFO 精灵: " + format_pet(pet))
+                        try:
+                            with _LOCK:
+                                _PET_INFO[pet.get("catchTime")] = pet
+                                _PET_INFO["_last"] = pet
+                        except Exception:
+                            pass
+                except Exception as e:
+                    log("error", f"解析 PetInfo 应答失败: {e}")
+            # 41921 阵容列表应答: 解析并存入 _TEAMS (切换阵容弹窗用)
+            if direction == "RECV" and c == 41921:
+                try:
+                    res = _parse_teams_41921(bytes.fromhex(body))
+                    with _LOCK:
+                        _TEAMS["curUsedId"] = res["curUsedId"]
+                        _TEAMS["teams"] = res["teams"]
+                        _TEAMS["fetched"] = True
+                        _TEAMS["version"] += 1
+                    log("ok", f"41921 阵容列表: {len(res['teams'])} 套, 当前使用阵容 id={res['curUsedId']}")
+                    for t in res["teams"]:
+                        n = sum(1 for ct, sf in t["pet_detail"] if ct)
+                        mark = " [使用中]" if t["id"] == res["curUsedId"] else ""
+                        log("ok", f"  阵容{t['id']} «{t['nick']}» 精灵{n}只{mark}")
+                except Exception as e2:
+                    log("error", f"  解析 41921 阵容失败: {e2}")
+            # 2303 仓库列表应答: 分页追加到 _STORAGE
+            if direction == "RECV" and c == 2303:
+                try:
+                    pets = _parse_storage_2303(bytes.fromhex(body))
+                    with _LOCK:
+                        _STORAGE["pets"].extend(pets)
+                        _STORAGE["fetched"] = True
+                        _STORAGE["version"] += 1
+                    log("ok", f"2303 仓库列表: 本页 {len(pets)} 只, 累计 {len(_STORAGE['pets'])} 只")
+                except Exception as e2:
+                    log("error", f"  解析 2303 仓库列表失败: {e2}")
+            # 2361 爱宠/精英仓库应答: 解析进 _EXE
+            if direction == "RECV" and c == 2361:
+                try:
+                    pets = _parse_love_2361(bytes.fromhex(body))
+                    with _LOCK:
+                        _EXE["pets"] = pets
+                        _EXE["fetched"] = True
+                        _EXE["version"] += 1
+                    log("ok", f"2361 精英(爱宠)仓库: {len(pets)} 只")
+                except Exception as e2:
+                    log("error", f"  解析 2361 精英仓库失败: {e2}")
+
+        global_client.on_frame = on_frame
+        if session:
+            global_client.session = session
+            log("ok", "使用调用方提供的 session(跳过淘米认证)")
+        else:
+            sess = global_client.fetch_session()
+            log("ok", f"淘米 session = {sess[:16]}...")
+        conn, responses = global_client.login_game(
+            host, port, max_seconds=12,
+            on_packet=None,   # 封包日志统一由 on_frame 记录, 避免重复
+        )
+        sk = getattr(global_client, "session_key", None)
+        set_status("ready", f"已连接 {conn}; 会话密钥={sk}", account=account, conn=conn)
+        log("ok", f"登录成功! 连接={conn}  收到 {len(responses)} 个封包  会话密钥={sk}")
+        # 登录后开启后台监听线程: 实时读取所有封包 (on_frame 会记录到日志与响应表格)
+        _start_listener(global_client)
+        # 登录后自动切换至10号阵容(防止阵容被后续开发的脚本打乱), 再刷新背包
+        try:
+            global_client.send_game_packet(41922, pack_body("2,10").hex())
+            log("info", "已自动切换至10号阵容 (防止阵容被脚本打乱)...")
+        except Exception as e:
+            log("error", f"自动切换至10号阵容失败: {e}")
+        # 用 43706 查询背包精灵 (出战/待命), 交给 on_frame 解析进 _BAG
+        try:
+            global_client.send_game_packet(43706, "")
+            log("info", "已自动发送 43706 GET_PET_INFO_BY_ONCE 查询背包精灵(出战/待命)...")
+        except Exception as e:
+            log("error", f"自动查询背包精灵失败: {e}")
+        saved = save_creds(account, password)
+        log("tip", f"已记住账号 {account} (共 {len(saved)} 对); 现在可以在下面'发包测试'里手工发命令了。")
+    except Exception as e:
+        traceback.print_exc()
+        set_status("error", f"登录失败: {e}", account=account)
+        log("error", f"登录失败: {e}")
+        try:
+            global_client.close()
+        except Exception:
+            pass
+    finally:
+        with _LOCK:
+            if _STATE["status"] == "ready":
+                _STATE["client"] = global_client
+
+
+# ---- HTTP 处理 ----
+class Handler(BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass  # 静默
+
+    def _send(self, code, ctype, body, headers=None):
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_GET(self):
+        path = self.path.split("?")[0]
+        if path in ("/", "/index.html"):
+            self._send(200, "text/html; charset=utf-8", PAGE.encode("utf-8"))
+        elif path == "/api/status":
+            with _LOCK:
+                s = dict(_STATE)
+            client_present = s["client"] is not None
+            s.pop("client", None)
+            s["client_present"] = client_present
+            self._send(200, "application/json", json.dumps(s).encode("utf-8"))
+        elif path == "/api/log":
+            with _COND:
+                body = json.dumps(_LOG, ensure_ascii=False).encode("utf-8")
+            self._send(200, "application/json", body)
+        elif path == "/api/credentials":
+            self._send(200, "application/json", json.dumps({"accounts": load_creds()}).encode("utf-8"))
+        elif path == "/api/cmdmap":
+            self._send(200, "application/json", json.dumps({str(k): v for k, v in CMD_MAP.items()}).encode("utf-8"))
+        elif path == "/api/filter":
+            self._send(200, "application/json", json.dumps({"ok": True, "ids": sorted(_FILTER_IDS)}).encode("utf-8"))
+        elif path == "/api/bag":
+            with _LOCK:
+                first = [_pet_bag_view(p) for p in _BAG["first"]]
+                second = [_pet_bag_view(p) for p in _BAG["second"]]
+                payload = {"ok": True, "first": first, "second": second,
+                           "fetched": _BAG["fetched"], "version": _BAG["version"]}
+            self._send(200, "application/json", json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+        elif path == "/api/teams":
+            with _LOCK:
+                payload = {"ok": True, "curUsedId": _TEAMS["curUsedId"],
+                           "teams": _TEAMS["teams"], "fetched": _TEAMS["fetched"],
+                           "version": _TEAMS["version"]}
+            self._send(200, "application/json", json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+        elif path == "/api/storage":
+            with _LOCK:
+                pets = [_storage_view(p) for p in _STORAGE["pets"]]
+                payload = {"ok": True, "pets": pets,
+                           "fetched": _STORAGE["fetched"], "version": _STORAGE["version"]}
+            self._send(200, "application/json", json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+        elif path == "/api/exe":
+            # 2361 列表本身不带等级/天赋/性格; 用 _PET_INFO(来自 2301 养成渠道) 回填, 保证徽标/详情正常显示
+            with _LOCK:
+                pets = []
+                for p in _EXE["pets"]:
+                    v = _storage_view(p)
+                    info = _PET_INFO.get(p.get("catchTime"))
+                    if info:
+                        for k in ("level", "dv", "nature", "is_bright"):
+                            if v.get(k) is None and info.get(k) is not None:
+                                v[k] = info[k]
+                    pets.append(v)
+                payload = {"ok": True, "pets": pets,
+                           "fetched": _EXE["fetched"], "version": _EXE["version"]}
+            self._send(200, "application/json", json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+        elif path.startswith("/api/pet-info"):
+            # /api/pet-info?catchTime=X 返回缓存的单只 PetInfo
+            q = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
+            ct = int(q.get("catchTime", [0])[0])
+            with _LOCK:
+                info = _PET_INFO.get(ct)
+            if info:
+                if isinstance(info, dict) and info.get("attr") is None:
+                    info["attr"] = attr_of(info.get("id"))
+                self._send(200, "application/json", json.dumps({"ok": True, "pet": info}, ensure_ascii=False).encode("utf-8"))
+            else:
+                self._send(200, "application/json", json.dumps({"ok": False, "error": "未获取到该精灵信息"}).encode("utf-8"))
+        elif path.startswith("/api/skills"):
+            # /api/skills?ids=10001,10002 返回这些技能的数据 (详情/弹窗用)
+            q = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
+            raw_ids = q.get("ids", [""])[0]
+            wanted = [x for x in raw_ids.split(",") if x.strip()]
+            with _LOCK:
+                got = {k: _SKILLS.get(k) for k in wanted if _SKILLS.get(k)}
+            self._send(200, "application/json",
+                       json.dumps({"ok": True, "skills": got}, ensure_ascii=False).encode("utf-8"))
+        elif path.startswith("/api/soulmarks"):
+            # /api/soulmarks?ids=300,3156 返回这些精灵的魂印(专属特性)数据
+            q = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
+            raw_ids = q.get("ids", [""])[0]
+            wanted = [x for x in raw_ids.split(",") if x.strip()]
+            with _LOCK:
+                got = {k: _SOULMARKS.get(k) for k in wanted if _SOULMARKS.get(k)}
+            self._send(200, "application/json",
+                       json.dumps({"ok": True, "soulmarks": got}, ensure_ascii=False).encode("utf-8"))
+        elif path.startswith("/head/"):
+            # 精灵头像: /head/<物种id>.png
+            fname = os.path.basename(path[len("/head/"):])
+            if not (fname.endswith(".png") and fname[:-4].isdigit()):
+                self._send(404, "text/plain", b"bad name")
+                return
+            fpath = os.path.join(_HEAD_DIR, fname)
+            if os.path.isfile(fpath):
+                with open(fpath, "rb") as f:
+                    data = f.read()
+                self._send(200, "image/png", data)
+            else:
+                self._send(404, "text/plain", b"not found")
+        elif path.startswith("/effecticon/"):
+            # 魂印/效果图标: /effecticon/<iconid>.png (来自 effecticon_*.bundle 提取, refs/effecticon)
+            fname = os.path.basename(path[len("/effecticon/"):])
+            if not (fname.endswith(".png") and fname[:-4].isdigit()):
+                self._send(404, "text/plain", b"bad name")
+                return
+            fpath = os.path.join(_EFFECT_ICON_DIR, fname)
+            if os.path.isfile(fpath):
+                with open(fpath, "rb") as f:
+                    data = f.read()
+                self._send(200, "image/png", data)
+            else:
+                self._send(404, "text/plain", b"not found")
+        elif path == "/api/stream":
+            self.handle_sse()
+        else:
+            self._send(404, "text/plain", b"not found")
+
+    def handle_sse(self):
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Cache-Control", "no-cache")
+        self.send_header("Connection", "keep-alive")
+        self.end_headers()
+        self.wfile.write(b"retry: 1000\n\n")
+        # 连上先回放最近 200 条历史日志 (避免面板空白, 便于核对)
+        with _COND:
+            recent = list(_LOG[-200:])
+        for ln in recent:
+            self.wfile.write(f"data: {json.dumps(ln, ensure_ascii=False)}\n\n".encode("utf-8"))
+        self.wfile.flush()
+        idx = len(_PENDING)
+        try:
+            while True:
+                with _COND:
+                    while len(_PENDING) <= idx:
+                        _COND.wait(timeout=20)
+                        if len(_PENDING) <= idx:
+                            # 心跳, 防止代理断连
+                            self.wfile.write(b": ping\n\n")
+                            self.wfile.flush()
+                            continue
+                    new = _PENDING[idx:]
+                    idx = len(_PENDING)
+                for ln in new:
+                    self.wfile.write(f"data: {ln}\n\n".encode("utf-8"))
+                self.wfile.flush()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+
+    def _json_body(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        if n <= 0:
+            return {}
+        return json.loads(self.rfile.read(n).decode("utf-8"))
+
+    def _send_json(self, data, code=200):
+        body = json.dumps(data, ensure_ascii=False).encode("utf-8")
+        self._send(code, "application/json", body)
+
+    def do_POST(self):
+        path = self.path.split("?")[0]
+        try:
+            data = self._json_body()
+        except Exception as e:
+            return self._send_json({"ok": False, "error": f"JSON 解析失败: {e}"}, 400)
+
+        if path == "/api/login":
+            account = str(data.get("account", "")).strip()
+            password = str(data.get("password", ""))
+            log("info", f"收到登录请求 account={account!r} (密码已打码)")
+            if not account:
+                log("error", "登录请求缺少『米米号』")
+                return self._send_json({"ok": False, "error": "缺少米米号(账号)"}, 400)
+            if not password:
+                log("error", "登录请求缺少『密码』")
+                return self._send_json({"ok": False, "error": "缺少密码"}, 400)
+            host = str(data.get("host") or DEFAULT_GAME_SERVER[0])
+            port = int(data.get("port") or DEFAULT_GAME_SERVER[1])
+            session = data.get("session") or None
+            threading.Thread(target=run_login, args=(account, password, host, port, session), daemon=True).start()
+            return self._send_json({"ok": True})
+
+        elif path == "/api/disconnect":
+            with _LOCK:
+                cli = _STATE["client"]
+                _STATE["client"] = None
+                _STATE["conn"] = ""
+                _STATE["detail"] = "已断开"
+                _STATE["status"] = "idle"
+            if cli:
+                try:
+                    cli.close()
+                except Exception:
+                    pass
+            log("info", "已断开当前连接")
+            return self._send_json({"ok": True})
+
+        elif path == "/api/credentials/delete":
+            with _COND:
+                acc = str(data.get("account", ""))
+            accounts = [a for a in load_creds() if a.get("account") != acc]
+            try:
+                with open(_CRED_FILE, "w", encoding="utf-8") as f:
+                    json.dump({"accounts": accounts}, f, ensure_ascii=False, indent=2)
+                log("info", f"已删除记住的账号 {acc}")
+            except OSError as e:
+                return self._send_json({"ok": False, "error": str(e)}, 400)
+            return self._send_json({"ok": True, "accounts": accounts})
+
+        elif path == "/api/send":
+            with _LOCK:
+                cli = _STATE["client"]
+            if cli is None:
+                return self._send_json({"ok": False, "error": "尚未登录, 无法发包"}, 400)
+            try:
+                raw_cmd = str(data.get("cmd")).strip()
+                # 支持按名字输入: "ENTER_MAP" / "40001" / "ENTER_MAP (2001)"
+                name_id = raw_cmd.split("(")[0].strip()
+                if name_id.isdigit():
+                    cmd = int(name_id)
+                else:
+                    if name_id in CMD_NAME:
+                        cmd = CMD_NAME[name_id]
+                    else:
+                        return self._send_json({"ok": False,
+                                                "error": f"未知命令名: {name_id!r}"}, 400)
+                body_hex = data.get("body", "")
+                # body 当前是"参数列表"输入: 按标准格式打包成十六进制; 也可加 prefix=h: 直接给原始HEX
+                encode = str(data.get("encode", "pack"))
+                if encode == "hex":
+                    body_hex = body_hex       # 原样作为十六进制
+                else:
+                    ok, res = pack_body(body_hex, raise_on_error=False)
+                    if not ok:
+                        return self._send_json({"ok": False, "error": f"包体参数错误: {res}"}, 400)
+                    body_hex = res.hex() if isinstance(res, bytes) else res
+                cli.send_game_packet(cmd, body_hex)   # 收发封包由 on_frame 统一记录, 避免重复
+                # 不再阻塞等待应答: 服务器的一切回包由后台监听线程实时读到,
+                # 经 on_frame 记录后显示到日志区与"服务器响应"表格 (受过滤/收发复选框约束)。
+                return self._send_json({"ok": True, "sent": {"cmd": cmd, "body": body_hex}})
+            except Exception as e:
+                log("error", f"发包异常: {e}")
+                return self._send_json({"ok": False, "error": str(e)}, 400)
+
+        elif path == "/api/send-recv":
+            # 脚本库用: 发送 SEND 包并等待该命令的 RECV 应答, 返回完整包体(hex) + 十进制 ints.
+            with _LOCK:
+                cli = _STATE["client"]
+            if cli is None:
+                return self._send_json({"ok": False, "error": "尚未登录, 无法发包"}, 400)
+            try:
+                raw_cmd = str(data.get("cmd")).strip()
+                name_id = raw_cmd.split("(")[0].strip()
+                if name_id.isdigit():
+                    cmd = int(name_id)
+                else:
+                    cmd = CMD_NAME.get(name_id)
+                    if cmd is None:
+                        return self._send_json({"ok": False, "error": f"未知命令名 {name_id!r}"}, 400)
+                body_spec = data.get("body", "")
+                ok2, packed = pack_body(body_spec, raise_on_error=False)
+                if not ok2:
+                    return self._send_json({"ok": False, "error": f"包体参数错误: {packed}"}, 400)
+                body_hex = packed.hex() if isinstance(packed, bytes) else packed
+                timeout = float(data.get("timeout", 8))
+                with _LOCK_RECV:
+                    before_seq = _RECV_SEQ.get(cmd, 0)
+                cli.send_game_packet(cmd, body_hex)
+                log("info", f"[send-recv] 已发送 {cmd} {CMD_MAP.get(cmd,'')}, 等待 RECV...")
+                resp = None
+                deadline = time.time() + timeout
+                while time.time() < deadline:
+                    with _LOCK_RECV:
+                        if _RECV_SEQ.get(cmd, 0) > before_seq:
+                            resp = _RECV_LATEST.get(cmd)
+                            break
+                    time.sleep(0.05)
+                if resp is None:
+                    return self._send_json({"ok": False, "error": "等待响应超时"}, 504)
+                ints = decode_body(bytes.fromhex(resp))["ints"]
+                return self._send_json({"ok": True, "body": resp, "ints": ints,
+                                        "cmd": cmd, "name": CMD_MAP.get(cmd, "")})
+            except Exception as e:
+                log("error", f"send-recv 异常: {e}")
+                return self._send_json({"ok": False, "error": str(e)}, 400)
+
+        elif path == "/api/teams/fetch":
+            # 拉取阵容列表: 发 41921 [0], 由监听线程解析进 _TEAMS
+            with _LOCK:
+                cli = _STATE["client"]
+            if cli is None:
+                return self._send_json({"ok": False, "error": "尚未登录"}, 400)
+            try:
+                cli.send_game_packet(41921, pack_body("0").hex())
+                log("info", "已发送 41921 拉取阵容列表...")
+                return self._send_json({"ok": True})
+            except Exception as e:
+                log("error", f"拉取阵容失败: {e}")
+                return self._send_json({"ok": False, "error": str(e)}, 400)
+
+        elif path == "/api/teams/switch":
+            # 切换阵容: 发 41922 [2, 阵容id]
+            with _LOCK:
+                cli = _STATE["client"]
+            if cli is None:
+                return self._send_json({"ok": False, "error": "尚未登录"}, 400)
+            try:
+                tid = int(data.get("id"))
+                cli.send_game_packet(41922, pack_body(f"2,{tid}").hex())
+                log("info", f"已发送 41922 切换阵容 [2, {tid}]...")
+                # 切换后同步刷新背包精灵 (43706), 让出战/待命背包反映新阵容
+                try:
+                    cli.send_game_packet(43706, "")
+                    log("info", "已发送 43706 同步刷新背包精灵...")
+                except Exception as e2:
+                    log("error", f"切换后刷新背包精灵失败: {e2}")
+                return self._send_json({"ok": True, "sent": {"cmd": 41922, "team": tid}})
+            except Exception as e:
+                log("error", f"切换阵容失败: {e}")
+                return self._send_json({"ok": False, "error": str(e)}, 400)
+
+        elif path == "/api/pets/store":
+            # 入库: 发 PET_RELEASE(2304) [catchTime, posIndex] (0=第一背包->仓库, 3=第二背包->仓库)
+            with _LOCK:
+                cli = _STATE["client"]
+            if cli is None:
+                return self._send_json({"ok": False, "error": "尚未登录"}, 400)
+            try:
+                catch = int(data.get("catchTime"))
+                bag = str(data.get("bag", "first"))
+                pos = 0 if bag != "second" else 3
+                cli.send_game_packet(2304, pack_body(f"{catch},{pos}").hex())
+                log("info", f"已发送入库(2304 PET_RELEASE) [{catch},{pos}]...")
+                # 完成后刷新背包
+                try:
+                    cli.send_game_packet(43706, "")
+                    log("info", "入库后已发送 43706 刷新背包...")
+                except Exception as e2:
+                    log("error", f"入库后刷新背包失败: {e2}")
+                return self._send_json({"ok": True, "sent": {"cmd": 2304, "catchTime": catch, "pos": pos}})
+            except Exception as e:
+                log("error", f"入库失败: {e}")
+                return self._send_json({"ok": False, "error": str(e)}, 400)
+
+        elif path == "/api/pets/default":
+            # 设为首发: 发 PET_DEFAULT(2308) [catchTime]
+            with _LOCK:
+                cli = _STATE["client"]
+            if cli is None:
+                return self._send_json({"ok": False, "error": "尚未登录"}, 400)
+            try:
+                catch = int(data.get("catchTime"))
+                cli.send_game_packet(2308, pack_body(str(catch)).hex())
+                log("info", f"已发送设为首发(2308 PET_DEFAULT) [{catch}]...")
+                try:
+                    cli.send_game_packet(43706, "")
+                    log("info", "设为首发后已发送 43706 刷新背包...")
+                except Exception as e2:
+                    log("error", f"设为首发后刷新背包失败: {e2}")
+                return self._send_json({"ok": True, "sent": {"cmd": 2308, "catchTime": catch}})
+            except Exception as e:
+                log("error", f"设为首发失败: {e}")
+                return self._send_json({"ok": False, "error": str(e)}, 400)
+
+        elif path == "/api/storage/fetch":
+            # 拉取仓库列表: 发 2303 GET_PET_LIST 分页 (0-6000, 每1000一页), 由监听线程解析进 _STORAGE
+            with _LOCK:
+                cli = _STATE["client"]
+            if cli is None:
+                return self._send_json({"ok": False, "error": "尚未登录"}, 400)
+            try:
+                with _LOCK:
+                    _STORAGE["pets"] = []
+                for start in range(0, 6000, 1000):
+                    cli.send_game_packet(2303, pack_body(f"{start},{start+1000}").hex())
+                log("info", "已发送 2303 GET_PET_LIST 拉取仓库(0-6000)...")
+                return self._send_json({"ok": True})
+            except Exception as e:
+                log("error", f"拉取仓库失败: {e}")
+                return self._send_json({"ok": False, "error": str(e)}, 400)
+
+        elif path == "/api/exe/fetch":
+            # 拉取精英(爱宠)仓库: 发 2361 GET_LOVE_PET_LIST, 由监听线程解析进 _EXE
+            with _LOCK:
+                cli = _STATE["client"]
+            if cli is None:
+                return self._send_json({"ok": False, "error": "尚未登录"}, 400)
+            try:
+                cli.send_game_packet(2361, "")
+                log("info", "已发送 2361 GET_LOVE_PET_LIST 拉取精英仓库...")
+                return self._send_json({"ok": True})
+            except Exception as e:
+                log("error", f"拉取精英仓库失败: {e}")
+                return self._send_json({"ok": False, "error": str(e)}, 400)
+
+        elif path == "/api/pet-info/fetch":
+            # 拉取单只精灵完整信息: 发 2301 GET_PET_INFO [catchTime], 监听线程缓存进 _PET_INFO.
+            # 已缓存则跳过, 避免重复拉取 (养成信息缓存).
+            with _LOCK:
+                cli = _STATE["client"]
+            if cli is None:
+                return self._send_json({"ok": False, "error": "尚未登录"}, 400)
+            try:
+                catch = int(data.get("catchTime"))
+                with _LOCK:
+                    if catch in _PET_INFO:
+                        log("info", f"2301 GET_PET_INFO [{catch}] 已有缓存, 跳过")
+                        return self._send_json({"ok": True, "cached": True})
+                cli.send_game_packet(2301, pack_body(str(catch)).hex())
+                log("info", f"已发送 2301 GET_PET_INFO [{catch}]...")
+                return self._send_json({"ok": True})
+            except Exception as e:
+                log("error", f"拉取精灵信息失败: {e}")
+                return self._send_json({"ok": False, "error": str(e)}, 400)
+
+        elif path == "/api/pets/warehouse-swap":
+            # 仓库精灵 <-> 背包精灵 互换: 先退背包精灵入库, 再把仓库精灵取出到该背包
+            with _LOCK:
+                cli = _STATE["client"]
+            if cli is None:
+                return self._send_json({"ok": False, "error": "尚未登录"}, 400)
+            try:
+                bag_catch = int(data.get("bagCatchTime"))
+                bag = str(data.get("bag", "first"))
+                st_catch = int(data.get("storageCatchTime"))
+                bg_pos = 3 if bag == "second" else 0   # 背包精灵退仓库: 0=第一->仓库, 3=第二->仓库
+                rg_pos = 2 if bag == "second" else 1   # 仓库精灵进背包: 1=仓库->第一, 2=仓库->第二
+                cli.send_game_packet(2304, pack_body(f"{bag_catch},{bg_pos}").hex())
+                cli.send_game_packet(2304, pack_body(f"{st_catch},{rg_pos}").hex())
+                log("info", f"已发送仓库互换: 退背包[{bag_catch},{bg_pos}] 取仓库[{st_catch},{rg_pos}]...")
+                try:
+                    cli.send_game_packet(43706, "")   # 刷新背包
+                except Exception:
+                    pass
+                # 仓库列表由前端 fetchStorage 按 2303 分页重拉
+                return self._send_json({"ok": True, "sent": {"cmd": 2304, "pair": [bag_catch, bg_pos, st_catch, rg_pos]}})
+            except Exception as e:
+                log("error", f"仓库互换失败: {e}")
+                return self._send_json({"ok": False, "error": str(e)}, 400)
+
+        elif path == "/api/pets/swap":
+            # 切换两只精灵位置: 发 41462 [sortIndex1, catchTime1, sortIndex2, catchTime2]
+            with _LOCK:
+                cli = _STATE["client"]
+            if cli is None:
+                return self._send_json({"ok": False, "error": "尚未登录"}, 400)
+            try:
+                sort1 = int(data.get("sortIndex1"))
+                catch1 = int(data.get("catchTime1"))
+                sort2 = int(data.get("sortIndex2"))
+                catch2 = int(data.get("catchTime2"))
+                cli.send_game_packet(41462, pack_body(f"{sort1},{catch1},{sort2},{catch2}").hex())
+                log("info", f"已发送切换位置(41462) [{sort1},{catch1},{sort2},{catch2}]...")
+                # 完成后刷新背包
+                try:
+                    cli.send_game_packet(43706, "")
+                    log("info", "切换后已发送 43706 刷新背包...")
+                except Exception as e2:
+                    log("error", f"切换后刷新背包失败: {e2}")
+                return self._send_json({"ok": True, "sent": {"cmd": 41462, "pair": [sort1, catch1, sort2, catch2]}})
+            except Exception as e:
+                log("error", f"切换位置失败: {e}")
+                return self._send_json({"ok": False, "error": str(e)}, 400)
+
+        elif path == "/api/pets/move":
+            # 拖到另一背包空位 => 直接移动: 仓库->背包 用2304(取仓库到背包); 背包->另一背包 用41462(目标空位catchTime=0)
+            with _LOCK:
+                cli = _STATE["client"]
+            if cli is None:
+                return self._send_json({"ok": False, "error": "尚未登录"}, 400)
+            try:
+                kind = data.get("kind")
+                catch = int(data.get("catchTime"))
+                if kind == "storage":
+                    bag = str(data.get("bag", "first"))
+                    rg_pos = 2 if bag == "second" else 1   # 仓库->第二/第一背包 (对齐 warehouse-swap 的 rg_pos)
+                    cli.send_game_packet(2304, pack_body(f"{catch},{rg_pos}").hex())
+                    log("info", f"仓库精灵 id={catch} 移至{bag}背包 (2304 [{catch},{rg_pos}])...")
+                else:
+                    from_sort = int(data.get("fromSort"))
+                    to_sort = int(data.get("toSort"))
+                    cli.send_game_packet(41462, pack_body(f"{from_sort},{catch},{to_sort},0").hex())
+                    log("info", f"背包精灵 id={catch} 移至位置 {to_sort} (41462 [{from_sort},{catch},{to_sort},0])...")
+                try:
+                    cli.send_game_packet(43706, "")
+                except Exception:
+                    pass
+                return self._send_json({"ok": True, "sent": {"kind": kind,
+                    "cmd": 2304 if kind == "storage" else 41462, "catchTime": catch}})
+            except Exception as e:
+                log("error", f"移动精灵失败: {e}")
+                return self._send_json({"ok": False, "error": str(e)}, 400)
+
+        elif path == "/api/body-preview":
+            # 前端实时预览: 把参数列表打包成标准包体并显示其十六进制
+            try:
+                spec = str(data.get("spec", ""))
+                ok, packed = pack_body(spec, raise_on_error=False)
+                if not ok:
+                    return self._send_json({"ok": False, "error": packed}, 400)
+                body = packed
+                try:
+                    parts = parse_parts(spec)
+                except ValueError as e:
+                    parts = [str(e)]
+                return self._send_json({"ok": True, "hex": body.hex(), "length": len(body),
+                                        "parts": parts}, 200)
+            except Exception as e:
+                return self._send_json({"ok": False, "error": str(e)}, 400)
+
+        elif path == "/api/filter":
+            # 保存过滤包id名单 (逗号/空白分隔或数组); 名单内的包将被舍弃
+            global _FILTER_IDS
+            raw = data.get("ids", "")
+            if isinstance(raw, list):
+                ids = [int(x) for x in raw if str(x).strip().isdigit() or str(x).strip().lstrip("-").isdigit()]
+            else:
+                ids = [int(t.strip()) for t in str(raw).replace(",", " ").split() if t.strip()]
+            _FILTER_IDS = set(ids)
+            _save_filter(_FILTER_IDS)
+            log("info", f"已更新并保存过滤包id名单: {sorted(_FILTER_IDS)}")
+            return self._send_json({"ok": True, "ids": sorted(_FILTER_IDS)})
+
+        return self._send_json({"ok": False, "error": "unknown"}, 404)
+
+
+# ---- 前端页面 (内嵌) ----
+PAGE = r"""<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<title>赛尔号协议调试台</title>
+<style>
+ *{box-sizing:border-box}
+ body{font-family:Menlo,Consolas,monospace;margin:0;background:#0e1117;color:#d8dee9}
+ header{padding:12px 16px;background:#161b22;border-bottom:1px solid #30363d;display:flex;align-items:center}
+ header h1{font-size:16px;margin:0;color:#58a6ff}
+ .status{margin-left:auto;padding:3px 10px;border-radius:12px;font-size:12px;background:#21262d}
+ .st-idle{color:#9aa5b1} .st-logging_in{color:#d29922} .st-ready{color:#3fb950} .st-error{color:#f85149}
+ main{display:flex;gap:12px;padding:12px;flex-wrap:wrap}
+ .card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px;min-width:280px}
+ .card h2{font-size:13px;margin:0 0 8px;color:#8b949e}
+ label{font-size:12px;color:#8b949e;display:block;margin:6px 0 2px}
+ input[type=text],input[type=password],input[type=number],textarea{width:100%;padding:6px 8px;background:#0d1117;border:1px solid #30363d;color:#d8dee9;border-radius:6px;font:12px/1.4 Menlo,monospace}
+ button{margin:8px 6px 0 0;padding:6px 12px;background:#238636;border:0;color:#fff;border-radius:6px;cursor:pointer;font-size:12px}
+ button.off{background:#6e7681} button:disabled{opacity:.5;cursor:not-allowed}
+ #log{width:100%;min-height:340px;height:calc(100vh - 470px);overflow:auto;background:#0d1117;padding:8px;border:1px solid #30363d;border-radius:6px;font:12px/1.5 Menlo,monospace;white-space:pre-wrap}
+ .lvl-info{color:#9aa5b1}.lvl-ok{color:#3fb950}.lvl-packet{color:#58a6ff}.lvl-error{color:#f85149}.lvl-tip{color:#d29922}.lvl-status{color:#e3b341}
+ #resp{width:100%;min-height:120px;background:#0d1117;padding:8px;border:1px solid #30363d;border-radius:6px;font:12px Menlo,monospace;color:#a5d6a7}
+ .rowflex{display:flex;gap:6px}.rowflex>*{flex:1}
+ .filterbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:0 0 8px}
+ .filterbar label{display:inline;margin:0;white-space:nowrap}
+ .filterbar input[type=text]{width:auto;flex:1;min-width:200px}
+ .filterbar input[type=checkbox]{width:auto;vertical-align:middle;margin-right:3px}
+ .filterbar button{margin:0}
+ .tabs{display:flex;gap:4px;padding:10px 16px 0;background:#161b22;border-bottom:1px solid #30363d}
+ .tabs .tab{padding:6px 18px;margin:0;background:#21262d;border:1px solid #30363d;border-bottom:0;border-radius:8px 8px 0 0;color:#8b949e}
+ .tabs .tab.active{background:#0e1117;color:#58a6ff;border-color:#58a6ff}
+ .tab-panel{display:none}
+ .tab-panel.active{display:block}
+ .bagwrap{display:flex;gap:12px;padding:12px}
+ .avrow{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin:0 0 12px}
+ .av-btn{display:block;min-width:0;margin:0;padding:6px;background:#21262d;border:1px solid #30363d;border-radius:8px;text-align:center;cursor:pointer;color:#d8dee9;overflow:hidden;font:12px Menlo,monospace;line-height:1.2;touch-action:none;-webkit-tap-highlight-color:transparent}
+ .av-btn.sel{border-color:#58a6ff;background:#0d2a45}
+ .av-img{width:100%;aspect-ratio:1;background:#0d1117;border:1px solid #30363d;border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:11px;color:#8b949e}
+ .av-empty{width:100%;aspect-ratio:1;background:transparent;border:1px dashed #30363d;border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:11px;color:#4b5563}
+ .av-txt{font-size:11px;margin-top:4px;color:#d8dee9;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+ .detail-grid{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;font-size:12px}
+ .detail-grid .k{color:#8b949e}
+ .detail-grid .v{color:#d8dee9}
+ .detail-sec{margin-top:8px}
+ .detail-sec h3{font-size:12px;color:#58a6ff;margin:8px 0 4px}
+ .abgrid{display:grid;grid-template-columns:repeat(2,1fr);gap:6px 18px}
+ .abcell{display:flex;align-items:center;gap:6px;font-size:12px}
+ .abcell .k{color:#8b949e}
+ .abcell .v{color:#d8dee9}
+ .abcell .ev{color:#f1e05a}
+ .marks-row{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;align-items:center;justify-items:center}
+ .mark-icon{width:46px;height:46px;background:#0d1117;border:1px solid #30363d;border-radius:6px;display:flex;flex-direction:column;align-items:center;justify-content:center;font-size:10px;color:#8b949e}
+ .mark-icon .lbl{font-size:9px;color:#8b949e}
+ .skillgrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+ .sk{width:100%;height:74px;background:#0d1117;border:1px solid #30363d;border-radius:6px;display:flex;flex-direction:column;align-items:center;justify-content:center;font-size:11px;color:#8b949e;min-width:0;overflow:hidden}
+ .sk .pp{font-size:10px;color:#6e7681}
+ .sk.sk5{grid-column:span 2}
+ .sk-click{cursor:pointer;transition:border-color .15s}
+ .sk-click:hover{border-color:#58a6ff;background:#111826}
+ .sk-nm{color:#d8dee9;font-size:12px;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+ .sk-sub{color:#8b949e;font-size:10px;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+ .sk-attr{margin-right:4px}
+ .sk-pow{color:#e3b341}
+ .soulmarks{display:none}
+ .smark-wrap{width:100%}
+ .smark-btn{width:100%;height:74px;background:#0d1117;border:1px solid #30363d;border-radius:6px;display:flex;align-items:center;gap:10px;padding:0 12px;cursor:pointer;color:#d8dee9;transition:border-color .15s}
+ .smark-btn:hover{border-color:#58a6ff;background:#111826}
+ .smark-img{width:44px;height:44px;object-fit:contain;background:#0d1117;border:1px solid #21262d;border-radius:6px;flex:0 0 auto;image-rendering:pixelated}
+ .smark-mid{display:flex;flex-direction:column;align-items:flex-start;gap:4px;min-width:0}
+ .smark-title{font-size:15px;color:#d8dee9;line-height:1}
+ .smark-tags{display:flex;flex-wrap:wrap}
+ .smark-btn-disabled{width:100%;height:74px;background:#0d1117;border:1px dashed #30363d;border-radius:6px;display:flex;align-items:center;justify-content:center;color:#6e7681;font-size:12px}
+ .soulmark-tag{display:inline-block;background:#12263b;color:#58a6ff;border:1px solid #1f3a5a;border-radius:4px;font-size:10px;padding:1px 6px;margin-right:4px}
+ .smark-modal-icon{width:56px;height:56px;margin:0 auto 10px}
+ .smark-modal-icon img{width:56px;height:56px;object-fit:contain;image-rendering:pixelated}
+ .smark-nav-btn{background:#21262d;border:1px solid #30363d;color:#d8dee9;border-radius:6px;padding:4px 12px;font-size:12px;cursor:pointer}
+ .smark-nav-btn:hover:not(:disabled){border-color:#58a6ff;color:#58a6ff}
+ .smark-nav-btn:disabled{opacity:.4;cursor:default}
+ #war-list{overflow-y:auto;max-height:calc(100vh - 300px);min-height:240px}
+ #war-info{margin-top:8px;border-top:1px solid #30363d;padding-top:8px;font-size:12px;color:#d8dee9}
+ .warfilt{background:#21262d;border:1px solid #30363d;color:#8b949e;margin:0;padding:4px 12px;font-size:12px;border-radius:6px}
+ .warfilt.active{background:#0d2a45;border-color:#58a6ff;color:#58a6ff}
+</style>
+</head>
+<body>
+<header>
+  <h1>赛尔号协议调试台</h1>
+  <div class="status" id="status">idle</div>
+</header>
+<div class="tabs">
+  <button class="tab active" data-tab="login">登录</button>
+  <button class="tab" data-tab="bag">背包</button>
+</div>
+<div id="tab-login" class="tab-panel active">
+<main>
+  <div class="card" style="flex:1.2">
+    <h2>① 登录操作</h2>
+    <label>米米号(账号)<sup style="color:#f85149">*</sup> <span style="color:#8b949e">可下拉选择已保存的</span></label>
+    <input id="account" type="text" list="credList" placeholder="输入 或 选择已保存的米米号" autofocus>
+    <datalist id="credList"></datalist>
+    <label>密码<sup style="color:#f85149">*</sup></label><input id="password" type="password">
+    <div class="rowflex">
+      <div><label>游戏服IP</label><input id="host" type="text" value="101.43.19.60"></div>
+      <div><label>端口</label><input id="port" type="number" value="1201"></div>
+    </div>
+    <button id="loginBtn">登录</button><button id="discBtn" class="off" disabled>断开</button>
+    <button id="delCredBtn" class="off" style="display:none">删除已选账号</button>
+  </div>
+
+  <div class="card" style="flex:1.4">
+    <h2>③ 发包测试</h2>
+    <label>命令（全部）<sup style="color:#888">选一个跳到下面</sup></label>
+    <select id="cmdRef"><option value="">— 从全部 2910 条命令中选择 —</option></select>
+    <label>命令号 / 名字（可输入过滤）</label><input id="cmd" type="text" list="cmdList" placeholder="如 40001 或 ENTER_MAP" value="40001">
+    <datalist id="cmdList"></datalist>
+    <label>包体参数（十进制，逗号/空格分隔）<sup style="color:#888">自动转标准包体</sup></label>
+    <input id="body" type="text" placeholder="十进制参数, 逗号/空格分隔; 可留空(空包体)。如 0 10 725 172  → 000000000000000A000002D5000000A0" value="">
+    <div class="rowflex" style="align-items:center;gap:8px">
+      <label style="margin:0"><input id="rawHex" type="checkbox"> 原样HEX</label>
+      <div style="margin-left:auto"><label style="margin:0">预览</label><code id="bodyPrev" style="display:inline-block;margin-left:6px;padding:2px 6px;background:#0d1117;border:1px solid #30363d;border-radius:4px;color:#79c0ff;font:11px Menlo,monospace;word-break:break-all">—</code></div>
+    </div>
+    <button id="sendBtn" disabled>发送</button>
+    <button id="petbagBtn" class="off" disabled title="发送命令 43706 GET_PET_INFO_BY_ONCE, 查询背包内所有精灵(含能力值)">查询背包精灵(43706)</button>
+    <div style="margin-top:8px"><label>服务器响应（实时，内容可选中复制；受过滤包id/收发复选框约束）</label>
+      <div id="sendStatus" style="font-size:12px;color:#8b949e;margin:2px 0 6px">—</div>
+      <div id="pktWrap" style="max-height:240px;overflow:auto;border:1px solid #30363d;border-radius:6px;background:#0d1117">
+        <table id="pktTable" style="width:100%;table-layout:fixed;border-collapse:collapse;font:12px Menlo,monospace;user-select:text;cursor:text">
+          <colgroup>
+            <col style="width:60px">
+            <col style="width:84px">
+            <col style="width:26%">
+            <col>
+          </colgroup>
+          <thead>
+            <tr style="text-align:left;background:#161b22">
+              <th style="padding:4px 8px;border:1px solid #30363d">类型</th>
+              <th style="padding:4px 8px;border:1px solid #30363d">命令号</th>
+              <th style="padding:4px 8px;border:1px solid #30363d">包体(hex)</th>
+              <th style="padding:4px 8px;border:1px solid #30363d">十进制数组</th>
+            </tr>
+          </thead>
+          <tbody id="pktBody"></tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</main>
+
+<div style="padding:0 12px 12px">
+  <div class="card">
+    <h2>② 日志输出 (实时) <button id="clearLogBtn" class="off" style="float:right;margin:0;padding:2px 10px;font-size:12px">清空输出</button></h2>
+    <div class="filterbar">
+      <label style="margin:0">过滤包id</label>
+      <input id="filterIds" type="text" spellcheck="false" placeholder="逗号分隔, 如 40002,2192,41228,4047,4475,41080,9134,2604,9019,2101,2004,3405,2601,2002,43321,1002,9908">
+      <label style="margin:0"><input id="chkSend" type="checkbox" checked> 接收send</label>
+      <label style="margin:0"><input id="chkRecv" type="checkbox" checked> 接收recv</label>
+      <button id="applyFilterBtn" class="off" style="margin:0;padding:2px 10px;font-size:12px">应用过滤</button>
+    </div>
+    <div id="log"></div>
+  </div>
+</div>
+</div><!-- /tab-login -->
+
+<div id="tab-bag" class="tab-panel">
+  <div class="bagwrap">
+    <div class="card" style="flex:1;min-width:320px">
+      <h2>出战背包（第一背包）</h2><div id="bag-first" class="avrow"><div style="color:#8b949e">等待...（登录后自动 43706 查询）</div></div>
+      <h2>待命背包（第二背包）</h2><div id="bag-second" class="avrow"><div style="color:#8b949e">等待...</div></div>
+      <button id="teamBtn" class="off" title="查看并切换到其它阵容">切换阵容</button>
+      <button id="wareBtn" class="off" title="打开/关闭精灵仓库">精灵仓库</button>
+      <div id="bag-status" style="display:none"></div>
+    </div>
+    <div class="card" style="flex:1.5;min-width:360px">
+      <div id="bag-detail-card">
+        <h2 id="bag-title">精灵详情</h2>
+        <div id="bag-detail"><div style="color:#8b949e">选中一只精灵查看信息</div></div>
+        <button id="storeBtn" class="off" disabled title="将选中精灵放入仓库">入库</button>
+      </div>
+      <div id="warehouse-view" style="display:none">
+        <h2 id="war-title">精灵仓库</h2>
+        <div style="display:flex;gap:8px;align-items:center;margin:0 0 8px;flex-wrap:wrap">
+          <button id="warTypeNormal" class="warfilt active">普通仓库</button>
+          <button id="warTypeExe" class="warfilt">精英仓库</button>
+          <input id="warSearch" type="text" spellcheck="false" placeholder="按id搜索仓库精灵" style="flex:1;min-width:120px;padding:6px 8px;background:#0d1117;border:1px solid #30363d;color:#d8dee9;border-radius:6px;font:12px Menlo,monospace">
+          <button id="warClose" class="off" style="display:none;margin:0;padding:2px 10px;font-size:12px" title="关闭搜索">×</button>
+        </div>
+        <div id="war-list" class="avrow"><div style="color:#8b949e">点击“精灵仓库”后拉取...</div></div>
+        <div id="war-info"></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<div id="teamModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:999">
+  <div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:440px;max-height:72vh;overflow:auto;background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px">
+    <h3 style="margin:0 0 8px;color:#58a6ff">阵容列表 <span id="teamNote" style="font-size:11px;color:#8b949e"></span></h3>
+    <div id="teamList"></div>
+  </div>
+</div>
+
+<div id="skillModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:1000">
+  <div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:420px;max-height:76vh;overflow:auto;background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px">
+    <h3 style="margin:0 0 10px;color:#58a6ff" id="skillModalTitle">技能详情</h3>
+    <div id="skillModalBody" style="font-size:12px;color:#d8dee9"></div>
+  </div>
+</div>
+
+<script>
+const logEl=document.getElementById('log');
+const statusEl=document.getElementById('status');
+function setStatus(s){statusEl.textContent=s;statusEl.className='status st-'+s;}
+
+// ---- 过滤/接收开关 (前端显示层) ----
+let idFilter = new Set();
+const chkSendEl = document.getElementById('chkSend');
+const chkRecvEl = document.getElementById('chkRecv');
+const filterIdsEl = document.getElementById('filterIds');
+function shouldShow(e){
+  if(e && e.direction){                       // 封包
+    const c = Number(e.cmd);
+    if(Number.isFinite(c) && idFilter.has(c)) return false;     // 名单内的包舍弃
+    const d = String(e.direction).toUpperCase();
+    if(d==='SEND' && !chkSendEl.checked) return false;
+    if(d==='RECV' && !chkRecvEl.checked) return false;
+  }
+  return true;
+}
+
+let lastSeenSeq=0;   // 仅用于去重 SSE 断线重连的回放, 不限制新包
+function appendLog(e){
+  const line=document.createElement('div');
+  line.className='lvl-'+(e.level||'info');
+  let t=`${e.t} [${e.level}] ${e.msg}`;
+  if(e.direction) t=`${e.t} [${e.direction}] cmd=${e.cmd}  ${e.msg}`;
+  line.textContent=t;
+  logEl.appendChild(line);
+  logEl.scrollTop=logEl.scrollHeight;
+  while(logEl.childNodes.length>20000) logEl.removeChild(logEl.firstChild);
+}
+
+// 实时接收: SSE 推送 (取代原来的 1.2s 轮询; 去掉 seq 去重限制)
+const es = new EventSource('/api/stream');
+es.onmessage = (ev)=>{
+  let e; try{ e=JSON.parse(ev.data); }catch(_){ return; }
+  if(e.seq && e.seq<=lastSeenSeq) return;                 // 去重断线回放
+  if(!shouldShow(e)){ if(e.seq) lastSeenSeq=Math.max(lastSeenSeq,e.seq); return; }
+  appendLog(e);
+  if(e.direction) appendTable(e);                         // 表格只记包 (send/recv)
+  if(e.seq && e.seq>lastSeenSeq) lastSeenSeq=e.seq;
+};
+es.onerror = ()=>{};                                        // 浏览器会自动重连
+
+// 从 /api/log 整panel重建 (应用当前过滤/开关); 用于初始加载与改动过滤/开关后即时生效
+async function renderLog(){
+  try{
+    const r=await fetch('/api/log'); const logs=await r.json();
+    logEl.innerHTML=''; lastSeenSeq=0;
+    for(const e of logs){ if(!shouldShow(e)) continue; appendLog(e); if(e.seq && e.seq>lastSeenSeq) lastSeenSeq=e.seq; }
+  }catch(e){}
+}
+
+// 读取 / 保存过滤名单
+async function loadFilter(){
+  try{
+    const r=await fetch('/api/filter'); const j=await r.json();
+    idFilter=new Set((j.ids||[]).map(Number));
+    filterIdsEl.value=(j.ids||[]).join(', ');
+  }catch(e){}
+}
+async function saveFilter(){
+  const raw=filterIdsEl.value;
+  const ids=raw.split(/[,\s]+/).map(s=>Number(s.trim())).filter(n=>Number.isFinite(n));
+  try{
+    const r=await fetch('/api/filter',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ids})});
+    const j=await r.json(); idFilter=new Set((j.ids||[]).map(Number));
+  }catch(e){}
+  renderLog(); renderTable();
+}
+function clearOutput(){ logEl.innerHTML=''; }
+
+document.getElementById('applyFilterBtn').onclick=saveFilter;
+chkSendEl.addEventListener('change',()=>{renderLog();renderTable();});
+chkRecvEl.addEventListener('change',()=>{renderLog();renderTable();});
+loadFilter().then(renderLog);
+// 记住的账号密码 (与"米米号"字段合并: 下拉选择已保存米米号 -> 自动填账号+密码)
+let savedAccounts=[];
+async function loadCreds(){
+  try{
+    const r=await fetch('/api/credentials'); const j=await r.json(); savedAccounts=j.accounts||[];
+    // 填充"米米号"字段的 datalist (已保存的米米号)
+    const dl=document.getElementById('credList');
+    dl.innerHTML='';
+    savedAccounts.forEach(e=>{ const o=document.createElement('option'); o.value=e.account; dl.appendChild(o); });
+    const delBtn=document.getElementById('delCredBtn');
+    if(savedAccounts.length){
+      const last=savedAccounts[savedAccounts.length-1];
+      document.getElementById('account').value=last.account;
+      document.getElementById('password').value=last.password;
+      delBtn.style.display='inline-block';
+    }else{ delBtn.style.display='none'; }
+  }catch(e){}
+}
+// 在"米米号"里选中(或输入)某个已保存的米米号 => 自动填入密码
+document.getElementById('account').addEventListener('input',()=>{
+  const acc=document.getElementById('account').value.trim();
+  const hit=savedAccounts.find(e=>e.account===acc);
+  if(hit) document.getElementById('password').value=hit.password;
+});
+document.getElementById('delCredBtn').onclick=async()=>{
+  const acc=document.getElementById('account').value.trim();
+  if(!acc){ appendLog({t:now(),level:'tip',msg:'请先填写要删除的米米号(账号)'}); return; }
+  const r=await fetch('/api/credentials/delete',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({account:acc})});
+  const j=await r.json();
+  if(j.ok){ savedAccounts=j.accounts; document.getElementById('account').value=''; document.getElementById('password').value=''; loadCreds(); }
+};
+loadCreds();
+
+async function refreshStatus(){
+  try{const r=await fetch('/api/status');const s=await r.json();
+    setStatus(s.status||'idle');
+    document.getElementById('loginBtn').disabled=(s.status==='logging_in');
+    document.getElementById('sendBtn').disabled=(s.status!=='ready');
+    document.getElementById('petbagBtn').disabled=(s.status!=='ready');
+    document.getElementById('teamBtn').disabled=(s.status!=='ready');
+    document.getElementById('wareBtn').disabled=(s.status!=='ready');
+    document.getElementById('discBtn').disabled=(s.status==='idle');
+  }catch(e){}
+}
+setInterval(refreshStatus,1000);refreshStatus();
+
+function now(){return new Date().toTimeString().slice(0,8);}
+document.getElementById('loginBtn').onclick=async()=>{
+  const btn=document.getElementById('loginBtn');
+  const accEl=document.getElementById('account');
+  const pwdEl=document.getElementById('password');
+  const acc=accEl.value.trim(), pwd=pwdEl.value;
+  accEl.style.border=''; pwdEl.style.border='';
+  if(!acc){accEl.focus();accEl.style.border='1px solid #f85149';setStatus('error');appendLog({t:now(),level:'error',msg:'请先填写米米号(账号)'});return;}
+  if(!pwd){pwdEl.focus();pwdEl.style.border='1px solid #f85149';setStatus('error');appendLog({t:now(),level:'error',msg:'请先填写密码'});return;}
+  btn.disabled=true;
+  try{
+    const body={account:acc,password:pwd,
+      host:document.getElementById('host').value,port:document.getElementById('port').value};
+    const r=await fetch('/api/login',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const j=await r.json();
+    if(!j.ok){setStatus('error');appendLog({t:now(),level:'error',msg:'登录请求失败: '+(j.error||('HTTP '+r.status))});btn.disabled=false;}
+    else{setStatus('logging_in');appendLog({t:now(),level:'info',msg:'登录请求已提交, 后台处理中...'});}
+  }catch(e){
+    setStatus('error');
+    appendLog({t:now(),level:'error',msg:'提交登录出错: '+e});
+    btn.disabled=false;
+  }
+};
+document.getElementById('discBtn').onclick=async()=>{await fetch('/api/disconnect',{method:'POST'});refreshStatus();renderLog();};
+document.getElementById('clearLogBtn').onclick=clearOutput;
+document.getElementById('sendBtn').onclick=async()=>{
+  const body={cmd:document.getElementById('cmd').value,body:document.getElementById('body').value,
+    encode:document.getElementById('rawHex').checked?'hex':'pack'};
+  const st=document.getElementById('sendStatus');
+  try{
+    const r=await fetch('/api/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const j=await r.json();
+    if(j.ok){
+      const n=(window.__CM||{})[j.sent.cmd]||'';
+      st.textContent=`已发送 cmd=${j.sent.cmd} ${n}　(不阻塞等待应答, 实时显示在下方表格)`;
+      st.style.color='#3fb950';
+    }else{ st.textContent='发送失败: '+(j.error||''); st.style.color='#f85149'; }
+  }catch(e){ st.textContent='发送出错: '+e; st.style.color='#f85149'; }
+};
+// 查询背包精灵: 发送命令 43706 GET_PET_INFO_BY_ONCE (空包体), 由后台监听线程读取应答
+document.getElementById('petbagBtn').onclick=async()=>{
+  const st=document.getElementById('sendStatus');
+  st.textContent='正在发送 43706 GET_PET_INFO_BY_ONCE 查询背包精灵...'; st.style.color='#d29922';
+  const body={cmd:'43706',body:'',encode:'pack'};
+  try{
+    const r=await fetch('/api/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    const j=await r.json();
+    if(j.ok){
+      st.textContent='已发送 43706 GET_PET_INFO_BY_ONCE (查询背包一切精灵), 应答实时显示在下方表格 (RECV)';
+      st.style.color='#3fb950';
+    }else{ st.textContent='发送失败: '+(j.error||''); st.style.color='#f85149'; }
+  }catch(e){ st.textContent='发送出错: '+e; st.style.color='#f85149'; }
+};
+// ---- 服务器响应表格 (实时, 可选中复制) ----
+const pktBodyEl=document.getElementById('pktBody');
+let pktRows=[];              // 所有已记表封包 (供收发复选框/过滤重渲染)
+const PKT_MAX=3000;
+function renderTableRow(r){
+  const tr=document.createElement('tr');
+  // 类型列: SEND / RECV 单行显示; 其余列单行 + 超出省略号, 但 title 保存完整内容便于复制
+  const mkCell=(val,color)=>{ const cd=document.createElement('td'); cd.textContent=val; cd.title=val;
+    cd.style.padding='3px 8px'; cd.style.border='1px solid #21262d'; cd.style.color=color || '#d8dee9';
+    cd.style.whiteSpace='nowrap'; cd.style.overflow='hidden'; cd.style.textOverflow='ellipsis';
+    return cd; };
+  const c1=mkCell(r.dir, r.dir==='SEND'?'#79c0ff':'#3fb950');
+  const c2=mkCell(r.cmd);
+  const c3=mkCell(r.body);
+  const c4=mkCell((r.ints&&r.ints.length)?`[${r.ints.join(', ')}]`:(r.body?'(非int32)':'[]'));
+  tr.appendChild(c1);tr.appendChild(c2);tr.appendChild(c3);tr.appendChild(c4);
+  return tr;
+}
+function appendTable(e){
+  // 归一化入口: SSE 日志项里的方向字段是 direction, 表格行统一用 dir
+  const r={dir:e.direction, cmd:e.cmd, body:e.body, ints:e.ints||[]};
+  pktRows.push(r);
+  if(pktRows.length>PKT_MAX) pktRows.shift();
+  pktBodyEl.appendChild(renderTableRow(r));
+  while(pktBodyEl.childNodes.length>PKT_MAX) pktBodyEl.removeChild(pktBodyEl.firstChild);
+  const wrap=document.getElementById('pktWrap'); if(wrap) wrap.scrollTop=wrap.scrollHeight;
+}
+function renderTable(){          // 应用当前收发复选框 + 包id过滤, 重渲染整表
+  pktBodyEl.innerHTML='';
+  for(const r of pktRows){
+    const c=Number(r.cmd);
+    if(Number.isFinite(c) && idFilter.has(c)) continue;
+    const d=String(r.dir).toUpperCase();
+    if(d==='SEND' && !chkSendEl.checked) continue;
+    if(d==='RECV' && !chkRecvEl.checked) continue;
+    pktBodyEl.appendChild(renderTableRow(r));
+  }
+}
+// 包体实时预览: 把参数列表打包成标准包体并显示十六进制
+const bodyEl=document.getElementById('body'), rawEl=document.getElementById('rawHex'), prevEl=document.getElementById('bodyPrev');
+bodyEl.addEventListener('input',updateBodyPreview);
+rawEl.addEventListener('change',updateBodyPreview);
+async function updateBodyPreview(){
+  const spec=bodyEl.value, raw=rawEl.checked;
+  prevEl.textContent='…';
+  try{
+    if(raw){ prevEl.textContent=(spec||'(空)'); return; }
+    const r=await fetch('/api/body-preview',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({spec})});
+    const j=await r.json();
+    if(j.ok){
+      const parts=j.parts||[];
+      prevEl.textContent=j.length?`${j.hex}  (${j.length}B; ${parts.map(p=>p[0]+'='+p[2]+'B').join(', ')}| 分包: ${parts.map(p=>p[0]).join(', ')})`:'(空包体)';
+      prevEl.style.color='#79c0ff';
+    }else{ prevEl.textContent='错误: '+(j.error||''); prevEl.style.color='#f85149'; }
+  }catch(e){ prevEl.textContent='错误: '+e; prevEl.style.color='#f85149'; }
+}
+updateBodyPreview();
+// 命令名自动补全 + 应答显示命令名
+window.__CM={};
+async function loadCmdMap(){
+  try{ const r=await fetch('/api/cmdmap'); const m=await r.json(); window.__CM=m;
+    const dl=document.getElementById('cmdList'); dl.innerHTML='';
+    const ref=document.getElementById('cmdRef'); ref.innerHTML='<option value="">— 从全部 '+Object.keys(m).length+' 条命令中选择 —</option>';
+    const opts=[];
+    for(const [id,name] of Object.entries(m)){ opts.push(name+' ('+id+')'); }
+    opts.sort();
+    opts.forEach(o=>{
+      const d=document.createElement('option'); d.value=o; dl.appendChild(d);
+      const s=document.createElement('option');
+      s.value=o.split(' (')[0];           // 选中后填入命令名
+      s.textContent=o;                    // 显示 name (id)
+      ref.appendChild(s);
+    });
+  }catch(e){}
+}
+// 在"命令(全部)"下拉里选一个 => 填入命令号输入框, 便于直接发送
+document.getElementById('cmdRef').onchange=()=>{
+  const v=document.getElementById('cmdRef').value;
+  if(v) document.getElementById('cmd').value=v;
+};
+loadCmdMap();
+
+// ---- 分页切换 ----
+document.querySelectorAll('.tabs .tab').forEach(t=>{
+  t.addEventListener('click',()=>{
+    document.querySelectorAll('.tabs .tab').forEach(x=>x.classList.remove('active'));
+    t.classList.add('active');
+    document.querySelectorAll('.tab-panel').forEach(p=>p.classList.remove('active'));
+    const p=document.getElementById('tab-'+t.dataset.tab); if(p) p.classList.add('active');
+    if(t.dataset.tab==='bag') refreshBag();
+  });
+});
+
+// 精灵按钮文本: 仅显示名字; 无名字则显示 id 数字 (统一背包+仓库)
+function displayName(p){
+  const n=(p && p.name || '').trim();
+  if(n && !/^\(id=/.test(n)) return n;
+  return String((p && p.id)!=null ? p.id : '?');
+}
+// 等级徽标: 黄字填充 + 黑色【外描边】 (黑色描边层在后, 黄色实心层在前), 黑体加粗
+// -webkit-text-stroke 居中描边会吃掉黄字内部, 这里用双层叠加实现真·外描边
+function makeLvBadge(level){
+  const txt='LV.'+(level!=null?level:'?');
+  const wrap=document.createElement('span');
+  wrap.style.cssText='position:absolute;left:2px;bottom:2px;z-index:1;display:inline-block';
+  const bk=document.createElement('span');   // 黑色外描边层 (在后)
+  bk.textContent=txt;
+  bk.style.cssText='position:absolute;left:0;top:0;color:#000;font:900 13px/1 "Heiti SC","SimHei","Microsoft YaHei",sans-serif;-webkit-text-stroke:1.5px #000;padding:0;';
+  const fg=document.createElement('span');   // 黄色实心层 (在前)
+  fg.textContent=txt;
+  fg.style.cssText='position:relative;display:inline-block;color:#ff0;font:900 13px/1 "Heiti SC","SimHei","Microsoft YaHei",sans-serif;padding:0;';
+  wrap.appendChild(bk); wrap.appendChild(fg);
+  return wrap;
+}
+// ---- 背包 (43706 解析结果) ----
+let bagData={first:[],second:[]};
+let bagSel=null;   // {bag:'first'|'second', index}
+let petSlotButtons=[];   // 每只精灵按钮的引用 {btn,pet,bag,index}, 供拖拽计算重叠
+let emptySlotButtons=[]; // 背包空位按钮 {btn,bag,index}, 拖拽到空位 = 移至该背包
+let suppressClick=false; // 拖拽结束后抑制一次 click
+let dragState={active:false, copy:null, src:null};  // 拖拽状态
+
+// 计算两个矩形在视口坐标下的重叠面积
+function overlapArea(a, b){
+  const w=Math.min(a.right,b.right)-Math.max(a.left,b.left);
+  const h=Math.min(a.bottom,b.bottom)-Math.max(a.top,b.top);
+  return (w>0&&h>0)?w*h:0;
+}
+// 从 bag+index 推导 sortIndex (第一背包 1..6, 第二背包 7..12)
+function sortIndexOf(slot){ return slot.bag==='second' ? (slot.index+7) : (slot.index+1); }
+
+// 生成复制的精灵图标并进入拖拽 (复制图标也载入本地头像)
+function startDrag(slot){
+  dragState.active=true; dragState.src=slot;
+  const copy=document.createElement('div');
+  copy.style.cssText='position:fixed;z-index:1000;pointer-events:none;width:72px;padding:4px;background:#21262d;border:1px solid #58a6ff;border-radius:8px;text-align:center;color:#d8dee9;font:11px Menlo,monospace;box-shadow:0 4px 12px rgba(0,0,0,.5);font-size:10px';
+  const ic=document.createElement('div'); ic.style.cssText='width:100%;aspect-ratio:1;background:#0d1117;border:1px solid #30363d;border-radius:6px;display:flex;align-items:center;justify-content:center;color:#8b949e;overflow:hidden';
+  if(slot.pet.avatar){
+    const im=document.createElement('img'); im.src=slot.pet.avatar; im.alt='';
+    im.style.width='100%'; im.style.height='100%'; im.style.objectFit='contain';
+    im.draggable=false; im.style.webkitUserDrag='none'; im.style.userSelect='none';
+    ic.appendChild(im);
+  }else{
+    ic.textContent=(slot.pet.name||('id='+slot.pet.id)).slice(0,4);
+  }
+  copy.appendChild(ic);
+  const cap=document.createElement('div'); cap.style.marginTop='4px'; cap.style.overflow='hidden'; cap.style.textOverflow='ellipsis'; cap.style.whiteSpace='nowrap'; cap.style.fontSize='10px';
+  cap.textContent=(slot.pet.name||('id='+slot.pet.id))+' Lv'+(slot.pet.level!=null?slot.pet.level:'?');
+  copy.appendChild(cap);
+  dragState.copy=copy;
+  document.body.appendChild(copy);
+}
+// 拖拽结束: 计算唯一最大重叠, 决定是否换位 (与首发重叠 -> 令该精灵首发)
+function endDrag(){
+  const copy=dragState.copy, slot=dragState.src;
+  if(copy){
+    const cr=copy.getBoundingClientRect();
+    let best=null, bestEmpty=null, bestArea=0, tie=false;
+    for(const o of petSlotButtons){
+      if(o.btn===slot.btn) continue;
+      const ar=overlapArea(cr, o.btn.getBoundingClientRect());
+      if(ar>bestArea+0.5){ bestArea=ar; best=o; bestEmpty=null; tie=false; }
+      else if(ar>0 && Math.abs(ar-bestArea)<0.5){ tie=true; }
+    }
+    for(const o of emptySlotButtons){
+      const ar=overlapArea(cr, o.btn.getBoundingClientRect());
+      if(ar>bestArea+0.5){ bestArea=ar; bestEmpty=o; best=null; tie=false; }
+      else if(ar>0 && Math.abs(ar-bestArea)<0.5){ tie=true; }
+    }
+    if(best && bestArea>0 && !tie){
+      const sk=slot.kind||'bag', tk=best.kind||'bag';
+      if(sk==='storage' && tk==='bag'){ warehouseSwap(best, slot); }        // 仓库拖到背包: 互换
+      else if(sk==='bag' && tk==='storage'){ warehouseSwap(slot, best); }  // 背包拖到仓库: 互换
+      else if(sk==='bag' && tk==='bag'){
+        const srcFirst = (slot.bag==='first' && slot.index===0);
+        const tgtFirst = (best.bag==='first' && best.index===0);
+        if(tgtFirst){ setDefaultPet(slot); }
+        else if(srcFirst){ setDefaultPet(best); }
+        else { swapPets(slot, best); }
+      }
+      // storage<->storage: 无操作
+    } else if(bestEmpty && bestArea>0 && !tie){
+      // 拖到另一背包空位 => 直接移动(非复制)
+      const sk=slot.kind||'bag';
+      if(sk==='storage'){ moveStorageToBag(slot.pet.catchTime, bestEmpty.bag); }        // 仓库 -> 该背包
+      else if(sk==='bag' && slot.bag!==bestEmpty.bag){ moveBagPetToBag(slot, bestEmpty); } // 背包 -> 另一背包
+    }
+    if(copy.parentNode) copy.parentNode.removeChild(copy);
+  }
+  dragState.active=false; dragState.copy=null; dragState.src=null;
+  suppressClick=true;
+  setTimeout(()=>{ suppressClick=false; }, 400);
+}
+// 仓库精灵移至指定背包空位 -> /api/pets/move (2304 取仓库到背包)
+async function moveStorageToBag(catchTime, bag){
+  setTimeout(()=>{ refreshBag(); }, 2500);
+  try{
+    const r=await fetch('/api/pets/move',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({kind:'storage',catchTime:catchTime,bag:bag})});
+    const j=await r.json();
+    if(j.ok) appendLog({t:now(),level:'ok',msg:'仓库精灵 id='+catchTime+' 已移至'+(bag==='second'?'待命':'出战')+'背包'});
+    else appendLog({t:now(),level:'error',msg:'移动失败: '+(j.error||'')});
+  }catch(e){ appendLog({t:now(),level:'error',msg:'移动出错: '+e}); }
+}
+// 背包精灵移至另一背包空位 -> /api/pets/move (41462 换位, 目标(空)catchTime=0)
+async function moveBagPetToBag(src, tgt){
+  setTimeout(()=>{ refreshBag(); }, 2500);
+  try{
+    const r=await fetch('/api/pets/move',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({kind:'bag',catchTime:src.pet.catchTime,fromSort:sortIndexOf(src),toSort:sortIndexOf(tgt)})});
+    const j=await r.json();
+    if(j.ok) appendLog({t:now(),level:'ok',msg:'精灵 id='+src.pet.id+' 已移至'+(tgt.bag==='second'?'待命':'出战')+'背包'});
+    else appendLog({t:now(),level:'error',msg:'移动失败: '+(j.error||'')});
+  }catch(e){ appendLog({t:now(),level:'error',msg:'移动出错: '+e}); }
+}
+// 全局拖拽: mousedown 记录起点 -> 移动>阈值即生成复制图标; 松开时结算
+let dragPending=null;   // {slot, x, y}
+document.addEventListener('mousemove',(e)=>{
+  if(dragPending && !dragState.active){
+    if(Math.abs(e.clientX-dragPending.x)>6 || Math.abs(e.clientY-dragPending.y)>6){
+      startDrag(dragPending.slot);
+    }
+  }
+  if(dragState.active && dragState.copy){
+    dragState.copy.style.left=(e.clientX-36)+'px';
+    dragState.copy.style.top=(e.clientY-45)+'px';
+  }
+});
+document.addEventListener('mouseup',()=>{
+  if(dragState.active){ endDrag(); }
+  dragPending=null;
+});
+// 触摸版拖拽: touchmove 移过阈值即产生复制图标并跟随; touchend 结算
+document.addEventListener('touchmove',(e)=>{
+  if(!(e.touches && e.touches[0])) return;
+  const t=e.touches[0];
+  if(dragPending && !dragState.active){
+    if(Math.abs(t.clientX-dragPending.x)>6 || Math.abs(t.clientY-dragPending.y)>6){
+      e.preventDefault(); startDrag(dragPending.slot);
+    }
+  }
+  if(dragState.active && dragState.copy){
+    e.preventDefault();
+    dragState.copy.style.left=(t.clientX-36)+'px';
+    dragState.copy.style.top=(t.clientY-45)+'px';
+  }
+},{passive:false});
+document.addEventListener('touchend',(e)=>{
+  if(dragState.active){ e.preventDefault(); endDrag(); }
+  dragPending=null;
+},{passive:false});
+// 切换两只精灵位置 (41462)
+async function swapPets(slotA, slotB){
+  setTimeout(()=>{ refreshBag(); }, 2500);   // 操作后刷新背包(由后端再发43706, 这里兜底)
+  try{
+    const s1=sortIndexOf(slotA), c1=slotA.pet.catchTime;
+    const s2=sortIndexOf(slotB), c2=slotB.pet.catchTime;
+    const r=await fetch('/api/pets/swap',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({sortIndex1:s1,catchTime1:c1,sortIndex2:s2,catchTime2:c2})});
+    const j=await r.json();
+    if(j.ok) setStatus('ready');
+    else appendLog({t:now(),level:'error',msg:'切换位置失败: '+(j.error||'')});
+  }catch(e){ appendLog({t:now(),level:'error',msg:'切换位置出错: '+e}); }
+}
+// 设为首发 (PET_DEFAULT 2308 [catchTime])
+async function setDefaultPet(slot){
+  setTimeout(()=>{ refreshBag(); }, 2500);
+  try{
+    const r=await fetch('/api/pets/default',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({catchTime:slot.pet.catchTime})});
+    const j=await r.json();
+    if(j.ok) appendLog({t:now(),level:'ok',msg:'已将 精灵 id='+slot.pet.id+' 设为首发'});
+    else appendLog({t:now(),level:'error',msg:'设为首发失败: '+(j.error||'')});
+  }catch(e){ appendLog({t:now(),level:'error',msg:'设为首发出错: '+e}); }
+}
+// 仓库精灵 <-> 背包精灵 互换
+async function warehouseSwap(bagSlot, storageSlot){
+  let ok=false;
+  try{
+    const r=await fetch('/api/pets/warehouse-swap',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({
+      bagCatchTime: bagSlot.pet.catchTime, bag: bagSlot.bag, storageCatchTime: storageSlot.pet.catchTime})});
+    const j=await r.json();
+    ok=!!j.ok;
+    if(j.ok) appendLog({t:now(),level:'ok',msg:'仓库互换成功 (背包 id='+bagSlot.pet.id+' <-> 仓库 id='+storageSlot.pet.id+')'});
+    else appendLog({t:now(),level:'error',msg:'仓库互换失败: '+(j.error||'')});
+  }catch(e){ appendLog({t:now(),level:'error',msg:'仓库互换出错: '+e}); }
+  if(!ok) return;
+  // 先刷新背包(等 43706 处理并更新 bagData), 再刷新仓库(基于更新后的背包排除已在背包的精灵)
+  await new Promise(res=>setTimeout(res, 1600));
+  await refreshBag();
+  await new Promise(res=>setTimeout(res, 600));
+  await fetchStorage();
+}
+
+// ---- 精灵仓库 ----
+let warehouseMode=false, warData=[], warSearch='', warType='normal', exeData=[], warSel=null;
+// 星级养成信息展示
+function renderCultInfo(pet){
+  const el=document.getElementById('war-info'); if(!el) return;
+  let h = '<div style="color:#8b949e;margin-bottom:4px">养成信息</div>'+
+    '<div class="detail-grid">'+
+    `<div><span class="k">属性</span><span class="v">${pet.attr?pet.attr:'?'}</span></div>`+
+    `<div><span class="k">等级</span><span class="v">${pet.level!=null?pet.level:'?'}</span></div>`+
+    `<div><span class="k">天赋</span><span class="v">${pet.dv!=null?pet.dv:'?'}</span></div>`+
+    `<div><span class="k">性格</span><span class="v">${pet.nature!=null?pet.nature:'?'}</span></div>`+
+    `</div>`;
+  // 能力值 + 对应学习力 (排版与精灵详情一致: .abgrid 每排两项, 黄色学习力, 体力在最后)
+  h += '<div class="detail-sec"><h3>能力值</h3><div class="abgrid">';
+  const rows=[['攻击', pet.attack, pet.ev_attack], ['防御', pet.defence, pet.ev_defence],
+              ['特攻', pet.s_a, pet.ev_sa], ['特防', pet.s_d, pet.ev_sd],
+              ['速度', pet.speed, pet.ev_sp], ['体力', (pet.maxHp!=null?pet.maxHp:'?'), pet.ev_hp]];
+  for(const [k,v,ev] of rows) h += `<div class="abcell"><span class="k">${k}</span><span class="v">${v!=null?v:'?'}</span><span class="ev">${ev!=null?ev:0}</span></div>`;
+  h += '</div></div>';
+  el.innerHTML = h;
+}
+// 仓库精灵养成信息: 用 2301 拉取完整 PetInfo (等级/天赋/性格)
+async function showWarInfo(p){
+  const el=document.getElementById('war-info'); if(!el) return;
+  el.innerHTML='选中 精灵 id='+p.id+' (catchTime='+p.catchTime+') 拉取养成信息...';
+  try{ await fetch('/api/pet-info/fetch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({catchTime:p.catchTime})}); }catch(e){}
+  for(let t=0;t<15;t++){
+    await new Promise(r=>setTimeout(r,400));
+    try{ const r=await fetch('/api/pet-info?catchTime='+p.catchTime); const j=await r.json();
+      if(j.ok && j.pet){ renderCultInfo(j.pet); return; }
+    }catch(e){}
+  }
+  renderCultInfo({level:p.level, dv:'?', nature:'?'});
+}
+// 背包选中精灵养成信息 (背包 PetInfo 已含 dv/nature)
+function showBagInfo(){
+  if(!bagSel) return;
+  const p = bagSel.bag==='first' ? bagData.first[bagSel.index] : bagData.second[bagSel.index];
+  if(p) renderCultInfo(p);
+}
+async function fetchExe(){
+  exeData=[]; renderWarView();
+  try{ await fetch('/api/exe/fetch',{method:'POST'}); }catch(e){}
+  for(let t=0;t<20;t++){
+    await new Promise(r=>setTimeout(r,400));
+    try{ const r=await fetch('/api/exe'); const j=await r.json();
+      if(j.ok && j.fetched){ exeData=j.pets||[]; break; }
+    }catch(e){}
+  }
+  // 精英仓库本表不带等级(2361); 用与养成相同的 2301 渠道补齐缺失等级, 保证 LV 徽标正常显示.
+  // 已缓存的(吃过养成)由后端跳过, 不重复发包.
+  const miss=exeData.filter(p=>p.level==null);
+  for(const p of miss){
+    try{ await fetch('/api/pet-info/fetch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({catchTime:p.catchTime})}); }catch(e){}
+    await new Promise(r=>setTimeout(r,40));   // 稍作间隔, 避免一次灌太多 2301
+  }
+  // 等 2301 应答回填缓存后, 重新拉取已补齐等级的结果
+  for(let t=0;t<30;t++){
+    await new Promise(r=>setTimeout(r,400));
+    try{ const r=await fetch('/api/exe'); const j=await r.json();
+      if(j.ok){ exeData=j.pets||[]; if(exeData.every(q=>q.level!=null)) break; }
+    }catch(e){}
+  }
+  renderWarView();
+}
+async function fetchStorage(){
+  warData=[]; renderWarView();
+  try{ await fetch('/api/storage/fetch',{method:'POST'}); }catch(e){}
+  // 分页由后端发2503, 轮询 /api/storage 直到拿到数据
+  for(let t=0;t<20;t++){
+    await new Promise(r=>setTimeout(r,400));
+    try{ const r=await fetch('/api/storage'); const j=await r.json();
+      if(j.ok && j.fetched){ warData=j.pets||[]; break; }
+    }catch(e){}
+  }
+  renderWarView();
+}
+function renderWarView(){
+  const list=document.getElementById('war-list'); if(!list) return;
+  list.innerHTML='';
+  // 背包里已存在的精灵, 不计入仓库
+  const bagCt=new Set();
+  (bagData.first||[]).concat(bagData.second||[]).forEach(p=>{ if(p.catchTime) bagCt.add(p.catchTime); });
+  // 数据源: 普通仓库(2303) 或 精英仓库(9015); 默认按 id 从大到小; 搜索按 id 过滤; 排除已在背包的
+  const src = (warType==='exe' ? exeData : warData);
+  let arr=src.slice().filter(p=>!(p.catchTime && bagCt.has(p.catchTime))).sort((a,b)=>(b.id||0)-(a.id||0));
+  const q=warSearch.trim();
+  if(q){ const qi=parseInt(q,10); if(Number.isFinite(qi)) arr=arr.filter(p=>p.id===qi); }
+  if(!arr.length){ list.innerHTML='<div style="color:#8b949e">（仓库为空或无匹配）</div>'; return; }
+  arr.forEach(p=>{
+    const b=document.createElement('button'); b.type='button'; b.className='av-btn'+(warSel===String(p.catchTime)?' sel':'');
+    const img=document.createElement('div'); img.className='av-img'; img.style.position='relative';
+    // 复制/展示都载入本地头像
+    if(p.avatar){
+      const im=document.createElement('img'); im.src=p.avatar; im.alt='';
+      im.style.width='100%'; im.style.height='100%'; im.style.objectFit='contain';
+      im.draggable=false; im.style.webkitUserDrag='none'; im.style.userSelect='none';
+      im.onerror=()=>{ img.textContent=displayName(p); };
+      img.appendChild(im);
+    }else{
+      img.textContent=displayName(p);
+    }
+    // 等级徽标: 头像图下层/左下角, 黄字黑外描边
+    img.appendChild(makeLvBadge(p.level));
+    const txt=document.createElement('div'); txt.className='av-txt';
+    txt.textContent=displayName(p);
+    b.appendChild(img); b.appendChild(txt);
+    const slotRef={btn:b, pet:p, kind:'storage'};
+    petSlotButtons.push(slotRef);
+    b.onclick=(e)=>{ if(suppressClick){ suppressClick=false; return; } warSel=String(p.catchTime); renderWarView(); showWarInfo(p); };
+    b.addEventListener('mousedown',(e)=>{ if(e.button!==0) return; dragPending={slot:slotRef, x:e.clientX, y:e.clientY}; });
+    b.addEventListener('touchstart',(e)=>{ if(dragState.active) return; const t=e.touches&&e.touches[0]; if(!t) return; dragPending={slot:slotRef, x:t.clientX, y:t.clientY}; });
+    list.appendChild(b);
+  });
+}
+function updateWarehouseView(){
+  const detail=document.getElementById('bag-detail-card');
+  const war=document.getElementById('warehouse-view');
+  if(warehouseMode){ detail.style.display='none'; war.style.display='block'; setWarTypeBtn(); if(warType==='exe') fetchExe(); else fetchStorage(); }
+  else{ detail.style.display='block'; war.style.display='none'; }
+}
+async function refreshBag(){
+  try{
+    const r=await fetch('/api/bag'); const j=await r.json();
+    if(!j.ok) return;
+    bagData={first:j.first||[],second:j.second||[]};
+    // 校验当前选中是否仍有效, 否则回退到首发(第一背包第1只)
+    const cur = bagSel ? (bagSel.bag==='first'?bagData.first[bagSel.index]:bagData.second[bagSel.index]) : null;
+    if(!cur){
+      if(bagData.first.length) bagSel={bag:'first',index:0};
+      else if(bagData.second.length) bagSel={bag:'second',index:0};
+      else bagSel=null;
+    }
+    renderBag();
+  }catch(e){}
+}
+function renderBag(){
+  petSlotButtons=[];   // 重建时清空, 由背包+仓库重新填充
+  emptySlotButtons=[]; // 背包空位(拖拽目标)
+  renderAvRow('bag-first', bagData.first, 'first');
+  renderAvRow('bag-second', bagData.second, 'second');
+  renderDetail();
+  if(warehouseMode) renderWarView();
+}
+function renderAvRow(containerId, arr, bag){
+  const c=document.getElementById(containerId); if(!c) return; c.innerHTML='';
+  // 每个背包固定 6 个位置 (3 个一排), 空的也占位显示
+  const SLOTS=6;
+  const m=Math.max(SLOTS, arr.length);
+  for(let i=0;i<m;i++){
+    const p=arr[i];
+    if(p){
+      const b=document.createElement('button'); b.type='button';
+      b.className='av-btn'+(bagSel && bagSel.bag===bag && bagSel.index===i ? ' sel':'');
+      const img=document.createElement('div'); img.className='av-img'; img.style.position='relative';
+      if(p.avatar){                        // 有头像图
+        const im=document.createElement('img'); im.src=p.avatar; im.alt='';
+        im.style.width='100%'; im.style.height='100%'; im.style.objectFit='contain';
+        im.draggable=false; im.style.webkitUserDrag='none'; im.style.userSelect='none';
+        im.onerror=()=>{ img.textContent='头像'; };
+        img.appendChild(im);
+      }else{ img.textContent='头像'; }     // 无头像图, 占位
+      // 等级徽标: 头像图下层/左下角, 黄字黑外描边
+      img.appendChild(makeLvBadge(p.level));
+      const txt=document.createElement('div'); txt.className='av-txt';
+      txt.textContent=displayName(p);
+      b.appendChild(img); b.appendChild(txt);
+      petSlotButtons.push({btn:b, pet:p, bag:bag, index:i, kind:'bag'});
+      const slotRef={btn:b, pet:p, bag:bag, index:i, kind:'bag'};
+      b.onclick=(e)=>{ if(suppressClick){ suppressClick=false; return; } bagSel={bag:bag,index:i}; renderBag(); if(warehouseMode){ warSel=null; showBagInfo(); } };
+      // 拖拽: mousedown 记录起点, 一旦移动超过阈值即产生复制图标 (无需长按)
+      b.addEventListener('mousedown',(e)=>{
+        if(e.button!==0) return;
+        dragPending={slot:slotRef, flag:false, x:e.clientX, y:e.clientY};
+      });
+      // 触摸版: touchstart 记录起点 (tap 仍由 click 选中, 移动即拖拽)
+      b.addEventListener('touchstart',(e)=>{ 
+        if(dragState.active) return;
+        const t=e.touches && e.touches[0]; if(!t) return;
+        dragPending={slot:slotRef, flag:false, x:t.clientX, y:t.clientY};
+      });
+      c.appendChild(b);
+    }else{
+      const e=document.createElement('div'); e.className='av-btn';
+      const img=document.createElement('div'); img.className='av-empty'; img.textContent='';
+      const txt=document.createElement('div'); txt.className='av-txt'; txt.textContent='空位';
+      e.appendChild(img); e.appendChild(txt); c.appendChild(e);
+      emptySlotButtons.push({btn:e, bag:bag, index:i});   // 记录空位, 供拖拽到空位=移至该背包
+    }
+  }
+}
+// ---- 技能详情 (缓存 + 弹窗) ----
+const _skillCache={};
+const skillModalEl=document.getElementById('skillModal');
+async function fetchSkills(ids){
+  const fresh=ids.filter(x=>x&&!_skillCache[x]);
+  if(!fresh.length) return;
+  try{
+    const r=await fetch('/api/skills?ids='+encodeURIComponent(fresh.join(',')));
+    const j=await r.json();
+    if(j.ok && j.skills) Object.assign(_skillCache, j.skills);
+  }catch(e){}
+}
+const _soulmarkCache={};   // 精灵物种id -> 魂印数据列表
+async function fetchSoulmarks(ids){
+  const fresh=ids.filter(x=>x&&!_soulmarkCache[x]);
+  if(!fresh.length) return;
+  try{
+    const r=await fetch('/api/soulmarks?ids='+encodeURIComponent(fresh.join(',')));
+    const j=await r.json();
+    if(j.ok && j.soulmarks) Object.assign(_soulmarkCache, j.soulmarks);
+  }catch(e){}
+}
+function escapeHtml(t){ return String(t==null?'':t).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
+function smText(t){ return String(t||'').replace(/\[sprite[^\]]*\]/gi,'').replace(/<[^>]+>/g,'').replace(/\r?\n/g,'\n').replace(/\|/g,'\n'); }
+function renderSoulmarkPage(arr, page){
+  if(!arr || !arr.length) return;
+  if(page<0) page=0; if(page>arr.length-1) page=arr.length-1;
+  const s=arr[page]||{};
+  const desc=(s.desc||'').replace(/\[sprite[^\]]*\]/gi,'').replace(/<[^>]+>/g,'').replace(/\|/g,'\n');
+  const tags=(s.tags&&s.tags.length)?s.tags.map(t=>`<span class="soulmark-tag">${t}</span>`).join(' '):'';
+  const icon=s.iconId?`<div class="smark-modal-icon"><img src="/effecticon/${s.iconId}.png" onerror="this.remove()"></div>`:'';
+  const nav=arr.length>1?`<div style="display:flex;justify-content:space-between;align-items:center;margin-top:12px">`+
+    `<button class="smark-nav-btn" onclick="smPage(${page-1})" ${page<=0?'disabled':''}>上一版</button>`+
+    `<span style="color:#8b949e">${page+1} / ${arr.length}</span>`+
+    `<button class="smark-nav-btn" onclick="smPage(${page+1})" ${page>=arr.length-1?'disabled':''}>下一版</button></div>`:'';
+  document.getElementById('skillModalTitle').textContent='专属特性';
+  document.getElementById('skillModalBody').innerHTML=
+    icon+(tags?`<div style="text-align:center;margin-bottom:10px">${tags}</div>`:'')+
+    `<div style="white-space:pre-line;line-height:1.7;color:#d8dee9;font-size:12px">${escapeHtml(desc)}</div>`+nav;
+  skillModalEl.style.display='block';
+}
+let _curPetEffects=[];   // 最近渲染详情精灵的 effects (用于匹配当前专属特性阶段)
+let _curSouls=[];        // 当前精灵实已开启的专属特性列表
+function smPage(page){ renderSoulmarkPage(_curSouls, page); }
+function openSoulmark(sid){
+  const arr=_soulmarkCache[sid]||[];
+  const ids=new Set((_curPetEffects||[]).map(e=>e.effectID));
+  _curSouls=arr.filter(s=>ids.has(s.effectId));   // 只取与当前 effects 匹配的(已开启)阶段
+  if(_curSouls.length) renderSoulmarkPage(_curSouls, 0);
+}
+function closeSkill(){ skillModalEl.style.display='none'; }
+function row(k,v){ if(v==null||v==='') return ''; return `<div style="display:flex;justify-content:space-between;border-bottom:1px solid #21262d;padding:4px 0"><span style="color:#8b949e">${k}</span><span style="color:#d8dee9">${v}</span></div>`; }
+function openSkill(id){
+  const d=_skillCache[id]; if(!d) return;
+  const must=d.mustHit?'是':'否';
+  const effs=(d.effects&&d.effects.length)?d.effects.map(e=>
+    `<div style="margin-top:6px;padding:6px;background:#0d1117;border:1px solid #30363d;border-radius:6px">`+
+      `<div style="color:#8b949e">效果#<span style="color:#58a6ff">${e.id}</span>`+(e.tag?` · <span style="color:#58a6ff">${e.tag}</span>`:'')+`</div>`+
+      (e.args&&e.args.length?`<div style="color:#8b949e">参数: ${e.args.join(', ')}</div>`:'')+
+      (e.desc?`<div style="color:#d8dee9;margin-top:2px">${e.desc}</div>`:'')+
+    `</div>`).join('') : '<div style="color:#8b949e">无附加效果</div>';
+  document.getElementById('skillModalTitle').textContent='技能详情 - '+d.name;
+  document.getElementById('skillModalBody').innerHTML=
+    `<div style="font-size:14px;color:#d8dee9;margin-bottom:8px">${d.name} <span style="font-size:11px;color:#8b949e">(技能id ${id})</span></div>`+
+    row('属性', d.typeName)+row('威力', d.power)+row('PP值', d.pp)+
+    row('命中率', (d.accuracy!=null?d.accuracy+'%':'?'))+
+    row('暴击率', (d.crit?d.crit+'%':'无'))+
+    row('是否必中', must)+row('先制等级', d.priority)+
+    row('技能效果描述', '')+effs;
+  skillModalEl.style.display='block';
+}
+skillModalEl.addEventListener('click',(e)=>{ if(e.target===skillModalEl) closeSkill(); });
+
+async function renderDetail(){
+  const p = bagSel ? (bagSel.bag==='first'?bagData.first[bagSel.index]:bagData.second[bagSel.index]) : null;
+  const title=document.getElementById('bag-title');
+  const det=document.getElementById('bag-detail');
+  const storeBtn=document.getElementById('storeBtn');
+  if(!p){ if(title)title.textContent='精灵详情'; if(det)det.innerHTML='<div style="color:#8b949e">请选中一只精灵</div>'; if(storeBtn) storeBtn.disabled=true; return; }
+  if(storeBtn) storeBtn.disabled=false;
+  if(title) title.textContent='精灵详情 - '+(p.name||('id='+p.id));
+  // 顶部: 名字+等级(仅当前等级)
+  let h='<div style="font-size:14px;color:#d8dee9;margin-bottom:6px">'+ (p.name||('id='+p.id)) +'　<span style="color:#8b949e">等级</span> <span style="color:#d8dee9">'+(p.level!=null?p.level:'?')+'</span></div>';
+  // 属性 + 养成: 天赋(去掉(dv)) + 性格
+  h+='<div class="detail-grid">'+
+     (p.attr?`<div><span class="k">属性</span><span class="v">${p.attr}</span></div>`:'') +
+     (p.dv!=null?`<div><span class="k">天赋</span><span class="v">${p.dv}</span></div>`:'') +
+     (p.nature!=null?`<div><span class="k">性格</span><span class="v">${p.nature}</span></div>`:'') +'</div>';
+  // 能力值: 每排两项, 右侧黄色数值为学习力(不显示"学习力"三个字), 体力移至最后一项
+  h+='<div class="detail-sec"><h3>能力值</h3><div class="abgrid">';
+  const rows=[['攻击', p.attack, p.ev_attack], ['防御', p.defence, p.ev_defence],
+              ['特攻', p.s_a, p.ev_sa], ['特防', p.s_d, p.ev_sd],
+              ['速度', p.speed, p.ev_sp], ['体力', (p.maxHp!=null?p.maxHp:'?'), p.ev_hp]];
+  for(const [k,v,ev] of rows) h+=`<div class="abcell"><span class="k">${k}</span><span class="v">${v!=null?v:'?'}</span><span class="ev">${ev!=null?ev:0}</span></div>`;
+  h+='</div></div>';
+  // 刻印: 三个并排图标 (后续补充图片)。暂置 SHOW_MARKS=false 隐藏, 改 true 恢复。
+  const SHOW_MARKS=false;
+  if(SHOW_MARKS){
+    h+='<div class="detail-sec"><h3>刻印</h3><div class="marks-row">';
+    for(const [lbl,val] of [['能力',p.abilityMark||0],['技能',p.skillMark||0],['通用',p.commonMark||0]])
+      h+=`<div class="mark-icon"><span class="lbl">${lbl}刻印</span><span>${val||'无'}</span></div>`;
+    h+='</div></div>';
+  }
+  // 专属特性 (魂印): 该精灵实际开启的阶段 = effects 中与物种某魂印 effectId 匹配者
+  const smId=p.id;
+  if(smId){ try{ await fetchSoulmarks([smId]); }catch(e){} }
+  _curPetEffects=p.effects||[];
+  const allSouls=smId?(_soulmarkCache[smId]||[]):[];
+  const petEffIds=new Set((_curPetEffects||[]).map(e=>e.effectID));
+  const sms=allSouls.filter(s=>petEffIds.has(s.effectId));   // 已开启的专属特性阶段
+  const firstSm=sms[0]||{};
+  const smIcon=firstSm.iconId?`<img class="smark-img" src="/effecticon/${firstSm.iconId}.png" onerror="this.style.display='none'">`:'';
+  const smTags=(firstSm.tags&&firstSm.tags.length)?`<div class="smark-tags">${firstSm.tags.map(t=>`<span class="soulmark-tag">${t}</span>`).join('')}</div>`:'';
+  h+='<div class="detail-sec"><h3>专属特性</h3><div class="smark-wrap">'+
+     (sms.length?
+       `<button class="smark-btn" onclick="openSoulmark(${smId})">${smIcon}<span class="smark-mid"><span class="smark-title">专属特性</span>${smTags}</span></button>`
+       : '<div class="smark-btn-disabled">专属特性未解锁</div>')+'</div></div>';
+  // 技能: 前4个 2x2 长方形图标, 第5个占两格宽在下方
+  const skills=p.skills||[];
+  const need=skills.map(x=>x&&x.id).filter(Boolean);
+  if(need.length){ try{ await fetchSkills(need); }catch(e){} }
+  h+='<div class="detail-sec"><h3>技能</h3><div class="skillgrid">';
+  const skIcon=(s,extra='')=>{ const cls='sk'+extra;
+    if(s && s.id){
+      const d=_skillCache[s.id]||{};
+      const nm=d.name?d.name:('技能'+s.id);
+      return `<div class="${cls} sk-click" onclick="openSkill(${s.id})"><span class="sk-nm">${nm}</span>`+
+        `<span class="sk-sub">${d.typeName?`<span class="sk-attr">${d.typeName}</span>`:''}${d.power?`<span class="sk-pow">威力${d.power}</span>`:''}</span>`+
+        `<span class="pp">PP=${s.pp!=null?s.pp:'?'}</span></div>`;
+    }else return `<div class="${cls}">空位</div>`; };
+  for(let i=0;i<4;i++) h+=skIcon(skills[i]);
+  h+=skIcon(skills[4],' sk5');   // 第5号位
+  h+='</div></div>';
+  det.innerHTML=h;
+}
+function g(k,v){ return `<div><span class="k">${k}</span><span class="v">${v}</span></div>`; }
+setInterval(refreshBag, 2500);   // 轮询背包数据 (登录后自动填充)
+refreshBag();
+
+// ---- 切换阵容 ----
+const teamModalEl=document.getElementById('teamModal');
+const teamListEl=document.getElementById('teamList');
+const teamNoteEl=document.getElementById('teamNote');
+async function openTeams(){
+  teamNoteEl.textContent='(正在拉取...)'; teamListEl.innerHTML='';
+  teamModalEl.style.display='block';
+  try{ await fetch('/api/teams/fetch',{method:'POST'}); }catch(e){}
+  let got=null;
+  for(let t=0;t<10;t++){
+    await new Promise(r=>setTimeout(r,500));
+    try{ const r=await fetch('/api/teams'); const j=await r.json();
+      if(j.ok && j.fetched && j.teams.length){ got=j; break; }
+    }catch(e){}
+  }
+  if(!got){ teamNoteEl.textContent='(未获取到阵容，请确认已登录且服务器支持)'; teamListEl.innerHTML=''; return; }
+  teamNoteEl.textContent='(点选一套使用；当前使用 id='+got.curUsedId+')';
+  teamListEl.innerHTML='';
+  got.teams.forEach(team=>{
+    const n=team.pet_detail.filter(x=>x[0]).length;
+    const cur=team.id===got.curUsedId;
+    const row=document.createElement('div');
+    row.style.cssText='display:flex;align-items:center;gap:8px;padding:8px;margin:0 0 6px;background:'+(cur?'#0d2a45':'#21262d')+';border:1px solid '+(cur?'#58a6ff':'#30363d')+';border-radius:6px;cursor:pointer';
+    row.innerHTML=`<div style="flex:1"><div style="color:${cur?'#58a6ff':'#d8dee9'}">${team.nick||('阵容'+team.id)}${cur?' (使用中)':''}</div><div style="font-size:11px;color:#8b949e">精灵 ${n} 只 · id=${team.id}</div></div>`;
+    row.onclick=async()=>{
+      if(cur){ return; }
+      row.style.opacity='.5';
+      let ok=false;
+      try{
+        const r=await fetch('/api/teams/switch',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:team.id})});
+        const j=await r.json();
+        ok=!!j.ok;
+        if(!ok){ teamNoteEl.textContent='切换失败: '+(j.error||''); row.style.opacity='1'; }
+      }catch(e){ teamNoteEl.textContent='切换出错: '+e; row.style.opacity='1'; }
+      if(ok){
+        // 切换成功 => 关闭弹窗, 并同步刷新背包(43706)
+        teamModalEl.style.display='none';
+        setTimeout(()=>{ refreshBag(); }, 2500);
+      }
+    };
+    teamListEl.appendChild(row);
+  });
+}
+document.getElementById('teamBtn').onclick=()=>{ openTeams(); };
+// 点击弹窗空白处(背板)关闭
+teamModalEl.addEventListener('click',(e)=>{ if(e.target===teamModalEl) teamModalEl.style.display='none'; });
+// 精灵仓库: 点击切换右半部分 仓库/详情
+document.getElementById('wareBtn').onclick=()=>{ warehouseMode=!warehouseMode; updateWarehouseView(); };
+// 仓库搜索 + 关闭搜索
+document.getElementById('warSearch').addEventListener('input',(e)=>{
+  warSearch=e.target.value;
+  renderWarView();
+  const c=document.getElementById('warClose');
+  if(warSearch.trim()){ c.style.display='inline-block'; } else { c.style.display='none'; }
+});
+document.getElementById('warClose').onclick=()=>{
+  warSearch=''; document.getElementById('warSearch').value='';
+  renderWarView(); document.getElementById('warClose').style.display='none';
+};
+// 仓库类型切换: 普通仓库(2303) / 精英仓库(9015)
+function setWarTypeBtn(){
+  document.getElementById('warTypeNormal').className='warfilt'+(warType==='normal'?' active':'');
+  document.getElementById('warTypeExe').className='warfilt'+(warType==='exe'?' active':'');
+}
+document.getElementById('warTypeNormal').onclick=()=>{ warType='normal'; setWarTypeBtn(); renderWarView(); };
+document.getElementById('warTypeExe').onclick=()=>{ warType='exe'; setWarTypeBtn(); fetchExe(); };
+// 入库: 把选中精灵放入仓库 (PET_RELEASE 2304 [catchTime, 0/3])
+document.getElementById('storeBtn').onclick=async()=>{
+  if(!bagSel) return;
+  const p = bagSel.bag==='first' ? bagData.first[bagSel.index] : bagData.second[bagSel.index];
+  if(!p || !p.catchTime){ appendLog({t:now(),level:'error',msg:'没有可入库的精灵'}); return; }
+  try{
+    const r=await fetch('/api/pets/store',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({catchTime:p.catchTime, bag:bagSel.bag})});
+    const j=await r.json();
+    if(j.ok){ appendLog({t:now(),level:'ok',msg:'已入库 精灵 id='+p.id+' (catchTime='+p.catchTime+')'}); bagSel={bag:'first',index:0}; }
+    else{ appendLog({t:now(),level:'error',msg:'入库失败: '+(j.error||'')}); }
+  }catch(e){ appendLog({t:now(),level:'error',msg:'入库出错: '+e}); }
+  setTimeout(()=>{ refreshBag(); }, 2500);
+};
+</script>
+</body>
+</html>"""
+
+
+def main():
+    ap = argparse.ArgumentParser(description="赛尔号协议调试 WebUI")
+    ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--port", type=int, default=8680,
+                    help="监听端口 (默认 8680; 若被占用可再换, 或留 0 自动选空闲端口)")
+    ap.add_argument("--no-update", action="store_true",
+                    help="启动时不检查/更新本地精灵头像 (默认会自动检查并按版本增量更新)")
+    ap.add_argument("--update-force", action="store_true",
+                    help="即使版本未变也强制重下载并解包精灵头像 (测试用)")
+    args = ap.parse_args()
+
+    # 启动前先确保本地"需要的文件"(目前=全部精灵头像)是最新的:
+    # 记录并检查版本(assets_updater 用 refs/head/.avatar_state.json 记录), 版本一致则跳过.
+    # 需要解析时自动 pip 安装 UnityPy 到项目 vendor/, 再从 bundle 解出头像.
+    if not args.no_update:
+        try:
+            from assets_updater import ensure_pet_avatars
+            _upd = ensure_pet_avatars(force=args.update_force)
+            if _upd.get("skipped"):
+                log("info", f"头像已是最新 (版本 {_upd.get('version')}), 跳过更新")
+            elif _upd.get("ok"):
+                log("info", f"头像更新完成 (版本 {_upd.get('version')})")
+            if _upd.get("error"):
+                print(f"[头像更新] 警告: {_upd['error']}")
+                log("warn", f"头像更新未完成: {_upd['error']} (继续使用现有头像)")
+        except Exception as e:   # 任何异常都不阻断服务启动
+            print(f"[头像更新] 未执行更新: {e}")
+            log("warn", f"头像更新未执行: {e}")
+    try:
+        srv = ThreadingHTTPServer((args.host, args.port), Handler)
+    except OSError as e:
+        print(f"端口 {args.port} 被占用: {e}")
+        print("已自动改到空闲端口; 或换一个: python3 webui.py --port <端口>")
+        srv = ThreadingHTTPServer((args.host, 0), Handler)
+    actual = srv.server_address[1]
+    print(f"赛尔号协议调试台: http://{args.host}:{actual}/")
+    log("info", f"调试台已启动: http://{args.host}:{actual}/")
+    log("tip", "填写米米号/密码后点『登录』; 登录过程与每个收发封包会实时输出到日志。")
+    print("登录后可在页面发包; 日志实时流。Ctrl+C 退出。")
+
+    def _on_sigterm(signum, frame):
+        print("\n收到 SIGTERM, 正在保存日志...")
+        save_logs("SIGTERM")
+        srv.shutdown()
+
+    signal.signal(signal.SIGTERM, _on_sigterm)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        print("\n正在退出...")
+    finally:
+        save_logs("shutdown")
+
+
+if __name__ == "__main__":
+    main()

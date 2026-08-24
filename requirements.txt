@@ -1,0 +1,8 @@
+# 只需要标准库即可运行, 无需安装任何第三方依赖.
+#
+# 说明:
+#   - HTTP 认证使用 urllib.request, 无需 requests
+#   - WebSocket 连接使用本项目自带的最小 ws_client (基于 socket/ssl), 无需 websockets
+#   - 解析 JSONP 使用内置 json + 正则
+#
+# 若希望在别的机器上运行, 请保证 Python >= 3.8.
