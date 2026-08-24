@@ -428,10 +428,14 @@ def _script_env():
 
 
 def _run_script(name, path):
-    """后台线程: 用 subprocess 运行选中脚本, 把 stdout/stderr 实时打进日志."""
+    """后台线程: 用 subprocess 运行选中脚本, 把 stdout/stderr 实时打进"脚本输出"控制台.
+
+    每个输出都走 log("script", ...) 通道, 前端把这级日志单独渲染到"脚本输出"控制台,
+    不混进封包日志. error 也单独记录到封包日志.
+    """
     global _SCRIPT_PROC
     import subprocess, sys
-    log("info", f"▶ 开始运行脚本 {name} ...")
+    log("script", f"▶ 开始运行脚本 {name} ...")
     try:
         proc = subprocess.Popen(
             [sys.executable, path],
@@ -447,9 +451,9 @@ def _run_script(name, path):
                 if line:
                     log("script", f"[{name}] {line}")
         rc = proc.wait()
-        log("info", f"✔ 脚本 {name} 结束, 退出码 {rc}")
+        log("script", f"✔ 脚本 {name} 结束, 退出码 {rc}")
     except Exception as e:
-        log("error", f"运行脚本 {name} 出错: {e}")
+        log("script", f"✖ 脚本 {name} 运行出错: {e}")
     finally:
         _SCRIPT_PROC = None
 
@@ -1343,19 +1347,18 @@ PAGE = r"""<!DOCTYPE html>
 
 <div id="tab-scripts" class="tab-panel">
   <div style="display:flex;gap:12px;padding:12px;align-items:flex-start;flex-wrap:nowrap">
-    <!-- 左半: 默认脚本目录下的脚本列表 (可选择运行) -->
-    <div class="card" style="flex:1;min-width:280px">
-      <h2>脚本 <button id="scriptRefreshBtn" class="off" style="float:right;margin:0;padding:2px 10px;font-size:12px">刷新</button></h2>
-      <div id="scriptDir" style="font-size:11px;color:#8b949e;margin:0 0 8px;word-break:break-all">—</div>
-      <div id="scriptList" style="max-height:56vh;overflow:auto;border:1px solid #30363d;border-radius:6px;background:#0d1117">
-        <div style="color:#8b949e;padding:8px">等待加载...</div>
+    <!-- 左半: 脚本列表 + 发包测试 -->
+    <div style="flex:1;min-width:320px;display:flex;flex-direction:column;gap:12px">
+      <div class="card">
+        <h2>脚本 <button id="scriptRefreshBtn" class="off" style="float:right;margin:0;padding:2px 10px;font-size:12px">刷新</button></h2>
+        <div id="scriptDir" style="font-size:11px;color:#8b949e;margin:0 0 8px;word-break:break-all">—</div>
+        <div id="scriptList" style="max-height:30vh;overflow:auto;border:1px solid #30363d;border-radius:6px;background:#0d1117">
+          <div style="color:#8b949e;padding:8px">等待加载...</div>
+        </div>
+        <button id="scriptRunBtn" disabled>运行选中脚本</button>
+        <button id="scriptStopBtn" class="off" style="display:none">停止脚本</button>
+        <div id="scriptStatus" style="font-size:12px;color:#8b949e;margin-top:6px">—</div>
       </div>
-      <button id="scriptRunBtn" disabled>运行选中脚本</button>
-      <button id="scriptStopBtn" class="off" style="display:none">停止脚本</button>
-      <div id="scriptStatus" style="font-size:12px;color:#8b949e;margin-top:6px">—</div>
-    </div>
-    <!-- 右半: 发包测试 + 日志输出 -->
-    <div style="flex:1.6;min-width:400px;display:flex;flex-direction:column;gap:12px">
       <div class="card">
         <h2>③ 发包测试</h2>
         <label>命令（全部）<sup style="color:#888">选一个跳到下面</sup></label>
@@ -1393,6 +1396,13 @@ PAGE = r"""<!DOCTYPE html>
           </div>
         </div>
       </div>
+    </div>
+    <!-- 右半: 脚本输出 (控制台) + 日志输出 -->
+    <div style="flex:1.6;min-width:420px;display:flex;flex-direction:column;gap:12px">
+      <div class="card">
+        <h2>脚本输出 (实时) <button id="scriptClearBtn" class="off" style="float:right;margin:0;padding:2px 10px;font-size:12px">清空</button></h2>
+        <div id="scriptOutput" style="max-height:34vh;overflow:auto;background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:8px;font:12px/1.5 Menlo,monospace;white-space:pre-wrap;color:#a5d6a7">（尚未运行脚本; 运行后 print 输出会实时显示在这里）</div>
+      </div>
       <div class="card">
         <h2>② 日志输出 (实时) <button id="clearLogBtn" class="off" style="float:right;margin:0;padding:2px 10px;font-size:12px">清空输出</button></h2>
         <div class="filterbar">
@@ -1402,7 +1412,7 @@ PAGE = r"""<!DOCTYPE html>
           <label style="margin:0"><input id="chkRecv" type="checkbox" checked> 接收recv</label>
           <button id="applyFilterBtn" class="off" style="margin:0;padding:2px 10px;font-size:12px">应用过滤</button>
         </div>
-        <div id="log"></div>
+        <div id="log" style="max-height:34vh"></div>
       </div>
     </div>
   </div>
@@ -1419,6 +1429,7 @@ const chkSendEl = document.getElementById('chkSend');
 const chkRecvEl = document.getElementById('chkRecv');
 const filterIdsEl = document.getElementById('filterIds');
 function shouldShow(e){
+  if(e && e.level==='script') return false;               // 脚本输出只显示在"脚本输出"控制台, 不混进封包日志
   if(e && e.direction){                       // 封包
     const c = Number(e.cmd);
     if(Number.isFinite(c) && idFilter.has(c)) return false;     // 名单内的包舍弃
@@ -1427,6 +1438,16 @@ function shouldShow(e){
     if(d==='RECV' && !chkRecvEl.checked) return false;
   }
   return true;
+}
+
+// ---- 脚本输出控制台 (print/stdout 显示在这里) ----
+const scriptOutEl=document.getElementById('scriptOutput');
+function appendScriptOutput(e){
+  const line=document.createElement('div');
+  line.textContent=(e.msg||'');
+  scriptOutEl.appendChild(line);
+  scriptOutEl.scrollTop=scriptOutEl.scrollHeight;
+  while(scriptOutEl.childNodes.length>5000) scriptOutEl.removeChild(scriptOutEl.firstChild);
 }
 
 let lastSeenSeq=0;   // 仅用于去重 SSE 断线重连的回放, 不限制新包
@@ -1446,9 +1467,8 @@ const es = new EventSource('/api/stream');
 es.onmessage = (ev)=>{
   let e; try{ e=JSON.parse(ev.data); }catch(_){ return; }
   if(e.seq && e.seq<=lastSeenSeq) return;                 // 去重断线回放
-  if(!shouldShow(e)){ if(e.seq) lastSeenSeq=Math.max(lastSeenSeq,e.seq); return; }
-  appendLog(e);
-  if(e.direction) appendTable(e);                         // 表格只记包 (send/recv)
+  if(e.level==='script'){ appendScriptOutput(e); }        // 脚本输出 -> 专用控制台
+  else if(shouldShow(e)){ appendLog(e); if(e.direction) appendTable(e); }
   if(e.seq && e.seq>lastSeenSeq) lastSeenSeq=e.seq;
 };
 es.onerror = ()=>{};                                        // 浏览器会自动重连
@@ -1457,8 +1477,12 @@ es.onerror = ()=>{};                                        // 浏览器会自�
 async function renderLog(){
   try{
     const r=await fetch('/api/log'); const logs=await r.json();
-    logEl.innerHTML=''; lastSeenSeq=0;
-    for(const e of logs){ if(!shouldShow(e)) continue; appendLog(e); if(e.seq && e.seq>lastSeenSeq) lastSeenSeq=e.seq; }
+    logEl.innerHTML=''; scriptOutEl.innerHTML=''; lastSeenSeq=0;
+    for(const e of logs){
+      if(e.level==='script'){ appendScriptOutput(e); }
+      else if(shouldShow(e)){ appendLog(e); }
+      if(e.seq && e.seq>lastSeenSeq) lastSeenSeq=e.seq;
+    }
   }catch(e){}
 }
 
@@ -1719,6 +1743,7 @@ document.getElementById('scriptRefreshBtn').onclick=loadScripts;
 scriptRunBtn.onclick=async()=>{
   const nm=scriptRunBtn.dataset.name;
   if(!nm){ appendLog({t:now(),level:'tip',msg:'请先选择要运行的脚本'}); return; }
+  scriptOutEl.innerHTML='';   // 每个脚本运行前清空输出控制台, 只显示本次运行
   scriptStatusEl.textContent='正在启动 '+nm+' ...'; scriptStatusEl.style.color='#d29922';
   try{
     const r=await fetch('/api/scripts/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:nm})});
@@ -1730,6 +1755,7 @@ scriptRunBtn.onclick=async()=>{
 scriptStopBtn.onclick=async()=>{
   try{ await fetch('/api/scripts/stop',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}); }catch(e){}
 };
+document.getElementById('scriptClearBtn').onclick=()=>{ scriptOutEl.innerHTML=''; };
 loadScripts();   // 预加载脚本列表 (登录后可立即看到)
 
 // 精灵按钮文本: 仅显示名字; 无名字则显示 id 数字 (统一背包+仓库)
