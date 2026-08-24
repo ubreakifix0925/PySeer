@@ -79,6 +79,14 @@ spd support transform type vip is_fly is_ride
 - `effectID=880` 恰为该物种(3266) 魂印的 `effect_id`（soulmark#594）。
 - ⇒ **精灵持有专属特性的阶段 = 其 `effects` 中与该物种某魂印 `effectId` 匹配的那条**；无匹配则未解锁；多魂印物种则命中的那条即当前阶段。
 
+**会话密钥离线破解（gamedump4，`=e10e6f7cd2`）**：
+- 密钥派生规则（参考 52pojie `t1468888`）：收到 `LOGIN_IN(1001)` 响应后，取**明文最后 4 字节**为“密钥种子”，与**米米号异或**，该值转字符串，取其 **md5 前 10 字符**即会话密钥（`seer/client.py::derive_session_key`、`mock_server.py::derive_seed_key` 一致）。
+- 本抓包缺 1001 响应（种子），故用**已知明文攻击**：登录后 C2S 包明文头固定为 `[ver=0x31][cmd][uid=米米号][res]`，对每个候选 `seed` 算 `key=md5(str(seed^账号))[:10]`，解一个 C2S 包，若 `ver==0x31 && uid==账号` 则为候选，再用**全部 C2S 包复验**（真密钥应 ~100% 命中，伪命中极低）。
+- 账号 = **<账号>**（非 <另一号>；后者只是 8080 心跳通道的会话/令牌号）。
+- 结果：`seed=532711005` → 会话密钥 **`e10e6f7cd2`**，解码 744 个 C2S 包全部为真实命令（GET_PET_INFO 458、GET_SIM_USERINFO 53、USER_FOREVER_VALUE 36、PET_RELEASE 24、GET_MULTI_FOREVER 19、SWITCH_MAP…），命令名与 `cmdmap.json` 吻合。
+- 脚本：`crack_seed_v3.py`（弱 oracle 收集候选 → 全部 C2S 复验）。注意：单用 `ver+uid` 会因密钥其余字节自由而产生“对齐巧合”伪命中（如 `eaeeff7cd2` 只命中 645/754 且 cmd 乱码），必须用全部 C2S 复验排除。
+- 结论与遗留：**C2S 方向已完全破解**；S2C（服务器→客户端）帧在该抓包中并非干净的 `[4B总长][cipher]`（即使按 seq 拼接再切帧，用该密钥也解不出 `ver=0x31`），疑似大帧跨 TCP 段/不同帧结构，方向性密钥差异，留作后续。
+
 ---
 
 ## 4. WebUI 功能（`webui.py`，http://127.0.0.1:8680）

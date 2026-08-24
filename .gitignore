@@ -8,6 +8,7 @@
 !.gitignore
 !README.md
 !DEVELOPMENT.md
+!ANALYSIS_gamedump4.md
 !requirements.txt
 !cmdmap.json
 !*.py
@@ -19,3 +20,6 @@
 # 即便目录被保留, 运行时字节码仍忽略
 *.pyc
 **/__pycache__/
+crack_seed_v2.py
+crack_seed_v3.py
+crack_seed.py
