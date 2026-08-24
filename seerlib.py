@@ -5,11 +5,15 @@
 快速示例::
 
     from seerlib import Seer
-    s = Seer("http://127.0.0.1:8680")     # 指向已登录的后端地址
+    s = Seer()                              # 运行时自动指向已登录后端 (无需硬编码地址)
     s.send(43706)                          # 无参发包(刷背包)
     pkt = s.recv(2301, [3266, 0, 0, 0])    # 发包并等该命令的 RECV, 返回 Packet
     v = s.get_value(pkt, 0)                # 取包体第 0 个 int32
     print(pkt.ints, v)
+
+后端地址自动发现: 见 discover_backend() —— 显式参数 > 环境变量 ``SEER_BACKEND`` >
+后端启动时写入的 ``webui_addr.json`` > 逐端口探测附近仍在线的后端 > 兜底 ``http://127.0.0.1:8680``.
+(当 webui_addr.json 指向的后端已下线时, 会自动逐端口探测并回退到仍在线的实例.)
 
 三大函数:
     send(cmd, params)      -> 发送 SEND 包 (不等待响应), 返回后端应答 dict
@@ -20,6 +24,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import urllib.error
 import urllib.request
@@ -31,6 +36,95 @@ class SeerError(Exception):
 
 def _hex(hexstr: str) -> bytes:
     return bytes.fromhex("".join(c for c in hexstr if c in "0123456789abcdefABCDEF"))
+
+
+# ---- 后端地址自动发现 ----
+
+# 未指定/未发现时的兜底默认地址 (webui 常用端口)
+DEFAULT_BASE = "http://127.0.0.1:8680"
+
+# 后端(webui.py)启动时会把"实际监听地址"写入该文件, 供脚本运行时定位.
+# 位置固定在本文件同目录, 与 webui.py 的 _ADDR_FILE 一致.
+_ADDR_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "webui_addr.json")
+
+# 逐端口探测的端口范围: webui 默认 8680; --port 0 / 换端口时可能落到这附近.
+_PROBE_PORTS = list(range(8680, 8700))
+
+# 地址探测超时(秒): 只用于"判断某地址是否为存活后端", 取小值快速跳过离线端口.
+_PROBE_TIMEOUT = 1.0
+
+
+def _normalize_base(base) -> str:
+    return str(base).rstrip("/")
+
+
+def _probe_alive(base, timeout=_PROBE_TIMEOUT) -> bool:
+    """判断 base 是否为存活的 seer 后端: GET /api/status 返回含 'status' 的 JSON.
+
+    用 /api/status 而非仅端口可达, 可避免误把其它 http 服务当作后端.
+    """
+    try:
+        req = urllib.request.Request(base + "/api/status", method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read().decode("utf-8"))
+        return isinstance(data, dict) and "status" in data
+    except Exception:
+        return False
+
+
+def _candidate_bases():
+    """生成有序、去重的候选后端地址列表 (用于逐端口探测回退).
+
+    顺序: webui_addr.json 里的地址 → 默认 >> 附近端口逐一扫.
+    """
+    bases = []
+
+    def add(u):
+        u = _normalize_base(u)
+        if u not in bases:
+            bases.append(u)
+
+    # 1. 后端启动时写入的 webui_addr.json (最高优先)
+    try:
+        if os.path.exists(_ADDR_FILE):
+            with open(_ADDR_FILE, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            u = d.get("url") or d.get("base") if isinstance(d, dict) else d
+            if u:
+                add(u)
+    except (OSError, ValueError, json.JSONDecodeError):
+        pass
+    # 2. 默认端口
+    add(DEFAULT_BASE)
+    # 3. 逐端口扫描附近端口 (覆盖 --port 0 / 换端口后仍在线的实例)
+    for p in _PROBE_PORTS:
+        add(f"http://127.0.0.1:{p}")
+    return bases
+
+
+def discover_backend(explicit=None, probe=True, timeout=_PROBE_TIMEOUT) -> str:
+    """运行时自动定位已登录的后端地址, 按优先级:
+
+    1. 显式传入的 base 参数   (脚本里显式指定, 优先级最高, 不做探测)
+    2. 环境变量 ``SEER_BACKEND`` (显式覆盖, 不做探测)
+    3. ``webui_addr.json`` 里的地址; 若该后端已下线, 自动逐端口探测回退到仍在线的实例
+    4. 兜底默认 ``http://127.0.0.1:8680``
+
+    因此脚本可以省略参数写成 ``s = Seer()``, 无需在代码里硬编码后端地址.
+    返回的是去掉尾部 ``/`` 的 base 字符串.
+    """
+    if explicit:
+        return _normalize_base(explicit)
+    env = os.environ.get("SEER_BACKEND")
+    if env:
+        return _normalize_base(env)
+    candidates = _candidate_bases()
+    if probe:
+        for base in candidates:
+            if _probe_alive(base, timeout):
+                return base
+    # 无在线实例时返回首个候选(最可能是正确地址), 交由调用方在使用时报错
+    return candidates[0]
 
 
 class Packet:
@@ -56,10 +150,18 @@ class Packet:
 
 
 class Seer:
-    """绑定一个已登录的后端地址, 提供发/收/取包功能."""
+    """绑定一个已登录的后端地址, 提供发/收/取包功能.
 
-    def __init__(self, base: str = "http://127.0.0.1:8680", timeout: float = 30.0):
-        self.base = base.rstrip("/")
+    地址可省: 默认按 ``discover_backend()`` 自动定位 (环境变量 ``SEER_BACKEND`` ->
+    ``webui_addr.json`` -> 逐端口探测附近仍在线的后端 -> 兜底 ``http://127.0.0.1:8680``),
+    因此可直接 ``s = Seer()``.
+    """
+
+    def __init__(self, base=None, timeout: float = 30.0, probe: bool = True,
+                 probe_timeout: float = None):
+        self.base = discover_backend(base,
+                                     probe=probe,
+                                     timeout=probe_timeout or _PROBE_TIMEOUT)
         self.timeout = timeout
 
     # ---------- 底层 HTTP ----------
@@ -150,7 +252,8 @@ def get_value(body, index: int) -> int:
 
 if __name__ == "__main__":
     # 简单自检: 需要后端已登录
-    s = Seer()
+    s = Seer()          # 自动发现后端地址 (含下线后逐端口探测回退)
+    print("后端地址:", s.base)
     print("刷新背包:", s.send(43706))
     pkt = s.recv(43706)
     print("43706 RECV 包体:", pkt.body)

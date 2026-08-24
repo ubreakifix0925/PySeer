@@ -47,6 +47,8 @@ _LOG_DIR = "webui_logs"
 _CRED_FILE = "webui_credentials.json"
 _FILTER_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "webui_filter.json")
 _CMDMAP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cmdmap.json")
+# 后端实际监听地址写到这里, 供 seerlib 脚本运行时自动定位 (见 seerlib.discover_backend)
+_ADDR_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "webui_addr.json")
 _HEAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "refs", "head")  # 精灵头像(按物种id)目录
 _EFFECT_ICON_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "refs", "effecticon")  # 魂印/效果图标目录
 
@@ -294,6 +296,22 @@ def save_creds(account, password):
     except OSError as e:
         print(f"保存账号密码失败: {e}")
     return accounts
+
+
+def write_addr_file(host, port):
+    """把后端实际监听地址写入 webui_addr.json, 供 seerlib 脚本运行时自动定位.
+
+    ``--port 0`` 会自动选空闲端口, 因此实际端口到启动后才确定; 这里把最终地址
+    持久化下来, 脚本无需硬编码 ``http://127.0.0.1:8680``.
+    """
+    try:
+        with open(_ADDR_FILE, "w", encoding="utf-8") as f:
+            json.dump({"url": f"http://{host}:{port}", "host": host, "port": port},
+                      f, ensure_ascii=False, indent=2)
+        return True
+    except OSError as e:
+        print(f"写入后端地址文件失败: {e}")
+        return False
 
 
 def save_logs(reason="shutdown"):
@@ -2193,6 +2211,9 @@ def main():
     log("info", f"调试台已启动: http://{args.host}:{actual}/")
     log("tip", "填写米米号/密码后点『登录』; 登录过程与每个收发封包会实时输出到日志。")
     print("登录后可在页面发包; 日志实时流。Ctrl+C 退出。")
+
+    # 把实际监听地址写入 webui_addr.json, 供 seerlib 脚本运行时自动定位后端
+    write_addr_file(args.host, actual)
 
     def _on_sigterm(signum, frame):
         print("\n收到 SIGTERM, 正在保存日志...")

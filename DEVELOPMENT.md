@@ -109,13 +109,18 @@ spd support transform type vip is_fly is_ride
 
 ```python
 from seerlib import Seer
-s = Seer("http://127.0.0.1:8680")       # 指向已登录后端
-
+s = Seer()          # 运行时自动指向已登录后端 (无需在代码里硬编码地址)
 s.send(43706)                             # ① 发送函数: 发 SEND 包(id + 参数列表)
 pkt = s.recv(2301, [3266, 0, 0, 0])       # ② 接收函数: 发 SEND + 等 RECV, 返回完整包体(Packet)
 v = s.get_value(pkt, 0)                   # ③ 取值函数: 取包体第 0 个 int32
 print(pkt.ints, pkt.body, v)
 ```
+
+**后端地址自动发现**：`Seer()` 不传参即按 `discover_backend()` 自动定位，优先级为
+`显式参数 > 环境变量 SEER_BACKEND > 后端启动时写入的 webui_addr.json > 逐端口探测附近仍在线的后端 > 兜底 http://127.0.0.1:8680`。
+后端 `webui.py` 启动时会把**实际监听地址**（含 `--port 0` 自动选的端口）写入 `webui_addr.json`，
+因此脚本无需也不应硬编码 `Seer("http://127.0.0.1:8680")`。**当 `webui_addr.json` 指向的后端已下线时**，
+会自动逐端口探测（默认 `8680..8699`，用 `/api/status` 判定存活）并回退到仍在线的实例。
 
 | 函数 | 说明 | 参数 | 返回 |
 |---|---|---|---|
