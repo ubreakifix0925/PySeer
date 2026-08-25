@@ -283,23 +283,39 @@ def parse_catch_pet(b, o=0):
 
 
 def parse_note_use_skill(body):
-    """2505 NOTE_USE_SKILL 回合结果 (依 refs/captured 实战包确认).
+    """2505 NOTE_USE_SKILL 回合结果 (依据 refs/attack/UseSkillInfo.as + AttackValue.as 精确解).
 
-    前导 16 字节(首个技能记录): [userID u32][skillID u32][count u32][actorCatchTime u32].
-    我方技能在包体最前面; 敌方技能则**内嵌在包体更深处的同级子块**(byte 级偏移,
-    不按 4 对齐), 可用 extract_skill_use_records() 完整找出双方本回合使用的技能.
+    一个 2505 = 一整回合 = `UseSkillInfo`, 内含 `firstAttackInfo` + `secondAttackInfo`
+    两个 AttackValue, pack 首尾相接 (我方块在最前, 敌方块紧随). 读取顺序见
+    parse_attack_value(), 对每个实战包**逐字节验证可精确消耗到末尾**.
 
-    尾部包含受击/受影响精灵的 [catchTime u32][hp u32][maxhp u32] 记录 (hpUpdates),
-    据此可做**逐回合血量刷新**. 中间的伤害/经验/属性等字段布局依赖 FightManager 类(未收录),
-    此处不解.
+    first(我方) 与 second(敌方, userID==0) 各自给全字段, 含:
+        skillID, atkTimes, lostHP(对敌伤害), realHurtHp, gainHP, remainHP(结算后当前HP),
+        maxHp, isCrit, state, petStatus, status/specailArr/sideEffects/changehps 等.
+
+    附加: extract_pet_hp_updates() (按 catchTime 扫描的 hp/maxhp 记录) 覆盖**背包全体**
+    精灵(含被波及的换下宠物), 而 attack 块只含两个施法者, 两者互补.
     """
     b = bytes(body)
-    head = {"userID": _u32(b, 0) if len(b) >= 4 else None,
-            "skillID": _u32(b, 4) if len(b) >= 8 else None,
-            "count": _u32(b, 8) if len(b) >= 12 else 0,
-            "actorCatchTime": _u32(b, 12) if len(b) >= 16 else None}
+    if len(b) < 44:
+        return {"error": "short", "attackBlocks": [], "hpUpdates": [], "skillRecords": []}
+    try:
+        usi = parse_use_skill_info(b)
+    except (ValueError, IndexError):
+        # 占位/哨兵包 (如 0xDEADBEEF guard) 或非有效 UseSkillInfo
+        return {"error": "guard", "attackBlocks": [], "hpUpdates": [], "skillRecords": []}
+    head = {
+        "userID": (usi.get("first") or {}).get("userID"),
+        "skillID": (usi.get("first") or {}).get("skillID"),
+        "count": (usi.get("first") or {}).get("atkTimes"),
+        "actorCatchTime": _u32(b, 12) if len(b) >= 16 else None,
+    }
     head["hpUpdates"] = extract_pet_hp_updates(b)
     head["skillRecords"] = extract_skill_use_records(b)
+    head["attackBlocks"] = extract_attack_blocks(b)
+    head["first"] = usi.get("first")
+    head["second"] = usi.get("second")
+    head["endOffset"] = usi.get("endOffset")
     return head
 
 
@@ -341,6 +357,171 @@ def extract_skill_use_records(b):
     return segs
 
 
+def parse_attack_value(b, o):
+    """按 refs/attack/AttackValue.as 逐字段解一个 AttackValue, 返回 (dict, new_offset).
+
+    该类的读取顺序已**逐字节验证**: 对每个实战 2505, 连续解两个 AttackValue 恰好
+    消耗到包体末尾 (0 误差). 字段如下 (大端, 除注明外为 u32):
+
+        userID, skillID,
+        (±2 个丢弃 u32: 回合/开局信息)
+        effectName(u32=FightEffectName.id), atkTimes, lostHP, realHurtHp,
+        gainHP(i32), remainHP(i32)   <- 施法者**结算后当前 HP**
+        maxHp, state, petStatus,
+        [skillList: count + (skillID, pp)×count],
+        isCrit,
+        status(uint8 count + 逐字节),
+        specailArr(u32 count + u32×count; 含 changeValue@[13], changeValue2@[25], changeSelfValue@[37], changeEnemyValue@[38]),
+        sideEffects(u32 count + PetStatusEffectInfo(12B)×count),
+        battle_lv(i32), change_bitset, priority,
+        immunizationStates(u32 count + u32×count),
+        changehps(u32 count + {id,hp,maxhp,lock,chujueNumber,chujueRound}×count + MarkBuffInfo each),
+        requireSwitchCthTime, maxHpSelf, maxHpOther, secretLaw,
+        skillRunawayMarks(u32 count + u32×count),
+        siteBuff(u16+u8), bothSiteBuff(u16+u8), markBuff(u8 cnt + (u16,u8)×cnt),
+        signInfo(u32 count + FightSignInfo(8B)×count),
+        lockedSkillArr(5×u32),
+        skillResult(u32 count + u32×count),
+        zhuijiId, zhuijiHurt.
+    """
+    def u(n=4):
+        nonlocal o
+        v = int.from_bytes(b[o:o + n], "big"); o += n; return v
+    def i(n=4):
+        nonlocal o
+        v = int.from_bytes(b[o:o + n], "big", signed=True); o += n; return v
+
+    x = {}
+    x["userID"] = u()
+    x["skillID"] = u()
+    u(); u()                      # 2 个丢弃 u32 (回合/开局)
+    x["effectName"] = u()
+    x["atkTimes"] = u()
+    x["lostHP"] = u()
+    x["realHurtHp"] = u()
+    x["gainHP"] = i()
+    x["remainHP"] = i()           # 结算后当前 HP
+    x["maxHp"] = u()
+    x["state"] = u()
+    x["petStatus"] = u()
+    sln = u()
+    x["skillList"] = [[u(), u()] for _ in range(sln)]
+    x["isCrit"] = u()
+    sc = u(1)
+    x["status"] = [u(1) for _ in range(sc)]
+    w = u()
+    x["specailArr"] = [u() for _ in range(w)]
+    se = u()
+    x["sideEffects"] = []
+    for _ in range(se):
+        x["sideEffects"].append({"type": u(), "id": u(), "parm": u()})
+    x["battle_lv"] = i()
+    x["change_bitset"] = u()
+    x["priority"] = u()
+    im = u()
+    x["immunizationStates"] = [u() for _ in range(im)]
+    ch = u()
+    x["changehps"] = []
+    for _ in range(ch):
+        c = {"id": u(), "hp": u(), "maxhp": u(), "lock": u(),
+             "chujueNumber": u(), "chujueRound": u()}
+        mb = u(1)
+        x["changehps"].append({**c, "_markBuff": [{"id": u(2), "markNum": u(1)} for _ in range(mb)]})
+    x["requireSwitchCthTime"] = u()
+    x["maxHpSelf"] = u()
+    x["maxHpOther"] = u()
+    x["secretLaw"] = u()
+    sw = u()
+    x["skillRunawayMarks"] = [u() for _ in range(sw)]
+    x["siteBuff"] = {"id": u(2), "turn": u(1)}
+    x["bothSiteBuff"] = {"id": u(2), "turn": u(1)}
+    mb = u(1)
+    x["markBuff"] = [{"id": u(2), "markNum": u(1)} for _ in range(mb)]
+    sn = u()
+    x["signInfo"] = []
+    for _ in range(sn):
+        loc = u(); sp = u()
+        x["signInfo"].append({"id": loc & 0xFFFF, "lvNum": (loc >> 16) & 0xFF,
+                              "roundNum": (loc >> 24) & 0xFF, "spValue": sp})
+    x["lockedSkillArr"] = [u() for _ in range(5)]
+    sr = u()
+    x["skillResult"] = [u() for _ in range(sr)]
+    x["zhuijiId"] = u()
+    x["zhuijiHurt"] = u()
+    return x, o
+
+
+def parse_use_skill_info(body):
+    """2505 NOTE_USE_SKILL = UseSkillInfo = [firstAttackInfo][secondAttackInfo].
+
+    只有**本回合实际出手**的两个施法者才各有 AttackValue; 若某方本回合未出手
+    (如敌方已阵亡/未动), 则对应 AttackValue 不存在或退化. 一般:
+        firstAttackInfo.userID == 我方账号, secondAttackInfo.userID == 0(敌方).
+    返回 {first, second, endOffset}. 若包体过短/为哨兵(0xDEADBEEF)或凑不齐第二个,
+    则 second 为 None 或整包判定为"非有效 2505".
+
+    守卫: 真实 UseSkillInfo 至少要有两个 AttackValue 可用; 若 first 的 userID/长度异常
+    (如 deadbeef guard 或 len<啥都不是), 直接抛 ValueError 让调用方跳过.
+    """
+    b = bytes(body)
+    if len(b) < 44:
+        raise ValueError("2505 包体过短, 非有效 UseSkillInfo")
+    first, o = parse_attack_value(b, 0)
+    # 哨兵 guard: userID==0xDEADBEEF 或 first 全是 0 且包体极短, 视为无效
+    if first.get("userID") == 0xDEADBEEF or (first.get("userID") == 0 and len(b) < 100):
+        raise ValueError("2505 为占位/哨兵包, 跳过")
+    second = None
+    if o < len(b):
+        try:
+            second, o = parse_attack_value(b, o)
+        except Exception:
+            second = None
+    return {"first": first, "second": second, "endOffset": o}
+
+
+def extract_attack_blocks(b):
+    """便捷: 返回 [firstAttackValue, secondAttackValue] 的简要字段列表.
+
+    每个元素含 userID/skillID/atkTimes/lostHP(伤害)/gainHP(回血)/realHurtHp/remainHP/
+    maxHp/isCrit/state/petStatus/status/specailArr/sideEffects/skillList/changehps.
+    跳过**空块**(skillID==0 且 userID==0 且 remainHP==0 且 maxHp==0): 表示该方本回合
+    未出手(敌已阵亡/未动/回合未进行), 不当作有效攻击者.
+    """
+    r = None
+    try:
+        r = parse_use_skill_info(b)
+    except (ValueError, IndexError):
+        return []
+    out = []
+    for blk in (r.get("first"), r.get("second")):
+        if blk is None:
+            continue
+        # 空块判定: 施法者未实际出招 (技能0/无伤害/无血量/无状态)
+        if (blk.get("skillID") == 0 and blk.get("userID") == 0
+                and blk.get("remainHP") == 0 and blk.get("maxHp") == 0
+                and blk.get("lostHP") == 0 and blk.get("gainHP") == 0):
+            continue
+        out.append({
+            "userID": blk.get("userID"),
+            "skillID": blk.get("skillID"),
+            "atkTimes": blk.get("atkTimes"),
+            "lostHP": blk.get("lostHP"),
+            "gainHP": blk.get("gainHP"),
+            "realHurtHp": blk.get("realHurtHp"),
+            "remainHP": blk.get("remainHP"),
+            "maxHp": blk.get("maxHp"),
+            "isCrit": blk.get("isCrit"),
+            "state": blk.get("state"),
+            "petStatus": blk.get("petStatus"),
+            "status": blk.get("status"),
+            "specailArr": blk.get("specailArr"),
+            "sideEffects": blk.get("sideEffects"),
+            "skillList": blk.get("skillList"),
+            "changehps": blk.get("changehps"),
+        })
+    return out
+
+
 def extract_pet_hp_updates(b):
     """扫描 2505/回合包里的精灵血量记录, 兼容两种布局.
 
@@ -356,8 +537,9 @@ def extract_pet_hp_updates(b):
     n = len(b)
 
     def add(ct, hp, mh):
-        # 允许 hp==0(精灵阵亡), 但 maxHp 必须 >1 且合理 (排除误读的 [ct][0][1])
-        if 0x40000000 <= ct <= 0x7FFFFFFF and 0 <= hp <= mh and 1 < mh < 10_000_000 and ct not in seen:
+        # 允许 hp==0(精灵阵亡), 但 maxHp 必须合理 (排除误读的 [ct][0][1] 与 tiny 垃圾记录;
+        # 真实对战精灵 maxHp 至少 ~几十, 而误读常在 1..5). 上限防溢出/噪声.
+        if 0x40000000 <= ct <= 0x7FFFFFFF and 0 <= hp <= mh and 10 < mh < 10_000_000 and ct not in seen:
             seen.add(ct)
             out.append({"catchTime": ct, "hp": hp, "maxHp": mh})
 
@@ -373,26 +555,33 @@ def extract_pet_hp_updates(b):
     return out
 
 
-# 2506 结果包体(FightOverInfo)里我方账号的字节偏移与尾部结果标志
-_FIGHT_OVER_ACCT_OFF = 5       # 实测: 我方账号 id (u32, 大端) 位于 body offset 5..8
-_FIGHT_OVER_TAIL_OFF = -1      # 实测: 尾部 1 字节 = 本场回合数 (0x02/0x03), 非胜负标志
-
-
+# 2506 结果包体 (FightOverInfo) 逐字段解码 — 依 refs/attack/FightOverInfo.as
 def parse_fight_over(body):
     """2506 FIGHT_OVER / 对战结束结果包 (FightOverInfo).
 
-    实测包体 57B, 几乎全为 0, 有效字段:
-        - offset 5 (u32, 大端): 我方账号 id (与 2503/2504 的 me_id 一致)
-        - 末字节: 本场回合数 (用于旁证"打了几回合"; 不是胜负标志)
+    按 refs/attack/FightOverInfo.as 解码 (实测包体 57B 恰好消费完):
+        type(u8), reason(u32), winnerID(u32), isCanSave(u32),
+        twoTimes/threeTimes/autoFightTimes/btlDetectTimes/energyTimes/learnTimes (各 u32),
+        deltaTopLv(i32), deltaTopHonour(u32), maxH(u32), totalH(u32), roundNum(u32).
 
-    注意: **该包不含胜负标志**。胜负需结合本场最后一次 2505 的 HP 更新判断:
-    (敌方 HP==0 → 我方胜; 我方 HP==0 且敌方>0 → 我方败) —— 由调用方结合已跟踪的对战状态给出.
-    返回 {accountId, roundNum, endOffset}.
+    **winnerID** 即胜者账号 —— 我方账号 => 我方胜; 敌方(0) => 我方负. reason 说明结束原因.
+    roundNum 为本场回合数. 返回 {type, reason, winnerID, isCanSave, maxH, totalH,
+    roundNum, deltaTopLv, deltaTopHonour, endOffset}.
     """
     b = bytes(body)
-    n = len(b)
-    acc = _u32(b, _FIGHT_OVER_ACCT_OFF) if n >= 9 else None
-    if acc is not None and (acc == 0 or acc > 0x7FFFFFFF):
-        acc = None
-    tail = b[_FIGHT_OVER_TAIL_OFF] if b else None
-    return {"accountId": acc, "roundNum": tail, "endOffset": n}
+    o = 0
+
+    def u(n=4):
+        nonlocal o
+        v = int.from_bytes(b[o:o + n], "big"); o += n; return v
+    def i(n=4):
+        nonlocal o
+        v = int.from_bytes(b[o:o + n], "big", signed=True); o += n; return v
+
+    d = {"type": u(1), "reason": u(), "winnerID": u(), "isCanSave": u() != 0}
+    d["twoTimes"] = u(); d["threeTimes"] = u(); d["autoFightTimes"] = u()
+    d["btlDetectTimes"] = u(); d["energyTimes"] = u(); d["learnTimes"] = u()
+    d["deltaTopLv"] = i(); d["deltaTopHonour"] = u()
+    d["maxH"] = u(); d["totalH"] = u(); d["roundNum"] = u()
+    d["endOffset"] = o
+    return d

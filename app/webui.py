@@ -262,6 +262,46 @@ def _ptag(p):
             f"HP {p.get('hp') or p.get('xinHp') or '?'}/{p.get('maxHP') or p.get('maxHp') or p.get('xinMaxHp') or '?'}")
 
 
+def _pet_entry(ct):
+    """按 catchTime 从对战状态找精灵: 返回 (pet_dict, side) 或 (None, None).
+
+    side: "我方"/"敌方". pet 用 _battle_view 补过名字/头像.
+    """
+    if ct is None:
+        return None, None
+    for p in _BATTLE.get("myTeam", []):
+        if p.get("catchTime") == ct:
+            return p, "我方"
+    for p in _BATTLE.get("otherTeam", []):
+        if p.get("catchTime") == ct:
+            return p, "敌方"
+    m = _BATTLE.get("my")
+    if m and m.get("catchTime") == ct:
+        return m, "我方"
+    o = _BATTLE.get("other")
+    if o and o.get("catchTime") == ct:
+        return o, "敌方"
+    return None, None
+
+
+def _pet_label(ct, p=None, side=None):
+    """战报里精灵的友好名: [我方] 星丝·鲁斯王(id=4648)."""
+    if p is None and ct is not None:
+        p, side = _pet_entry(ct)
+    pid = (p or {}).get("id") or (p or {}).get("petID")
+    nm = (p or {}).get("name") or resolve_name({"id": pid}) if pid else "(未知)"
+    side = side or "?"
+    return f"[{side}] {nm}(id={pid})"
+
+
+def _hp_delta(old, new):
+    """血量变化: 掉血用负数, 回血用正数; None 表示未知."""
+    try:
+        return round(int(new) - int(old)) if old is not None and new is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _update_battle(cmd, hex_body, me_id):
     """解析对战包(2503/2504)并更新 _BATTLE 状态; me_id=当前账号米米号, 用于区分我方/敌方."""
     global _BATTLE
@@ -330,33 +370,67 @@ def _update_battle(cmd, hex_body, me_id):
             except Exception:
                 pass
         elif cmd == 2505:
-            # NOTE_USE_SKILL: 前导 [userID][skillID][count][actorCatchTime] + 尾部受击精灵
-            # [catchTime][hp][maxHp] 记录 → 逐回合刷新对应一方/我方队伍血量.
+            # NOTE_USE_SKILL: 一个 2505 = 一整回合 = UseSkillInfo (firstAttackInfo + secondAttackInfo).
+            # 依 refs/attack/AttackValue.as 精确解: attackBlocks 给 full AttackValue (skillID/atkTimes/
+            # lostHP/gainHP/remainHP/maxHp/isCrit/state/petStatus/specailArr/...).
             try:
                 sk = parse_note_use_skill(data)
                 upd = sk.get("hpUpdates") or []
+                blocks = sk.get("attackBlocks") or []
+                # 记录更新前各精灵 HP, 供战报显示血条变化(掉血/回血)
                 with _LOCK:
+                    pre_hp = {}
+                    for p in _BATTLE.get("myTeam", []) + _BATTLE.get("otherTeam", []):
+                        ct = p.get("catchTime")
+                        if ct is not None:
+                            pre_hp[ct] = p.get("hp")
                     _BATTLE["lastSkill"] = sk
                     _BATTLE["lastCmd"] = 2505
                     _apply_hp_updates(upd)
                     _BATTLE["version"] += 1
-                # 敌方技能并非 2505 前导, 而是内嵌在包体深处的同级子块; 全量解析出双方本回合动作
-                recs = sk.get("skillRecords") or []
-                seen_r = set()
-                for r in recs:
-                    rid = r.get("userID")
-                    side = "我方" if rid == me_id else ("敌方" if rid == 0 else f"?{rid}")
-                    _report(f"回合 用户{rid}({side}) 使用技能 {_skill_name(r.get('skillID'))}[{r.get('skillID')}] 回合数{r.get('count')}")
+                # 用精确的 AttackValue 双方块报告 (确定性的), 退化回 skillRecords
+                if blocks:
+                    for r in blocks:
+                        rid = r.get("userID")
+                        side = "我方" if rid == me_id else ("敌方" if rid == 0 else f"?{rid}")
+                        hp = r.get("remainHP")
+                        crit = " 暴击!" if r.get("isCrit") else ""
+                        atk = r.get("skillID")
+                        _report(f"回合 用户{rid}({side}) 使用技能 {_skill_name(atk)}[{atk}] "
+                                f"伤害{r.get('lostHP')} 回血{r.get('gainHP')} 剩余HP {hp}/{r.get('maxHp')}{crit}"
+                                + (" ⚠️阵亡" if hp == 0 else ""))
+                else:
+                    recs = sk.get("skillRecords") or []
+                    for r in recs:
+                        rid = r.get("userID")
+                        side = "我方" if rid == me_id else ("敌方" if rid == 0 else f"?{rid}")
+                        _report(f"回合 用户{rid}({side}) 使用技能 {_skill_name(r.get('skillID'))}[{r.get('skillID')}] 回合数{r.get('count')}")
+                # 血条变化: 按精灵名呈现, 掉血/回血/阵亡 (替代原先的 catch 调试输出)
                 for u in upd:
-                    _report(f"  HP变化 catch={u.get('catchTime')} → {u.get('hp')}/{u.get('maxHp')}")
-                if not recs:
+                    ct = u.get("catchTime")
+                    new = u.get("hp")
+                    mh = u.get("maxHp")
+                    old = pre_hp.get(ct)
+                    # 只显示真正在场的精灵 (跳过未识别/幻影的 catchTime)
+                    pet, side = _pet_entry(ct)
+                    if pet is None:
+                        continue
+                    delta = _hp_delta(old, new)
+                    label = _pet_label(ct, pet, side)
+                    d_txt = ("掉血 %d" % -delta) if (delta is not None and delta < 0) else \
+                            ("回血 +%d" % delta) if (delta is not None and delta > 0) else \
+                            ("HP 不变") if delta == 0 else "血条变化"
+                    note = " ⚠️阵亡" if (new is not None and new <= 0) else \
+                           (" ⚠️残血" if (new is not None and mh and 0 < new <= mh * 0.2) else "")
+                    _report(f"  {label} {d_txt} → {new}/{mh}{note}")
+                if not blocks and not sk.get("skillRecords"):
                     side = "我方" if sk.get("userID") == me_id else "敌方"
                     _report(f"回合 用户{sk.get('userID')}({side}) 使用技能 {_skill_name(sk.get('skillID'))}[{sk.get('skillID')}] 目标数{sk.get('count')}")
                 if not upd:
-                    _report(f"  (未解析到HP更新; 包体{len(data)}B, 已存 webui_logs/battle_capture.log, 点『复制』后我读文件解码)")
-                log("info", f"对战(2505 回合): 玩家技能{sk.get('skillID')} 敌方技能"
-                            f"{[r.get('skillID') for r in recs if r.get('userID') == 0]} "
-                            f"更新{len(upd)}只HP")
+                    _report(f"  (本回合未解析到血量变化; 包体{len(data)}B, 已存 webui_logs/battle_capture.log, 点『复制』后我读文件解码)")
+                log("info", f"对战(2505 回合): 我方技能{sk.get('skillID')} 敌方技能"
+                            f"{[r.get('skillID') for r in blocks if r.get('userID') == 0]} "
+                            f"攻击块{len(blocks)} HP更新{len(upd)}")
             except Exception:
                 pass
         elif cmd in (2406,):
@@ -382,12 +456,17 @@ def _update_battle(cmd, hex_body, me_id):
                 fin_ot = _BATTLE.get("other")
             fin_my_hp = (fin_my or {}).get("hp")
             fin_ot_hp = (fin_ot or {}).get("hp")
-            # 2506 结果包可解析出账号与回合数; 但无胜负标志, 靠双方 HP 判定
+            # 2506 FightOverInfo 的 **winnerID 即胜者账号** —— 我方账号=>我胜; 敌方(0)=>我负. 以此为权威
             try:
                 fo = parse_fight_over(data)
             except Exception:
                 fo = {}
-            if fin_ot_hp is not None and fin_ot_hp <= 0 and (fin_my_hp or 0) > 0:
+            wid = fo.get("winnerID")
+            if wid == me_id:
+                verdict = "我方胜利"
+            elif wid == 0:
+                verdict = "我方战败 (或未开打结束)"
+            elif fin_ot_hp is not None and fin_ot_hp <= 0 and (fin_my_hp or 0) > 0:
                 verdict = "我方胜利"
             elif fin_my_hp is not None and fin_my_hp <= 0 and (fin_ot_hp or 0) > 0:
                 verdict = "我方战败"
@@ -400,10 +479,11 @@ def _update_battle(cmd, hex_body, me_id):
                 def _hp(v):
                     return "?" if v is None else str(v)
                 _report(f"  最终血量 我方 {_hp(fin_my_hp)} | 敌方 {_hp(fin_ot_hp)}")
-            if fo.get("accountId") is not None:
-                _report(f"  结束包: 账号 {fo['accountId']} 回合数 {fo.get('roundNum')} (包体{len(data)}B)")
+            if fo.get("winnerID") is not None:
+                _report(f"  结束包(winID): 胜者={fo['winnerID']}"
+                        f" 原因{fo.get('reason')} 类型{fo.get('type')} 回合数{fo.get('roundNum')} (包体{len(data)}B)")
             else:
-                _report(f"  结束包: 无账号/回合信息 (包体{len(data)}B, 前48B {data[:48].hex()})")
+                _report(f"  结束包: 无胜负信息 (包体{len(data)}B, 前48B {data[:48].hex()})")
             if flushed:
                 _report(f"  本场完整包体已存 {flushed[0]} ({flushed[1]} 包)")
             with _LOCK:

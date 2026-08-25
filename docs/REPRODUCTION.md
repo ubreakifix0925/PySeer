@@ -154,37 +154,61 @@ key  = md5( str(xor) ).hexdigest()[:10]     # 取 md5 前 10 个字符
 - `FightSignInfo`(8B)：`id(16b)|lvNum(8b)|roundNum(8b)` + `spValue(u32)`。
 - 我方/敌方由 `userID==actorID` 决定；`requireSwitchCthTime` 用于"自动换宠"。
 
-### 5.3 2505 NOTE_USE_SKILL（回合结果）—— 最容易踩坑
-**一个 2505 = 一整回合**，内含**多条同构的 16B 技能记录**：
+### 5.3 2505 NOTE_USE_SKILL（回合结果）—— 已完整解出
+**一个 2505 = 一整回合 = `UseSkillInfo`**，内含 `firstAttackInfo` + `secondAttackInfo`
+两个 **AttackValue**，pack 直接**首尾相接**（我方块在最前，敌方块随后）。完整读取顺序
+见 `refs/attack/AttackValue.as`（`parse_attack_value()` 已实现，对每个实战包可**逐字节精确
+消耗到末尾**）。`extract_attack_blocks()` / `parse_note_use_skill()` 返回全字段。
+
+**AttackValue 字段读取顺序**（大端；`u()`=u32，`i()`=i32）：
 
 ```
-技能记录(16B) = [userID(u32)][skillID(u32)][count(u32=回合数)][actorCatchTime(u32)]
+userID u32, skillID u32, (2×丢弃 u32: 回合/开局)
+effectName u32(FightEffectName.id), atkTimes u32, lostHP u32, realHurtHp u32,
+gainHP i32, remainHP i32,        <- remainHP = 施法者**结算后当前 HP**
+maxHp u32, state u32, petStatus u32,
+[skillList: count u32 + (skillID,pp)×count],
+isCrit u32,
+status (u8 count + 逐字节),
+specailArr (u32 count + u32×count; 语义索引: [5..9]状态, [10]追击败, [11]lostHP, [14]reSetAliveNum, [26]变身),
+sideEffects (u32 count + PetStatusEffectInfo(12B)×count),
+battle_lv i32, change_bitset u32, priority u32,
+immunizationStates (u32 count + u32×count),
+changehps (u32 count + {id,hp,maxhp,lock,chujueNumber,chujueRound}×count + MarkBuffInfo each),
+requireSwitchCthTime u32, maxHpSelf u32, maxHpOther u32, secretLaw u32,
+skillRunawayMarks (u32 count + u32×count),
+siteBuff(u16+u8), bothSiteBuff(u16+u8), markBuff(u8 cnt + (u16,u8)×cnt),
+signInfo (u32 count + FightSignInfo(8B)×count),
+lockedSkillArr (5×u32),
+skillResult (u32 count + u32×count),
+zhuijiId u32, zhuijiHurt u32.
 ```
 
-- **我方技能**在包体**前导**(offset 0)。
-- **敌方技能**是**内嵌在包体深处、byte 级偏移(不按 4 对齐)** 的同级子块 —— 必须**逐字节扫描**
-  `extract_skill_use_records()` 才能把双方本回合技能都解出来（敌方子块位置每次不同：
-  实测 412 / 448 / 573B 等，取决于前面变长字段长度）。
-- 敌方子块 `userID==0`，我方子块 `userID==当前账号`。
-- **HP 更新记录**两种布局（`extract_pet_hp_updates` 兼容）：
-  - 格式A(相邻三段式)：`[catchTime][hp][maxhp]`
-  - 格式B(32B)：`[catchTime][type][1][val][0][0][hp][maxhp]`（hp 在 +24，maxhp 在 +28）
-  - `hp==0` 表示**阵亡**；守卫 `maxHp>1` 过滤假记录 `[ct][0][1]`。
+- **`remainHP/maxHp` = 本回合结算后双方施法精灵的权威血量**（斩杀回合敌方 `remainHP==0`）。
+- **`lostHP` = 本技能造成的伤害**，`gainHP` = 回血，`isCrit` = 是否暴击。
+- 敌方块 `userID==0`，我方块 `userID==当前账号`；**斩妖回合（敌已阵亡）敌块为空块**
+  （全 0，`extract_attack_blocks()` 已跳过）。
+- 补充：`extract_pet_hp_updates()`（按 catchTime 扫描的 hp/maxhp）覆盖**背包全体**精灵；
+  attack 块只含两个施法者，两者互补。
 
-实测（打谱尼 Boss，mode=67）：敌方技能 `10995 旋灭裂空阵(圣灵·135)`、
-`20500 圣光气(普通·0·必中，属性/回复类)`；我方 `37381 星光·浪打千击(水·30·必中)`。
-敌方技能在**斩杀回合(敌方阵亡)** 往往不再出现。
+实测（打谱尼 Boss，mode=67）：我方 `37381 星光·浪打千击`（水·30，每回合暴击，
+伤害 1269–3301），敌方 `10995 旋灭裂空阵`（圣灵·135，伤害 40–343）或
+`20500 圣光气`（普通·0·必中，回复/属性类，伤害 0）。
 
 ### 5.4 2506 FIGHT_OVER（对战结束）
-`FightOverInfo` 包体 **57B 几乎全 0**，有效字段仅：
-- `offset 5 (u32)`：我方账号 id
-- **末字节**：本场**回合数**（`0x03`=3回合、`0x02`=2回合、`0x00`=未打/取消）
+`FightOverInfo`（`parse_fight_over()` 已实现，包体 57B 恰好消费完）字段：
 
-**不含胜负标志**。胜负靠本场最后一次 2505 的 HP 更新判定：
-- 敌方HP==0 且我>0 → **我方胜利**
-- 我方HP==0 且敌>0 → **我方战败**
-- 双双归零 → 同归于尽
-- 都无法判定（如取消场）→ 胜负未判定
+```
+type u8, reason u32, winnerID u32, isCanSave u32,
+twoTimes/threeTimes/autoFightTimes/btlDetectTimes/energyTimes/learnTimes (各 u32),
+deltaTopLv i32, deltaTopHonour u32, maxH u32, totalH u32, roundNum u32.
+```
+
+- **`winnerID` = 胜者账号** —— 我方账号 => **我方胜利**；敌方(`0`) => 我方战败/未开打。这是权威判定。
+- `reason` 说明结束原因；`roundNum` = 本场回合数；`maxH/totalH` = 血量（部分模式才有）。
+- 已确认：实战胜场 `winnerID==<账号>`, reason=0；取消场 `winner=0, reason=1`。
+- 兜底：若无 `winnerID`（极旧/异常包），可退化为用本场最后一次 2505 的 HP 推
+  （敌方HP==0 且我>0 → 我方胜利；我==0 且敌>0 → 我败；双双0 → 同归于尽）。
 
 ### 5.5 已确认的其它战斗命令
 | cmd | 含义 | 解析 |
