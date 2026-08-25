@@ -3,9 +3,9 @@
 
 启动时调用 :func:`ensure_pet_avatars`:
   1. 读远端 YooAsset 版本号 (PackageManifest_<pkg>.version)
-  2. 与本地记录 (refs/head/.avatar_state.json) 比对; 版本一致且头像目录非空 -> 跳过
+  2. 与本地记录 (data/head/.avatar_state.json) 比对; 版本一致且头像目录非空 -> 跳过
   3. 否则: 自动安装 UnityPy(如缺失) -> 下载 pet_head_*.bundle 到缓存
-           -> 用 UnityPy 解析出 <物种id>.png 写入 refs/head/ -> 记录版本
+           -> 用 UnityPy 解析出 <物种id>.png 写入 data/head/ -> 记录版本
 
 - 依赖自动安装: 优先用已存在的 pip; 没有则引导安装 pip(get-pip.py), 再把 UnityPy
   装到项目内 vendor/ 目录并加入 sys.path, 不污染全局 site-packages.
@@ -28,45 +28,47 @@ REMOTE_BASE = os.environ.get(
     "SEER_AVATAR_BASE",
     "https://newseer.61.com/Assets/StandaloneWindows64/DefaultPackage/",
 )
-BASE_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
-HEAD_DIR = Path(os.environ.get("SEER_AVATAR_OUT", BASE_DIR / "refs" / "head"))
-CACHE_DIR = Path(os.environ.get("SEER_AVATAR_CACHE", BASE_DIR / "cache" / "pet_head"))
-VENDOR_DIR = Path(os.environ.get("SEER_AVATAR_VENDOR", BASE_DIR / "vendor"))
+BASE_DIR = Path(os.path.dirname(os.path.abspath(__file__)))   # 源码目录 app/
+_PROJ = BASE_DIR.parent                                        # 项目根目录
+_DATA_DIR = _PROJ / "data"                                     # 运行时资源目录
+HEAD_DIR = Path(os.environ.get("SEER_AVATAR_OUT", _DATA_DIR / "head"))
+CACHE_DIR = Path(os.environ.get("SEER_AVATAR_CACHE", _PROJ / "cache" / "pet_head"))
+VENDOR_DIR = Path(os.environ.get("SEER_AVATAR_VENDOR", _PROJ / "vendor"))
 STATE_FILE = HEAD_DIR / ".avatar_state.json"
 BUNDLE_GLOB = "_pet_head_"  # 匹配"精灵头像" bundle 名
 
 # ---- petbook (精灵图鉴名字) 相关 ----
-PETBOOK_FILE = Path(os.environ.get("SEER_PETBOOK_OUT", BASE_DIR / "petbook.json"))
-PETBOOK_STATE = Path(os.environ.get("SEER_PETBOOK_STATE", BASE_DIR / ".petbook_state.json"))
+PETBOOK_FILE = Path(os.environ.get("SEER_PETBOOK_OUT", _DATA_DIR / "petbook.json"))
+PETBOOK_STATE = Path(os.environ.get("SEER_PETBOOK_STATE", _DATA_DIR / ".petbook_state.json"))
 CONFIG_PKG = os.environ.get("SEER_PETBOOK_PKG", "ConfigPackage")
 CONFIG_BASE = os.environ.get(
     "SEER_PETBOOK_BASE",
     "https://newseer.61.com/Assets/StandaloneWindows64/ConfigPackage/",
 )
-CONFIG_CACHE = Path(os.environ.get("SEER_PETBOOK_CACHE", BASE_DIR / "cache" / "petbook"))
+CONFIG_CACHE = Path(os.environ.get("SEER_PETBOOK_CACHE", _PROJ / "cache" / "petbook"))
 PETBOOK_ASSET = "assets/game/configs/bytes/petbook.bytes"  # 图鉴二进制表(含 id->名字)
 MONSTERS_ASSET = "assets/game/configs/bytes/monsters.bytes"  # 精灵二进制表(含 id,real_id,type,技能等)
 SKILLTYPES_ASSET = "assets/game/configs/bytes/skilltypes.bytes"  # 精灵属性类型表(id->中文名, 含双属性/新属性)
 MOVES_ASSET = "assets/game/configs/bytes/moves.bytes"  # 技能基础表(id->名/pp/属性/威力/命中/暴击/必中/先制/效果)
 SKILL_EFFECT_ASSET = "assets/game/configs/bytes/skill_effect.bytes"  # 技能效果表(id->描述模板/参数个数)
 SKILLS_FILE = Path(os.environ.get(
-    "SEER_SKILLS_OUT", BASE_DIR / "skills.json"))
+    "SEER_SKILLS_OUT", _DATA_DIR / "skills.json"))
 SKILLS_STATE = Path(os.environ.get(
-    "SEER_SKILLS_STATE", BASE_DIR / ".skills_state.json"))
+    "SEER_SKILLS_STATE", _DATA_DIR / ".skills_state.json"))
 EFFECT_ICON_ASSET = "assets/game/configs/bytes/effecticon.bytes"  # 魂印/效果图标表(id->描述/pet_id关联/效果)
 EFFECT_TAG_ASSET = "assets/game/configs/bytes/effectag.bytes"  # 魂印效果标签表(id->标签名)
 SOULMARKS_FILE = Path(os.environ.get(
-    "SEER_SOULMARKS_OUT", BASE_DIR / "soulmarks.json"))
+    "SEER_SOULMARKS_OUT", _DATA_DIR / "soulmarks.json"))
 SOULMARKS_STATE = Path(os.environ.get(
-    "SEER_SOULMARKS_STATE", BASE_DIR / ".soulmarks_state.json"))
+    "SEER_SOULMARKS_STATE", _DATA_DIR / ".soulmarks_state.json"))
 EFFECT_ICON_DIR = Path(os.environ.get(
-    "SEER_EFFECTICON_DIR", BASE_DIR / "refs" / "effecticon"))  # 魂印/效果图标输出目录
+    "SEER_EFFECTICON_DIR", _DATA_DIR / "effecticon"))  # 魂印/效果图标输出目录
 EFFECT_ICON_GLOB = "_effecticon_"  # 匹配 DefaultPackage 里"效果图标" bundle
-PET_ATTR_FILE = Path(os.environ.get("SEER_PETATTR_OUT", BASE_DIR / "pet_attr.json"))
+PET_ATTR_FILE = Path(os.environ.get("SEER_PETATTR_OUT", _DATA_DIR / "pet_attr.json"))
 PET_ATTR_STATE = Path(os.environ.get(
-    "SEER_PETATTR_STATE", BASE_DIR / ".pet_attr_state.json"))
+    "SEER_PETATTR_STATE", _DATA_DIR / ".pet_attr_state.json"))
 MONSTERS_JSON = Path(os.environ.get(
-    "SEER_MONSTERS_JSON", BASE_DIR / "refs" / "monsters.json"))
+    "SEER_MONSTERS_JSON", _PROJ / "refs" / "monsters.json"))
 
 # 属性类型编号 -> 中文名 (来自 skilltypes.bytes, 单体 1-20 + 复合 21-132)
 PET_ATTR_NAMES = {
@@ -288,7 +290,7 @@ def _pip_env():
 
 def _bootstrap_pip():
     """引导 pip (应对无 pip / PEP 668 externally-managed). 返回是否成功."""
-    get_pip = BASE_DIR / "cache" / "get-pip.py"
+    get_pip = _PROJ / "cache" / "get-pip.py"
     get_pip.parent.mkdir(parents=True, exist_ok=True)
     url = "https://bootstrap.pypa.io/get-pip.py"
     log("需要 pip, 正在下载 get-pip.py ...")
@@ -383,7 +385,7 @@ def _find_effect_icon_bundles(bundles):
 
 
 def ensure_effect_icons(force=False):
-    """下载 DefaultPackage 的 effecticon_*.bundle 并解出图标到 refs/effecticon/.
+    """下载 DefaultPackage 的 effecticon_*.bundle 并解出图标到 data/effecticon/.
 
     提供魂印/效果图标(按 icon_id 命名, 供 webui /effecticon/<id>.png). 失败不影响其它更新.
     """
@@ -561,7 +563,7 @@ def _read_json(path):
 
 
 def _avatar_ids():
-    """refs/head 下已有头像的物种 id 集合."""
+    """data/head 下已有头像的物种 id 集合."""
     import glob as _g
     out = set()
     for f in _g.glob(str(HEAD_DIR / "*.png")):

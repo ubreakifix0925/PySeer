@@ -1,25 +1,28 @@
-# 默认忽略所有内容, 仅保留运行必需文件.
-# 运行必需: WebUI/webui.py + 数据更新/assets_updater.py + 脚本库/seerlib.py
-#           + 协议客户端 seer/ 包 + cmdmap.json + requirements.txt + 文档.
-# 其余(生成数据/下载缓存/逆向参考/运行时凭据/日志/字节码)一律忽略.
+# ============================================================
+# 默认忽略所有内容, 仅保留"运行项目必须"的文件.
+# 运行必需 = 程序文件(app/) + 说明文档(README.md, docs/) + 本文件.
+# 其余(运行时下载/生成的资源、逆向参考资料、分析工具与产物、缓存、凭据、日志、字节码)一律忽略.
+# ============================================================
+
 *
 
-# ---- 运行必需的源码 / 配置 / 文档 ----
+# ---- 运行必需：程序文件 (app/) ----
 !.gitignore
 !README.md
-!DEVELOPMENT.md
-!ANALYSIS_gamedump4.md
-!requirements.txt
-!cmdmap.json
-!*.py
-!seer/
-!seer/**
-!tools/
-!tools/**
 
-# 即便目录被保留, 运行时字节码仍忽略
+!app/
+!app/**
+!app/seer/
+!app/seer/**
+!app/scripts/
+!app/scripts/**
+!app/cmdmap.json
+!app/requirements.txt
+
+# ---- 文档 ----
+!docs/
+!docs/**
+
+# ---- 仍要忽略的运行产物/字节码 (即便目录保留) ----
 *.pyc
 **/__pycache__/
-crack_seed_v2.py
-crack_seed_v3.py
-crack_seed.py

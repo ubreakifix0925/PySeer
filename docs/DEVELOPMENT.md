@@ -1,7 +1,7 @@
 # 赛尔号（Seer）脚本与数据工具 — 开发成果整理
 
 > 本文档汇总基于 **seer-login-test 后端**（`assets_updater.py` 自更新数据管线 + `webui.py` 协议调试台）完成的一系列成果：自更新游戏数据、精灵详情界面功能、协议逆向结论，以及供脚本使用的第三方库 `seerlib.py`。
-> 基础登录/WebUI 使用说明见 [README.md](./README.md)。
+> 基础登录/WebUI 使用说明见 [README.md](../README.md)。
 
 ---
 
@@ -13,7 +13,7 @@
 游戏资源(ConfigPackage bundle / DefaultPackage bundle)
         │  assets_updater.py (启动时自动下载+解析, 可自更新)
         ▼
-petbook.json / pet_attr.json / skills.json / soulmarks.json / refs/effecticon/*.png
+petbook.json / pet_attr.json / skills.json / soulmarks.json / data/effecticon/*.png
         │  由 webui.py 启动加载, 供界面回填
         ▼
 WebUI(http://127.0.0.1:8680)  ── 后台已登录的 SeerClient  ──▶ seerlib.py (脚本库)
@@ -36,7 +36,7 @@ WebUI(http://127.0.0.1:8680)  ── 后台已登录的 SeerClient  ──▶ se
 | 属性名来源 | `skilltypes.bytes` | `parse_skill_types` | 属性 id→中文名（138 种） |
 | `skills.json` | `moves.bytes` + `skill_effect.bytes` | `parse_moves` / `parse_skill_effects` / `regenerate_skills` | 技能 id → 名/PP/属性/威力/命中/暴击/必中/先制/效果（27206 条） |
 | `soulmarks.json` | `effecticon.bytes` + `effectag.bytes` | `parse_effect_icons` / `parse_effect_tags` / `regenerate_soulmarks` | 精灵 id → 专属特性魂印列表（1993 只） |
-| `refs/effecticon/*.png` | DefaultPackage `effecticon_1..5.bundle` | `ensure_effect_icons` | 魂印/效果图标（2114 张，按 icon_id 命名） |
+| `data/effecticon/*.png` | DefaultPackage `effecticon_1..5.bundle` | `ensure_effect_icons` | 魂印/效果图标（2114 张，按 icon_id 命名） |
 
 每份数据都由**同一 ConfigPackage bundle**（`cache/petbook/<fh>.bundle`，含 `petbook.bytes`/`monsters.bytes`/`skilltypes.bytes`/`moves.bytes`/`skill_effect.bytes`/`effecticon.bytes`/`effectag.bytes`）解析，随游戏版本自动刷新；状态文件：`.petbook_state.json` / `.pet_attr_state.json` / `.skills_state.json` / `.soulmarks_state.json`（均已加入 `.gitignore`）。
 
@@ -87,6 +87,12 @@ spd support transform type vip is_fly is_ride
 - 脚本：`crack_seed_v3.py`（弱 oracle 收集候选 → 全部 C2S 复验）。注意：单用 `ver+uid` 会因密钥其余字节自由而产生“对齐巧合”伪命中（如 `eaeeff7cd2` 只命中 645/754 且 cmd 乱码），必须用全部 C2S 复验排除。
 - 结论与遗留：**C2S 方向已完全破解**；S2C（服务器→客户端）帧在该抓包中并非干净的 `[4B总长][cipher]`（即使按 seq 拼接再切帧，用该密钥也解不出 `ver=0x31`），疑似大帧跨 TCP 段/不同帧结构，方向性密钥差异，留作后续。
 
+**封包头 ver 字节 = 包类型/方向标记（本轮对战流抓包确认，并非版本号）**：
+- `0x31` = 客户端→服务器（C2S，请求/指令）。
+- `0x01` = 服务器→客户端**主动推送**（NOTE），如 `NOTE_READY_TO_FIGHT`/`NOTE_START_FIGHT`/`PET_BOOK_UPDATE`/`LOAD_PERCENT`。
+- `0x3E` = 服务器→客户端，**对客户端某条请求的直接应答**，如 `MIBAO_FIGHT`/`NEW_TEAM_REFRESH_INFO`/`READY_TO_FIGHT`/`USE_SKILL`/`GET_PET_INFO`。
+- 实现：`seer/client.py::_ver_kind()` 据此返回 `request/note/response/unknown`；`recv_game_packet()` 返回值带 `kind` 字段；`recv_until()` 用 `kind != 'note'` 判定"真正应答"，避免把服务器 NOTE 推送误当成交答。
+
 ---
 
 ## 4. WebUI 功能（`webui.py`，http://127.0.0.1:8680）
@@ -115,6 +121,18 @@ spd support transform type vip is_fly is_ride
 - **右侧**：自上而下为「脚本输出 (实时)」+「② 日志输出」(实时)；「③ 发包测试」则移到**左半脚本列表下方**。登录页仅保留“① 登录操作”。
 - **自动跳转**：登录成功后（状态 `ready`）自动切换到“脚本”页。
 - 后端接口：`GET /api/scripts`（列目录+是否运行中）、`POST /api/scripts/run`（{name}，含路径穿越校验）、`POST /api/scripts/stop`。
+
+### 对战页（第四个页签“对战”）
+- **图形化对战**：轮询 `/api/battle`，图形化显示**我方/敌方**当前出战精灵的头像（`data/head/<id>.png`）、血条(`hp/maxHP`)、等级、以及各自**出场队伍**（2503）的精灵缩略图。
+- **技能/操作按钮**：下方一排技能按钮（来自我方当前出战精灵的 `skills`），点击即发 **2405 USE_SKILL**；另有 换宠(2407)/用药(2406)/逃跑(2410)/捕捉(2409) 操作按钮。
+- **实时更新**：后台 `on_frame` 解析 **2503 NOTE_READY_TO_FIGHT**（`NoteReadyToFightInfo`，双方队伍+血量+技能）与 **2504 NOTE_START_FIGHT**（`FightStartInfo`，开场当前出战精灵画像）填充 `_BATTLE`，前端每 800ms 轮询刷新。
+- **发起对战**：输入**带 cmdid 的完整 HEX 包**（支持任意对战命令号，如 41129 之外的命令），`/api/battle/hex` 从包头提取命令号+包体，按当前账号重建 uid/序列号并加密封包发送。
+- 解析器：`seer/fightinfo.py`（`parse_note_ready_to_fight`/`parse_fight_start_info`/`parse_change_pet_info`/`parse_fight_sign` 等）。**2504 `FightPetInfo` 已完整解析**（含 `FightSignInfo`=8B：`id(16b)|lvNum(8b)|roundNum(8b)` + `spValue`(u32)，以及 `lockedSkillArr`），因此 2504 能解出**双方**当前出战精灵。
+- **逐回合刷新**：后台 `on_frame` 处理——**2505 NOTE_USE_SKILL**（实测确认前导 `[userID][skillID][round][actorCatchTime]`，血量记录为 `[catchTime][type][1][val][0][0][hp][maxHp]` 的 32B 记录，`hp=0` 表示阵亡）会**按 catchTime 逐回合刷新**双方当前精灵与双方队伍的 HP（`extract_pet_hp_updates` 兼容相邻三段式/32B 两种布局 / `_apply_hp_updates`）；**2407 CHANGE_PET** 按 `ChangePetInfo` 更新对应一方；2406 用道具、2409 捕捉会解析并写日志。2505 中间的伤害/经验等字段布局仍待 `com.robot.app.fight.FightManager` 类，未解。
+- **双方技能识别（敌我）**：一个 **2505 = 一整回合**，内含**多条**同构的**16 字节技能记录** `[userID][skillID][count(回合数)][actorCatchTime]`。**我方**技能在包体**前导**(offset 0)；**敌方**技能是**内嵌在包体深处、byte 级偏移(不按 4 对齐)** 的**同级子块**——可通过逐字节扫描 `extract_skill_use_records()` 把**双方本回合各自使用的技能**全部解析出来（依赖后续变长字段长度，故敌方子块位置每次不同：实测 412/448/573B 等）。实测敌方(`uid=0`)技能：**10995 旋灭裂空阵(圣灵·135)**、**20500 圣光气(普通·0·必中，属性/回复类)**；我方技能 `37381 星光·浪打千击(水·30·必中)` 在包体最前。敌方技能在斩杀回合(敌方阵亡)往往**不再出现**。
+- **战报记录**：`_BATTLE.report` 按时间记录整场对战——`对战开始(mode/双方队伍)`→`开场双方当前`→逐回合 `回合 用户X 使用技能 **技能名[技能id]** + HP变化`、`换宠`、`用道具`、`捕捉`→`对战结束`；`/api/battle` 返回 `report`，对战页底部「战报记录」整栏**从上到下(时间正序)** 实时展示（新增在底部，仅当用户停在底部时才跟随滚动；可清空/复制）。**点击技能等操作会先通过 `/api/battle/action` 记入 `> 点击发送…`**。**每场结束(2506)会把本场所有完整(解密后)包体写入 `webui_logs/battle_<时间>.log`**，供研究分析；历史包体另持续追加到 `webui_logs/battle_capture.log`。
+- **对战结束结果**：**2506 FIGHT_OVER 结果包**（FightOverInfo）经 `parse_fight_over()` 解析——包体(`57B`)几乎全 0，有效字段仅 **offset 5 的 u32=我方账号 id** 与**末字节=本场回合数**（***不含胜负标志***）。因此战绩由**本场最后一次 2505 的 HP 更新判定**：`敌方HP==0 且我>0 → 我方胜利`；`我方HP==0 且敌>0 → 我方战败`；双双归零 → `同归于尽`；否则 `胜负未判定`（如未开打就结束的取消场）。战报输出 `对战结束 —— 结果: …` + 最终双方血量 + 结束包账号/回合数。
+- 注：`refs/BattleFightManager.as` 是 **BattleRoyale（雪球大战/大逃杀）** 管理器（`BATTLEROYALE_*`/`RoyaleUserInfo`/道具伤害），`refs/FightManager.as` 是**发起对战**（fightWithPlayer/Npc/Boss、MIBAO_FIGHT、邀请）；两者均**不解析**精灵对战 2505 回合包，2505 的完整结构仍需 **`com.robot.app.fight.FightManager`**，其派发的**回合/结算类在 `com.robot.core.info.fightInfo.attack.*`**（如 `attack.FightOverInfo`，见 `FightManager.as` import）。**PetFightDLL** 是 `FightManager._petFightClass` 指向的**动态战斗引擎类**：`FightManager.setup()` 里写死 `_petFightClass = "PetFightDLL_201308"`（另有 `"PetFightDLL"` 一版，靠缓冲记录 939 切换，但当前固定 201308）；它由 `getDefinitionByName` 按**完全限定类名**实例化，`petFightClass` getter 只返回**短名**，其完整包路径为 `com.robot.app.fight.PetFightDLL_201308` / `com.robot.app.fight.PetFightDLL`（与 `com.robot.app.fight.FightManager` 同包）。**真正逐字段解 2505 回合结果的读者类就在这个 PetFightDLL 里**，本仓库未收录其源码。
 
 ---
 
@@ -161,28 +179,46 @@ print(pkt.ints, pkt.body, v)
 
 ```
 seer-login-test/
-├── assets_updater.py      # 自更新数据管线: 下载+解析 petbook/monsters/skilltypes/moves/skill_effect/effecticon/effectag
-├── webui.py               # 协议调试台 WebUI (http://127.0.0.1:8680): 精灵详情/专属特性/技能/拖拽换位
-├── seerlib.py             # 脚本第三方库: Seer.send/recv/get_value
-├── cmdmap.json            # 命令 id -> 命令名
-├── petbook.json           # 精灵 id -> 名字 (自更新)
-├── pet_attr.json          # 精灵物种 id -> 属性中文名 (自更新)
-├── skills.json            # 技能 id -> 技能数据 (自更新)
-├── soulmarks.json         # 精灵 id -> 专属特性魂印列表 (自更新)
-├── seer/
-│   ├── body.py            # pack_body / decode_body / parse_parts
-│   ├── petinfo.py         # PetInfo 各段解析 (依据 refs/*.as)
-│   └── ...                # client/session/tcp_client/ws_client/packet/algorithm/misc
-├── refs/
-│   ├── effecticon/        # 魂印/效果图标(2114 张, 按 icon_id 命名)
-│   ├── *.as               # 反编译的 PetInfo/PetSkillInfo/PetEffectInfo/PetResistanceInfo.as
-│   ├── head/              # 精灵头像(<物种id>.png)
-│   ├── monsters.json      # 他人解析好的 monsters.bytes (早期静态参照, 已被自解析取代)
-│   └── monsters.txt       # 早版本偏移表(记录在 monsters.bytes 的名字字节范围, 仅版本匹配的前~70条有用)
-├── cache/
-│   ├── petbook/<fh>.bundle # ConfigPackage 包(含全部 .bytes)
-│   └── effecticon/         # 下载的 effecticon_*.bundle
-└── .petbook_state.json 等  # 数据版本状态(运行时产物, 已 gitignore)
+├── app/                      # 程序文件 (运行必需, git track)
+│   ├── webui.py              # 协议调试台 WebUI (http://127.0.0.1:8680): 精灵详情/专属特性/技能/拖拽换位
+│   ├── seerlib.py            # 脚本第三方库: Seer.send/recv/get_value
+│   ├── assets_updater.py     # 自更新数据管线: 下载+解析 petbook/monsters/skilltypes/moves/skill_effect/effecticon/effectag
+│   ├── login_test.py         # 登录协议自检/测试入口
+│   ├── mock_server.py        # 模拟网关 (不联网自检用)
+│   ├── cmdmap.json           # 命令 id -> 命令名
+│   ├── requirements.txt
+│   ├── seer/                 # 协议客户端包
+│   │   ├── body.py           # pack_body / decode_body / parse_parts
+│   │   ├── petinfo.py        # PetInfo 各段解析 (依据 refs/*.as)
+│   │   └── ...               # client/session/tcp_client/ws_client/packet/algorithm/misc/fightinfo
+│   └── scripts/              # "脚本"页默认脚本存放目录 (用户把 .py 放进来即可在页面运行)
+├── data/                     # 运行时下载/生成的资源 (gitignore)
+│   ├── head/                 # 精灵头像(<物种id>.png)
+│   ├── effecticon/           # 魂印/效果图标(按 icon_id 命名)
+│   ├── petbook.json          # 精灵 id -> 名字 (自更新)
+│   ├── pet_attr.json         # 精灵物种 id -> 属性中文名 (自更新)
+│   ├── skills.json           # 技能 id -> 技能数据 (自更新)
+│   ├── soulmarks.json        # 精灵 id -> 专属特性魂印列表 (自更新)
+│   └── webui_*.json          # 运行时凭据/过滤/后端地址 (gitignore)
+├── refs/                     # 逆向参考资料 (gitignore)
+│   ├── *.as                  # 反编译的 PetInfo/PetSkillInfo/PetEffectInfo/PetResistanceInfo/FightInfo 等
+│   ├── captured              # 6v1 战斗抓包 (2505 NOTE_USE_SKILL 解基准)
+│   ├── gamedump4.txt         # 游戏本体抓包
+│   ├── monsters.json/.txt    # 早期静态参照 (已被自解析取代)
+│   ├── seerNew/ seerpacket/ Petbag/  # 他人逆向实现/反编译参考
+│   └── seerpacket/cmdmap.json # Command.cs 解析的命令表 (cmdmap.json 的来源)
+├── analysis/                 # 分析工具与产物 (gitignore)
+│   ├── analyze_gamedump.py   # 抓包离线分析器
+│   ├── extract_pet_heads.py  # 从 bundle 解精灵头像入口
+│   ├── crack_seed*.py        # 离线反推 gamedump4 会话密钥
+│   └── gamedump4_*.txt/csv、postlogin_*.txt、cracked_session.txt 等产物
+├── cache/                    # 下载缓存 (get-pip.py / 各 .bundle, gitignore)
+├── vendor/                   # 本地 pip 用具 (UnityPy/pip_tool, gitignore)
+├── webui_logs/               # 运行日志 (gitignore)
+├── docs/                     # 文档
+│   ├── DEVELOPMENT.md        # 开发成果整理 (本文)
+│   └── REPRODUCTION.md       # 给 AI/复现者 的技术复现要点
+└── README.md                 # 项目介绍/快速上手
 ```
 
 ---
@@ -199,16 +235,20 @@ seer-login-test/
 ## 8. 常用启动/验证
 
 ```bash
-# 启动 WebUI(后台, 已登录后生效)
-PYTHONPATH=vendor/unitypy nohup python3 -u webui.py --port 8680 >/tmp/webui8680.log 2>&1 &
+# 启动 WebUI(后台, 已登录后生效); 在项目根目录运行
+PYTHONPATH=vendor/unitypy nohup python3 -u app/webui.py --port 8680 >/tmp/webui8680.log 2>&1 &
 # 浏览器打开 http://127.0.0.1:8680/
 
 # 手动触发数据更新(下载+解析全部)
-PYTHONPATH=vendor/unitypy python3 assets_updater.py --force
+PYTHONPATH=vendor/unitypy python3 app/assets_updater.py --force
 
 # 脚本库自检(需后端已登录; 会刷背包并打印 43706 包体)
-PYTHONPATH=vendor/unitypy python3 -m seerlib
+PYTHONPATH=vendor/unitypy python3 -m app.seerlib
 ```
+
+> 说明：`app/` 里 `webui.py`/`seerlib.py`/`assets_updater.py` 都通过 `os.path.dirname(__file__)`
+> 推导出 `app/` 目录，再取上一级为项目根、`data/` 为运行时数据目录；因此**从项目根或 `app/` 目录运行均可**，
+> 只要 `PYTHONPATH` 含 `vendor/unitypy`。
 
 ---
 

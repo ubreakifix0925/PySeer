@@ -10,7 +10,8 @@
 > 其中“中间人攻击窃取登录凭证”的部分**不在此实现范围内**。
 
 > 📘 **相关文档**：自更新游戏数据管线、精灵详情界面功能、协议逆向结论、脚本库 `seerlib.py`
-> 等成果详见 [DEVELOPMENT.md](./DEVELOPMENT.md)。
+> 等成果详见 [docs/DEVELOPMENT.md](./docs/DEVELOPMENT.md)；给 AI / 二次开发者的**协议技术复现**
+> 速查见 [docs/REPRODUCTION.md](./docs/REPRODUCTION.md)。
 
 ---
 
@@ -63,17 +64,31 @@ WebSocket 连接 ──► 发送登录封包 (cmd 0x3E9 = 1001)
 
 ```
 seer-login-test/
-├── login_test.py          # 入口：分步骤 PASS/FAIL 的运行器
-├── seer/                  # 可复用的协议包
-│   ├── algorithm.py       # MD5 / Encrypt / Decrypt / MSerial
-│   ├── misc.py            # hex / bytes / int 协议格式转换
-│   ├── packet.py          # PacketData 构建/解析 + 包体加解密
-│   ├── session.py         # 淘米认证 (account-co.61.com) -> session
-│   ├── ws_client.py       # 标准库最小 WebSocket 客户端 (socket/ssl)
-│   └── client.py          # SeerClient：连接/登录/心跳流程
-├── requirements.txt       # 说明：无第三方依赖
-└── refs/                  # 下载的参考帖文与源码
+├── app/                     # 程序文件 (运行必需)
+│   ├── login_test.py        # 入口：分步骤 PASS/FAIL 的运行器
+│   ├── webui.py             # 协议调试 WebUI (http://127.0.0.1:8680)
+│   ├── seerlib.py           # 脚本第三方库 (Seer.send/recv/get_value)
+│   ├── assets_updater.py    # 自更新游戏数据管线
+│   ├── seer/                # 可复用的协议包
+│   │   ├── algorithm.py     # MD5 / Encrypt / Decrypt / MSerial
+│   │   ├── misc.py          # hex / bytes / int 协议格式转换
+│   │   ├── packet.py        # PacketData 构建/解析 + 包体加解密
+│   │   ├── session.py       # 淘米认证 (account-co.61.com) -> session
+│   │   ├── ws_client.py     # 标准库最小 WebSocket 客户端 (socket/ssl)
+│   │   └── client.py        # SeerClient：连接/登录/心跳流程
+│   ├── cmdmap.json          # 命令 id -> 命令名
+│   └── requirements.txt     # 说明：无第三方依赖
+├── data/                    # 运行时下载/生成的资源 (git 忽略)
+├── refs/                    # 下载的反编译源码/参考帖文 (git 忽略)
+├── analysis/                # 抓包分析工具与产物 (git 忽略)
+├── docs/                    # 文档 (DEVELOPMENT / REPRODUCTION)
+└── cache/ vendor/ webui_logs/  # 运行时缓存/用具/日志 (git 忽略)
 ```
+
+> 目录分类：**程序文件**在 `app/`（git 跟踪）；**运行时下载/生成的资源**在 `data/`；
+> **逆向参考资料**在 `refs/`；**分析工具与产物**在 `analysis/`；**文档**在 `docs/`。
+> `data/`、`refs/`、`analysis/`、`cache/`、`vendor/`、`webui_logs/` 均被 `.gitignore` 忽略，
+> 仓库只跟踪 `app/` 源码、`README.md`、`docs/` 与 `.gitignore`。
 
 ---
 
@@ -88,7 +103,7 @@ seer-login-test/
 验证算法、封包、加解密、JSONP 解析是否正确：
 
 ```bash
-python3 login_test.py --self-test
+python3 app/login_test.py --self-test
 ```
 
 ### 2) 干运行（不联网）
@@ -96,7 +111,7 @@ python3 login_test.py --self-test
 验证登录封包能否正常构建（不访问服务器）：
 
 ```bash
-python3 login_test.py --account 1234567890 --password 你的密码 --dry-run
+python3 app/login_test.py --account 1234567890 --password 你的密码 --dry-run
 ```
 
 ### 3) 真实登录测试
@@ -109,27 +124,27 @@ python3 login_test.py --account 1234567890 --password 你的密码 --dry-run
 ```bash
 export SEER_ACCOUNT=你的米米号
 export SEER_PASSWORD='p@ss!w.rd'   # 用单引号包裹, 防止 ! 被历史展开
-python3 login_test.py
+python3 app/login_test.py
 ```
 
 **方式二：密码文件**
 
 ```bash
 printf 'p@ss!w.rd\n' > pass.txt   # 首行为密码, 自动去除换行
-python3 login_test.py --account 你的米米号 --password-file pass.txt
+python3 app/login_test.py --account 你的米米号 --password-file pass.txt
 ```
 
 **方式三：交互输入（密码不回显）**
 
 ```bash
-python3 login_test.py --account 你的米米号
+python3 app/login_test.py --account 你的米米号
 # 之后按提示输入密码, 输入时不显示
 ```
 
 **方式四：直接传参（仅当密码不含特殊字符时）**
 
 ```bash
-python3 login_test.py --account 你的米米号 --password '你的密码'
+python3 app/login_test.py --account 你的米米号 --password '你的密码'
 ```
 
 输出示例（分步骤）：
@@ -153,10 +168,10 @@ python3 login_test.py --account 你的米米号 --password '你的密码'
 如果你希望脚本**登录后不退出、持续心跳，让账号处于被脚本占用的在线状态**，加 `--hold`：
 
 ```bash
-python3 login_test.py --hold                  # 一直保持, 直到 Ctrl+C
-python3 login_test.py --hold --hold-seconds 60   # 保持 60 秒后自动退出
-python3 login_test.py --hold --hold-interval 5   # 心跳间隔 5 秒 (默认)
-python3 login_test.py --hold --verbose           # 打印每次收到的封包
+python3 app/login_test.py --hold                  # 一直保持, 直到 Ctrl+C
+python3 app/login_test.py --hold --hold-seconds 60   # 保持 60 秒后自动退出
+python3 app/login_test.py --hold --hold-interval 5   # 心跳间隔 5 秒 (默认)
+python3 app/login_test.py --hold --verbose           # 打印每次收到的封包
 ```
 
 `--hold` 模式下脚本会保持 WebSocket 连接，定期发心跳（cmd 0x3EA），并自动应答服务器的时间同步请求，
@@ -174,10 +189,10 @@ python3 login_test.py --hold --verbose           # 打印每次收到的封包
 body = `session(16B)` + `"unknown"` + 填充 + `[1,1,1]` + `"flash_taomee"` + 填充。
 
 ```bash
-python3 login_test.py --game-login            # 用默认服务器 101.43.19.60:1201
-python3 login_test.py --game-login --game-host 101.43.19.60 --game-port 1201
-python3 login_test.py --game-login --verbose  # 打印每个解密封包
-python3 login_test.py --game-login --game-seconds 15   # 读角色数据最多 15 秒
+python3 app/login_test.py --game-login            # 用默认服务器 101.43.19.60:1201
+python3 app/login_test.py --game-login --game-host 101.43.19.60 --game-port 1201
+python3 app/login_test.py --game-login --verbose  # 打印每个解密封包
+python3 app/login_test.py --game-login --game-seconds 15   # 读角色数据最多 15 秒
 ```
 
 它会：获取淘米 session → 连接游戏服务器 → 发送加密登录 `1001` → 收到并解密服务器的
@@ -216,11 +231,11 @@ key  = md5(str(xor)).hexdigest()[:10]     # 取 hex 前10位
 一个**纯标准库**（`http.server` + SSE）的调试界面，方便人工调试登录与封包：
 
 ```
-python3 webui.py --host 127.0.0.1 --port 8680
+python3 app/webui.py --host 127.0.0.1 --port 8680
 # 浏览器打开 http://127.0.0.1:8680/
 ```
 > 默认端口 `8680`;若被占用,`--port 0` 会自动选一个空闲端口(打印实际端口),或
-> `python3 webui.py --port <新端口>` 手动换。
+> `python3 app/webui.py --port <新端口>` 手动换。
 
 界面三个功能区：
 
@@ -267,7 +282,7 @@ HTTP 接口：
 本工具可以把你登录后**收到/发出的每个封包**完整记录到文件，方便排查缺口：
 
 ```bash
-python3 login_test.py --hold --log-file packets.txt --verbose
+python3 app/login_test.py --hold --log-file packets.txt --verbose
 ```
 
 `packets.txt` 会记录每一帧的 `时间 方向 cmd 包体 完整hex`，例如：

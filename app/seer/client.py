@@ -50,6 +50,29 @@ DEFAULT_GAME_SERVER = ("101.43.19.60", 1201)
 # 通信密钥: 命令号>=1000 的封包用 seer 算法加密; 登录(1001)之后会切换为会话密钥
 DEFAULT_KEY = "!crAckmE4nOthIng:-)"
 
+# ---- 封包头 ver 字节 = 包类型/方向标记 (实测对战抓包得出, 并非版本号) ----
+# 客户端->服务器 一律 0x31; 服务器->客户端 分两类: 0x01 = NOTE/主动推送, 0x3E = 对客户端请求的直接应答.
+VER_CLIENT_REQ  = 0x31   # 客户端请求 (SEND)
+VER_SERVER_NOTE = 0x01   # 服务器主动推送 (NOTE, 如 NOTE_READY_TO_FIGHT / PET_BOOK_UPDATE / LOAD_PERCENT)
+VER_SERVER_RESP = 0x3E   # 服务器对客户端某条请求的直接应答 (如 MIBAO_FIGHT / USE_SKILL / READY_TO_FIGHT)
+
+
+def _ver_kind(ver: int) -> str:
+    """按 ver 字节判定包类型: 'request' | 'note' | 'response' | 'unknown'.
+
+    request  = 客户端发给服务器的请求(收包函数一般不会收到);
+    note     = 服务器主动推送的 NOTE (ver=0x01);
+    response = 服务器对客户端某条请求的直接应答 (ver=0x3E);
+    unknown  = 其它/未识别.
+    """
+    if ver == VER_CLIENT_REQ:
+        return "request"
+    if ver == VER_SERVER_NOTE:
+        return "note"
+    if ver == VER_SERVER_RESP:
+        return "response"
+    return "unknown"
+
 
 class LoginError(Exception):
     pass
@@ -279,12 +302,15 @@ class SeerClient:
         return out
 
     def recv_until(self, target_cmd, max_packets=64, timeout=6):
-        """读取封包, 直到读到 cmd==target_cmd 的应答 (或达到 max_packets / 超时).
+        """读取封包, 直到读到 cmd==target_cmd 的**真正应答** (或达到 max_packets / 超时).
 
-        登录后服务器会先推送一批 S2C 封包 (如 ENTER_MAP/GET_PET_INFO/数值刷新等),
-        然后再回复你本次下发的命令。普通 recv_packets(count=3) 读到的往往只是那批
-        推包, 而真正回应在它们之后。此函数把整批推包一路读完, 直到看到与 target_cmd
-        对应的应答; 期间若收到时间同步(0x3EA)会顺手回 time_check 以维持连接。
+        登录后服务器会先推送一批 S2C NOTE 封包 (ver=0x01, 如 ENTER_MAP/GET_PET_INFO/
+        NOTE_READY_TO_FIGHT/数值刷新等), 然后再回复你本次下发的命令。普通 recv_packets
+        读到的往往只是那批推送, 而真正回应在它们之后。本函数利用 ver 字节区分:
+        - ``kind=='note'``(0x01) 的包视为服务器**主动推送**, 即使 cmd==target_cmd 也不停下;
+        - 只有看到 ``kind!='note'`` 且 cmd==target_cmd 的包 (即 0x3E 应答 / 其它) 才判定为
+          本次命令的应答并停止。
+        期间若收到时间同步(0x3EA)会顺手回 time_check 以维持连接。
 
         返回读到的全部封包列表 (含 target_cmd 的应答, 若找到).
         """
@@ -308,14 +334,18 @@ class SeerClient:
                         self.send_time_check(bytes(r["body"]).hex())
                     except Exception:
                         pass
-                if r["cmd"] == target_cmd:            # 找到本次命令的应答
+                if r["cmd"] == target_cmd and r.get("kind") != "note":   # 真正应答才停
                     break
         except Exception:
             pass
         return out
 
     def recv_game_packet(self, timeout=None):
-        """读取服务器一条加密封包, 解密并解析为 PacketData."""
+        """读取服务器一条加密封包, 解密并解析为 PacketData.
+
+        ver 字节按 _ver_kind 判定包类型 (note=主动推送 / response=对请求的应答),
+        并入返回值 ``kind`` 字段; 客户端(登录等)可用它决定"哪些是真正的应答".
+        """
         wire = self.tcp.read_packet(timeout)
         self._apply_key(self.session_key or DEFAULT_KEY)   # 登录(1001)后会自动切换为会话密钥
         dec = decrypt(wire)                      # [4B plainLen][ver][cmd][uid][res][body]
@@ -327,12 +357,14 @@ class SeerClient:
         uid = int.from_bytes(plain[5:9], "big")
         res = int.from_bytes(plain[9:13], "big")
         body = plain[13:]
+        kind = _ver_kind(ver)                    # 由 ver 字节判定类型
         self.received_cmds.append(cmd)
         self._emit_frame("RECV", wire.hex(), cmd, body.hex())
         if cmd == CMD_LOGIN:
             self.is_logged_in = True
             self.last_result = res & 0xFFFFFFFF
-        return {"ver": ver, "cmd": cmd, "uid": uid, "result": res, "body": body}
+        return {"ver": ver, "cmd": cmd, "uid": uid, "result": res, "body": body,
+                "kind": kind}
 
     def login_game(self, host=None, port=None, max_seconds=10, on_packet=None,
                    verbose=False):

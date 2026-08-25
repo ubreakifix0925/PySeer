@@ -7,7 +7,7 @@
     3. 发包测试      --登录成功后, 手动构造命令号+包体并通过当前连接发送, 读取服务器响应
 
 用法:
-    python3 webui.py [--host 127.0.0.1] [--port 8680]
+    python3 app/webui.py [--host 127.0.0.1] [--port 8680]
     浏览器打开 http://127.0.0.1:8680/
 """
 
@@ -24,6 +24,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from seer.body import decode_body, pack_body, parse_parts
 from seer.client import DEFAULT_GAME_SERVER, LoginError, SeerClient
+from seer.fightinfo import parse_catch_pet, parse_change_pet_info, parse_fight_over, parse_fight_start_info, parse_note_ready_to_fight, parse_note_use_skill, parse_use_pet_item
 from seer.petinfo import format_pet, load_pet_names, merge_pet_names, parse_front, parse_full, resolve_name, set_pet_names, split_petbag_43706
 
 # ---- 全局状态 ----
@@ -43,16 +44,20 @@ _RECV_SEQ = {}               # {cmd: 该 cmd 的 RECV 序号} 供判断"新响�
 _LOCK_RECV = threading.Lock()  # 保护 _RECV_LATEST/_RECV_SEQ
 
 _LOG_MAX = 5000
-_LOG_DIR = "webui_logs"
-_CRED_FILE = "webui_credentials.json"
-_FILTER_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "webui_filter.json")
-_CMDMAP_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cmdmap.json")
+# 源码目录 (本项目程序文件所在 app/) 与项目根目录 (其上一级)
+_SRC_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJ = os.path.dirname(_SRC_DIR)
+_DATA_DIR = os.path.join(_PROJ, "data")
+_LOG_DIR = os.path.join(_PROJ, "webui_logs")
+_CRED_FILE = os.path.join(_DATA_DIR, "webui_credentials.json")
+_FILTER_FILE = os.path.join(_DATA_DIR, "webui_filter.json")
+_CMDMAP_FILE = os.path.join(_SRC_DIR, "cmdmap.json")
 # 后端实际监听地址写到这里, 供 seerlib 脚本运行时自动定位 (见 seerlib.discover_backend)
-_ADDR_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "webui_addr.json")
-_HEAD_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "refs", "head")  # 精灵头像(按物种id)目录
-_EFFECT_ICON_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "refs", "effecticon")  # 魂印/效果图标目录
+_ADDR_FILE = os.path.join(_DATA_DIR, "webui_addr.json")
+_HEAD_DIR = os.path.join(_DATA_DIR, "head")  # 精灵头像(按物种id)目录
+_EFFECT_ICON_DIR = os.path.join(_DATA_DIR, "effecticon")  # 魂印/效果图标目录
 # "脚本"页左侧默认脚本存放路径: 用户把 .py 脚本放进该目录即可在页面选择运行
-SCRIPTS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "scripts")
+SCRIPTS_DIR = os.path.join(_SRC_DIR, "scripts")
 
 # 当前正在运行的用户脚本子进程 (供"脚本"页启动/停止)
 _SCRIPT_PROC = None
@@ -110,6 +115,36 @@ _EXE = {"pets": [], "fetched": False, "version": 0}
 
 # 单只精灵(2301 GET_PET_INFO) 缓存: catchTime -> PetInfo dict (供仓库养成信息展示)
 _PET_INFO = {}
+
+# 对战状态 (由 2503 NOTE_READY_TO_FIGHT / 2504 NOTE_START_FIGHT 解析填充, 供"对战"页展示)
+_BATTLE = {
+    "active": False,          # 是否进入对战 (收到 2503 置 True)
+    "mode": 0,                # 对战模式 (2503)
+    "my": None,               # 我方当前出战精灵 ({id,petID,nick,...}) (2504)
+    "other": None,            # 敌方当前出战精灵 (2504)
+    "myTeam": [],             # 我方出战队伍 ({id,catchTime,hp,skills,...}) (2503)
+    "otherTeam": [],          # 敌方出战队伍 (2503)
+    "mySkills": [],           # 我方当前可使用的技能 id 列表
+    "myId": None,             # 我方账号(米米号), 用于区分 my/other
+    "lastCmd": None,          # 最近触及更新的命令 (2503/2504)
+    "lastSkill": None,        # 最近一次回合技能 (2505 前导: {userID,skillID,count,actorCatchTime})
+    "report": [],             # 战报记录 (chronological [{t,msg}])
+    "_ready_sent_mode": None, # 已自动发送过 2404 的对战模式 (防重复)
+    "version": 0,
+}
+
+# 本场对战收到的完整(解密后)包体暂存: [(t, direction, cmd, body_hex)], 每场结束写入日志文件
+_BATTLE_PKTS = []
+
+# 技能名查询 (skills.json): id -> 中文名
+def _skill_name(sid):
+    try:
+        d = _SKILLS.get(str(sid))
+        if d and d.get("name"):
+            return d["name"]
+    except Exception:
+        pass
+    return str(sid)
 
 
 def _parse_love_2361(data):
@@ -182,7 +217,7 @@ def _parse_teams_41921(data):
 
 
 def _pet_bag_view(p):
-    """为背包里的精灵补充头像 URL (refs/head/<物种id>.png 存在时) 与名字."""
+    """为背包里的精灵补充头像 URL (data/head/<物种id>.png 存在时) 与名字."""
     out = dict(p)
     pid = out.get("id")
     fname = "%s.png" % pid if isinstance(pid, int) and pid > 0 else None
@@ -209,6 +244,278 @@ def _storage_view(p):
     return out
 
 
+def _battle_view(p):
+    """给对战精灵补充头像 URL 与名字 (按物种id), 供"对战"页显示."""
+    out = dict(p)
+    pid = out.get("id") or out.get("petID")
+    fname = "%s.png" % pid if isinstance(pid, int) and pid > 0 else None
+    out["avatar"] = ("/head/%s" % fname) if (fname and os.path.isfile(os.path.join(_HEAD_DIR, fname))) else None
+    out["name"] = out.get("petName") or out.get("nick") or resolve_name(out)
+    return out
+
+
+def _ptag(p):
+    """战报用精灵描述串: id / Lv / HP."""
+    if not p:
+        return "—"
+    return (f"id={p.get('petID') or p.get('id')} Lv{p.get('lv') or p.get('level') or '?'} "
+            f"HP {p.get('hp') or p.get('xinHp') or '?'}/{p.get('maxHP') or p.get('maxHp') or p.get('xinMaxHp') or '?'}")
+
+
+def _update_battle(cmd, hex_body, me_id):
+    """解析对战包(2503/2504)并更新 _BATTLE 状态; me_id=当前账号米米号, 用于区分我方/敌方."""
+    global _BATTLE
+    try:
+        me_id = int(me_id)          # 统一为 int, 便于与包内 id 比较
+        data = bytes.fromhex(hex_body) if isinstance(hex_body, str) else bytes(hex_body)
+        if cmd == 2503:
+            r = parse_note_ready_to_fight(data)
+            # 2503 的两个 user 按 id 匹配 me_id 决定 my/other; 找不到则 A 为我方
+            a, b = r.get("userA"), r.get("userB")
+            my_u = (a if a["id"] == me_id else b) if a and b else a
+            ot_u = (b if a["id"] == me_id else a) if a and b else b
+            with _LOCK:
+                _BATTLE["mode"] = r.get("mode")
+                _BATTLE["active"] = True
+                _BATTLE["myId"] = me_id
+                _BATTLE["myTeam"] = [_battle_view(p) for p in (my_u or {}).get("pets", [])]
+                _BATTLE["otherTeam"] = [_battle_view(p) for p in (ot_u or {}).get("pets", [])]
+                _BATTLE["mySkills"] = _active_skills(_BATTLE)
+                # my/other 先取各自队伍第一只(出战首发); 后续 2504 会按需覆盖为真正当前精灵
+                _BATTLE["my"] = _battle_view(_BATTLE["myTeam"][0]) if _BATTLE["myTeam"] else None
+                _BATTLE["other"] = _battle_view(_BATTLE["otherTeam"][0]) if _BATTLE["otherTeam"] else None
+                _BATTLE["lastCmd"] = 2503
+                _BATTLE["version"] += 1
+            _report(f"对战开始 mode={r.get('mode')} | 我方{len(_BATTLE['myTeam'])}只 敌方{len(_BATTLE['otherTeam'])}只", clear=True)
+            _report(f"  我方队伍: " + "、".join(f"id={p['id']}(HP {p.get('hp')})" for p in _BATTLE['myTeam']))
+            _report(f"  敌方队伍: " + "、".join(f"id={p['id']}(HP {p.get('hp')})" for p in _BATTLE['otherTeam']))
+            log("ok", f"对战(2503): mode={r.get('mode')} 我方{len(_BATTLE['myTeam'])}只 敌方{len(_BATTLE['otherTeam'])}只")
+        elif cmd == 2504:
+            r = parse_fight_start_info(data)
+            a, b = r.get("fightPetA"), r.get("fightPetB")
+            # 两个 FightPetInfo 顺序不定, 按 userID==me_id 区分我方/敌方
+            if a and a.get("userID") == me_id:
+                my_f, ot_f = a, b
+            elif b and b.get("userID") == me_id:
+                my_f, ot_f = b, a
+            else:
+                my_f, ot_f = a, b
+            with _LOCK:
+                _BATTLE["active"] = True
+                _BATTLE["myId"] = me_id
+                _BATTLE["my"] = _battle_view(my_f) if my_f else None
+                _BATTLE["other"] = _battle_view(ot_f) if ot_f else None
+                _BATTLE["mySkills"] = _active_skills(_BATTLE)
+                _BATTLE["lastCmd"] = 2504
+                _BATTLE["version"] += 1
+            _report(f"开场 我方当前 {_ptag(my_f)} | 敌方当前 {_ptag(ot_f)}")
+            log("ok", "对战(2504): 双方当前出战精灵已更新")
+        elif cmd == 2407:
+            # 换宠: 2407 CHANGE_PET 应答带当前精灵状态(ChangePetInfo), 更新对应一方血量/等级.
+            try:
+                ch, _ = parse_change_pet_info(data)
+                uid = ch.get("userID")
+                with _LOCK:
+                    _BATTLE["active"] = True
+                    _BATTLE["myId"] = me_id
+                    if uid == me_id:
+                        _BATTLE["my"] = _battle_view(ch)
+                    else:
+                        _BATTLE["other"] = _battle_view(ch)
+                    _BATTLE["mySkills"] = _active_skills(_BATTLE)
+                    _BATTLE["lastCmd"] = 2407
+                    _BATTLE["version"] += 1
+                _report(f"换宠 用户{uid}{( ' 我方' if uid == me_id else ' 敌方')} → {_ptag(ch)}")
+                log("ok", f"对战(2407): 换宠 用户{uid} pet={ch.get('petID')} hp={ch.get('hp')}/{ch.get('maxHp')}")
+            except Exception:
+                pass
+        elif cmd == 2505:
+            # NOTE_USE_SKILL: 前导 [userID][skillID][count][actorCatchTime] + 尾部受击精灵
+            # [catchTime][hp][maxHp] 记录 → 逐回合刷新对应一方/我方队伍血量.
+            try:
+                sk = parse_note_use_skill(data)
+                upd = sk.get("hpUpdates") or []
+                with _LOCK:
+                    _BATTLE["lastSkill"] = sk
+                    _BATTLE["lastCmd"] = 2505
+                    _apply_hp_updates(upd)
+                    _BATTLE["version"] += 1
+                # 敌方技能并非 2505 前导, 而是内嵌在包体深处的同级子块; 全量解析出双方本回合动作
+                recs = sk.get("skillRecords") or []
+                seen_r = set()
+                for r in recs:
+                    rid = r.get("userID")
+                    side = "我方" if rid == me_id else ("敌方" if rid == 0 else f"?{rid}")
+                    _report(f"回合 用户{rid}({side}) 使用技能 {_skill_name(r.get('skillID'))}[{r.get('skillID')}] 回合数{r.get('count')}")
+                for u in upd:
+                    _report(f"  HP变化 catch={u.get('catchTime')} → {u.get('hp')}/{u.get('maxHp')}")
+                if not recs:
+                    side = "我方" if sk.get("userID") == me_id else "敌方"
+                    _report(f"回合 用户{sk.get('userID')}({side}) 使用技能 {_skill_name(sk.get('skillID'))}[{sk.get('skillID')}] 目标数{sk.get('count')}")
+                if not upd:
+                    _report(f"  (未解析到HP更新; 包体{len(data)}B, 已存 webui_logs/battle_capture.log, 点『复制』后我读文件解码)")
+                log("info", f"对战(2505 回合): 玩家技能{sk.get('skillID')} 敌方技能"
+                            f"{[r.get('skillID') for r in recs if r.get('userID') == 0]} "
+                            f"更新{len(upd)}只HP")
+            except Exception:
+                pass
+        elif cmd in (2406,):
+            try:
+                it, _ = parse_use_pet_item(data)
+                _report(f"用道具 用户{it.get('userID')} 道具{it.get('itemID')} 改血{it.get('changeHp')}")
+                log("info", f"对战(2406 用道具): 用户{it.get('userID')} 道具{it.get('itemID')} 改血{it.get('changeHp')}")
+            except Exception:
+                pass
+        elif cmd in (2409,):
+            try:
+                cp, _ = parse_catch_pet(data)
+                _report(f"捕捉 catchTime={cp.get('catchTime')} 精灵={cp.get('petID')}")
+                log("info", f"对战(2409 捕捉): 捕获 catchTime={cp.get('catchTime')} 精灵={cp.get('petID')}")
+            except Exception:
+                pass
+        elif cmd == 2506:
+            # FIGHT_OVER: 对战结束 -> 本场完整包立档 -> 输出对战结果 -> 重置对战状态(回到未对战)
+            flushed = _flush_battle_pkts()
+            # 在清空状态前, 取本场最终双方当前精灵 HP, 用于判定胜负
+            with _LOCK:
+                fin_my = _BATTLE.get("my")
+                fin_ot = _BATTLE.get("other")
+            fin_my_hp = (fin_my or {}).get("hp")
+            fin_ot_hp = (fin_ot or {}).get("hp")
+            # 2506 结果包可解析出账号与回合数; 但无胜负标志, 靠双方 HP 判定
+            try:
+                fo = parse_fight_over(data)
+            except Exception:
+                fo = {}
+            if fin_ot_hp is not None and fin_ot_hp <= 0 and (fin_my_hp or 0) > 0:
+                verdict = "我方胜利"
+            elif fin_my_hp is not None and fin_my_hp <= 0 and (fin_ot_hp or 0) > 0:
+                verdict = "我方战败"
+            elif fin_my_hp is not None and fin_ot_hp is not None and fin_my_hp <= 0 and fin_ot_hp <= 0:
+                verdict = "同归于尽"
+            else:
+                verdict = "对战结束(胜负未判定)"
+            _report(f"对战结束 —— 结果: {verdict}")
+            if fin_my_hp is not None or fin_ot_hp is not None:
+                def _hp(v):
+                    return "?" if v is None else str(v)
+                _report(f"  最终血量 我方 {_hp(fin_my_hp)} | 敌方 {_hp(fin_ot_hp)}")
+            if fo.get("accountId") is not None:
+                _report(f"  结束包: 账号 {fo['accountId']} 回合数 {fo.get('roundNum')} (包体{len(data)}B)")
+            else:
+                _report(f"  结束包: 无账号/回合信息 (包体{len(data)}B, 前48B {data[:48].hex()})")
+            if flushed:
+                _report(f"  本场完整包体已存 {flushed[0]} ({flushed[1]} 包)")
+            with _LOCK:
+                _BATTLE.update({"active": False, "mode": 0, "my": None, "other": None,
+                                "myTeam": [], "otherTeam": [], "mySkills": [],
+                                "_ready_sent_mode": None, "lastCmd": 2506})
+                _BATTLE["version"] += 1
+            log("info", "对战(2506): 对战结束, 已重置对战状态")
+        elif cmd in (2405, 2394, 2410, 2507, 2508, 2404):
+            # 其它回合/技能相关包: 记录到战报 (便于观察服务器回合推进)
+            name = {2405:"USE_SKILL应答", 2394:"PET_BOOK_UPDATE", 2410:"ESCAPE_FIGHT",
+                    2507:"NOTE_UPDATE_SKILL", 2508:"NOTE_UPDATE_PROP", 2404:"READY_TO_FIGHT应答"}.get(cmd, str(cmd))
+            _report(f"收到 {name}({cmd}) 包体({len(data)}B)")
+            with _LOCK:
+                _BATTLE["lastCmd"] = cmd
+                _BATTLE["version"] += 1
+    except Exception as e:
+        log("error", f"解析对战包({cmd})失败: {e}")
+
+
+def _active_skills(battle):
+    """取我方当前出战精灵的可用技能列表.
+
+    优先取 2504 的 my((一)当前出战), 其技能在 2503 的 myTeam 里按 catchTime 匹配;
+    匹配不到则取 myTeam 第一只的技能.
+    """
+    my = battle.get("my") or {}
+    catch = my.get("catchTime")
+    for p in battle.get("myTeam", []):
+        if catch is not None and p.get("catchTime") == catch:
+            return list(p.get("skills") or [])
+    if battle.get("myTeam"):
+        return list(battle["myTeam"][0].get("skills") or [])
+    return []
+
+
+def _apply_hp_updates(updates):
+    """按 catchTime 把 2505/回合包里的 hp/maxHp 写回 _BATTLE 的 my/other 与双方队伍."""
+    if not updates:
+        return
+    by_ct = {u["catchTime"]: u for u in updates}
+
+    def upd(entry):
+        if not entry:
+            return
+        u = by_ct.get(entry.get("catchTime"))
+        if u:
+            entry["hp"] = u["hp"]
+            entry["maxHp"] = u["maxHp"]
+
+    upd(_BATTLE.get("my"))
+    upd(_BATTLE.get("other"))
+    for p in _BATTLE.get("myTeam", []):
+        upd(p)
+    for p in _BATTLE.get("otherTeam", []):
+        upd(p)
+
+
+def _report(msg, clear=False, limit=500):
+    """往 _BATTLE.report 追加一条战报; clear=True 时先清空."""
+    import time as _t
+    with _LOCK:
+        if clear:
+            _BATTLE["report"] = []
+        _BATTLE["report"].append({"t": _t.strftime("%H:%M:%S"), "msg": msg})
+        if len(_BATTLE["report"]) > limit:
+            _BATTLE["report"] = _BATTLE["report"][-limit:]
+
+
+def _capture_battle(cmd, body_hex, direction="RECV"):
+    """把**解密后**的完整对战包体追加写入 webui_logs/battle_capture.log, 并暂存到本场缓冲.
+
+    存的是已解出包体的 hex(不含包头), 可直接按 [包体] 解码. 每场结束(_flush_battle_pkts)
+    会把本场完整包单独立档.
+    """
+    import time as _t
+    ts = _t.strftime('%Y-%m-%d %H:%M:%S')
+    try:
+        os.makedirs(_LOG_DIR, exist_ok=True)
+        with open(os.path.join(_LOG_DIR, "battle_capture.log"), "a", encoding="utf-8") as f:
+            f.write(f"{ts} {direction} cmd={cmd} len={len(body_hex)//2} BODY {body_hex}\n")
+    except OSError:
+        pass
+    try:
+        _BATTLE_PKTS.append((ts, direction, int(cmd), body_hex))
+    except Exception:
+        pass
+
+
+def _flush_battle_pkts():
+    """把本场对战收到的完整(解密后)包体写入 webui_logs/battle_<时间>.log, 供研究分析."""
+    import time as _t
+    if not _BATTLE_PKTS:
+        return None
+    ts = _t.strftime("%Y%m%d_%H%M%S")
+    try:
+        os.makedirs(_LOG_DIR, exist_ok=True)
+        path = os.path.join(_LOG_DIR, f"battle_{ts}.log")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(f"# 赛尔号对战完整包体(解密后) | 保存 {ts} | 共 {len(_BATTLE_PKTS)} 包\n")
+            for t, direction, cmd, body in _BATTLE_PKTS:
+                name = CMD_MAP.get(cmd, "")
+                f.write(f"{t} {direction} cmd={cmd} {name} len={len(body)//2} BODY {body}\n")
+        n = len(_BATTLE_PKTS)
+        _BATTLE_PKTS.clear()
+        return (path, n)
+    except OSError as e:
+        print(f"保存对战包失败: {e}")
+        return None
+
+
+
 def _load_cmdmap():
     """加载 Command.cs 解析出的 id->命令名 字典 (refs/seerpacket/cmdmap.json 的副本)."""
     try:
@@ -224,12 +531,12 @@ CMD_NAME = {v: k for k, v in CMD_MAP.items()}  # 反向: name -> id
 
 # 精灵名表 (id->名字): 基础来自 assets_updater 自动导出的 petbook.json (从游戏图鉴 petbook.bytes 解析),
 # 再用用户可在根目录维护的 pet_names.json 覆盖同名项 (用户纠错优先).
-_PETNAMES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pet_names.json")
-_PETBOOK_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "petbook.json")
+_PETNAMES_FILE = os.path.join(_DATA_DIR, "pet_names.json")
+_PETBOOK_FILE = os.path.join(_DATA_DIR, "petbook.json")
 
 # 精灵属性表 (物种id->属性名, 如 "草"/"水"/"水 龙"): 来自 monsters.bytes 的 type 字段,
 # 由 assets_updater 自动导出 (参考 refs/monsters.json 结构: type 即属性, real_id==0 的基表记录为物种本体).
-_PETATTR_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pet_attr.json")
+_PETATTR_FILE = os.path.join(_DATA_DIR, "pet_attr.json")
 
 
 def _read_json_map(path):
@@ -248,7 +555,7 @@ _PETATTR = _read_json_map(_PETATTR_FILE)  # {str 物种id: str 属性名}
 
 # 技能表 (技能id->技能数据: name/pp/typeName/power/accuracy/crit/mustHit/priority/effects):
 # 来自 moves.bytes + skill_effect.bytes, 由 assets_updater 自动导出 skills.json.
-_SKILLS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "skills.json")
+_SKILLS_FILE = os.path.join(_DATA_DIR, "skills.json")
 _SKILLS = _read_json_map(_SKILLS_FILE)   # {str 技能id: dict 技能数据}
 
 
@@ -261,7 +568,7 @@ def skill_of(mid):
 
 # 魂印/专属特性表 (精灵物种id -> [魂印数据 {id,tags,desc,analyze,effectId,args}]):
 # 来自 effecticon.bytes + effectag.bytes, 由 assets_updater 自动导出 soulmarks.json.
-_SOULMARKS_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "soulmarks.json")
+_SOULMARKS_FILE = os.path.join(_DATA_DIR, "soulmarks.json")
 _SOULMARKS = _read_json_map(_SOULMARKS_FILE)   # {str 物种id: [魂印数据...]}
 
 
@@ -420,10 +727,9 @@ def list_scripts():
 
 
 def _script_env():
-    """构造脚本子进程环境: 把项目根目录放进 PYTHONPATH, 使脚本可 import seerlib."""
+    """构造脚本子进程环境: 把源码目录放 PYTHONPATH, 使脚本可 import seerlib/seer."""
     env = dict(os.environ)
-    proj = os.path.dirname(os.path.abspath(__file__))
-    env["PYTHONPATH"] = proj + os.pathsep + (env.get("PYTHONPATH") or "")
+    env["PYTHONPATH"] = _SRC_DIR + os.pathsep + (env.get("PYTHONPATH") or "")
     return env
 
 
@@ -504,6 +810,28 @@ def run_login(account, password, host, port, session=None):
                 with _LOCK_RECV:
                     _RECV_SEQ[c] = _RECV_SEQ.get(c, 0) + 1
                     _RECV_LATEST[c] = body
+                # 对战包: 更新 _BATTLE 状态 (2503 队伍 / 2504 当前出战)
+                if c in (2503, 2504, 2404, 2407, 2505, 2406, 2409, 2506, 2405, 2394, 2410, 2507, 2508):
+                    # 解密后的完整包体落盘(不截断), 供解码 2505 等真实字节布局
+                    try:
+                        _capture_battle(c, body, direction)
+                    except Exception:
+                        pass
+                    try:
+                        _update_battle(c, body, str(global_client.account))
+                    except Exception as eb:
+                        log("error", f"更新对战状态({c})失败: {eb}")
+                    # 收到对战就绪(2503) -> 自动发送 READY_TO_FIGHT(2404) 请求正式开战 (每个对战只发一次)
+                    if c == 2503:
+                        try:
+                            mode_now = _BATTLE.get("mode")
+                            if _BATTLE.get("_ready_sent_mode") != mode_now:
+                                global_client.send_game_packet(2404, "")
+                                _BATTLE["_ready_sent_mode"] = mode_now
+                                _report("> 自动发送 READY_TO_FIGHT(2404) 请求正式开战")
+                                log("info", "[对战] 收到2503, 已自动发送 2404 READY_TO_FIGHT")
+                        except Exception as e2:
+                            log("error", f"自动发送2404失败: {e2}")
             # 43706(背包精灵全量)/2301(单只精灵) 应答: 解析 PetInfo 前段=能力值
             if direction == "RECV" and c in (43706, 2301):
                 try:
@@ -690,6 +1018,12 @@ class Handler(BaseHTTPRequestHandler):
                 payload = {"ok": True, "pets": pets,
                            "fetched": _EXE["fetched"], "version": _EXE["version"]}
             self._send(200, "application/json", json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+        elif path == "/api/battle":
+            # 对战页: 当前对战状态 (双方当前精灵/队伍/可用技能)
+            with _LOCK:
+                b = dict(_BATTLE)
+            b["client_present"] = _STATE.get("client") is not None
+            self._send(200, "application/json", json.dumps(b, ensure_ascii=False).encode("utf-8"))
         elif path.startswith("/api/pet-info"):
             # /api/pet-info?catchTime=X 返回缓存的单只 PetInfo
             q = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
@@ -734,7 +1068,7 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._send(404, "text/plain", b"not found")
         elif path.startswith("/effecticon/"):
-            # 魂印/效果图标: /effecticon/<iconid>.png (来自 effecticon_*.bundle 提取, refs/effecticon)
+            # 魂印/效果图标: /effecticon/<iconid>.png (来自 effecticon_*.bundle 提取, data/effecticon)
             fname = os.path.basename(path[len("/effecticon/"):])
             if not (fname.endswith(".png") and fname[:-4].isdigit()):
                 self._send(404, "text/plain", b"bad name")
@@ -1182,6 +1516,72 @@ class Handler(BaseHTTPRequestHandler):
             # 停止当前正在运行的脚本子进程
             return self._send_json({"ok": True, "stopped": _stop_script()})
 
+        elif path == "/api/battle/send":
+            # 对战页发包: {cmd, body, encode} (命令号可为任意对战命令, 用当前连接发送)
+            with _LOCK:
+                cli = _STATE["client"]
+            if cli is None:
+                return self._send_json({"ok": False, "error": "尚未登录, 无法发包"}, 400)
+            try:
+                raw_cmd = str(data.get("cmd")).strip()
+                cmd = int(raw_cmd) if raw_cmd.isdigit() else CMD_NAME.get(raw_cmd)
+                if cmd is None:
+                    return self._send_json({"ok": False, "error": f"未知命令名/号: {raw_cmd!r}"}, 400)
+                body_spec = str(data.get("body", ""))
+                encode = str(data.get("encode", "pack"))
+                if encode == "hex":
+                    body_hex = "".join(ch for ch in body_spec if ch in "0123456789abcdefABCDEF")
+                else:
+                    ok, packed = pack_body(body_spec, raise_on_error=False)
+                    if not ok:
+                        return self._send_json({"ok": False, "error": f"包体参数错误: {packed}"}, 400)
+                    body_hex = packed.hex() if isinstance(packed, bytes) else packed
+                cli.send_game_packet(cmd, body_hex)
+                log("info", f"[对战] 已发送 cmd={cmd} {CMD_MAP.get(cmd,'')} body={body_hex[:48]}")
+                return self._send_json({"ok": True, "sent": {"cmd": cmd, "body": body_hex}})
+            except Exception as e:
+                log("error", f"[对战] 发包异常: {e}")
+                return self._send_json({"ok": False, "error": str(e)}, 400)
+
+        elif path == "/api/battle/hex":
+            # 发起对战: 输入"带cmdid的完整HEX包", 从包头提取命令号+包体, 重建(decode)后经当前连接发送.
+            # 支持任意对战命令号 (不止 41129); uid/序列号会用当前账号重算.
+            with _LOCK:
+                cli = _STATE["client"]
+            if cli is None:
+                return self._send_json({"ok": False, "error": "尚未登录, 无法发包"}, 400)
+            try:
+                hexs = "".join(ch for ch in str(data.get("hex", "")) if ch in "0123456789abcdefABCDEF")
+                raw = bytes.fromhex(hexs)
+                if len(raw) < 17:
+                    return self._send_json({"ok": False, "error": "HEX 过短(需含 17 字节包头)"}, 400)
+                cmd = int.from_bytes(raw[5:9], "big")       # [len4][ver1][cmd4]... 从串口提取命令号
+                body = raw[17:]
+                cli.send_game_packet(cmd, body.hex())        # 会把 uid/序列号按当前账号重建并加密封包
+                log("info", f"[对战] 发起: 解析出 cmd={cmd} {CMD_MAP.get(cmd,'')} 包体={body.hex()[:48]}")
+                return self._send_json({"ok": True, "sent": {"cmd": cmd, "body": body.hex()}})
+            except Exception as e:
+                log("error", f"[对战] 发起HEX失败: {e}")
+                return self._send_json({"ok": False, "error": str(e)}, 400)
+
+        elif path == "/api/battle/clear":
+            # 清空对战状态
+            global _BATTLE
+            with _LOCK:
+                _BATTLE.update({"active": False, "mode": 0, "my": None, "other": None,
+                                "myTeam": [], "otherTeam": [], "mySkills": [],
+                                "myId": None, "lastCmd": None})
+                _BATTLE["version"] += 1
+            return self._send_json({"ok": True})
+
+        elif path == "/api/battle/action":
+            # 记录一条客户端动作到战报 (如点击技能), 便于回放/观察
+            msg = str(data.get("msg", "")).strip()
+            if msg:
+                _report(msg)
+                return self._send_json({"ok": True, "msg": msg})
+            return self._send_json({"ok": False, "error": "msg 为空"}, 400)
+
         return self._send_json({"ok": False, "error": "unknown"}, 404)
 
 
@@ -1222,6 +1622,25 @@ PAGE = r"""<!DOCTYPE html>
 .script-item{display:block;width:100%;text-align:left;padding:6px 8px;border:0;border-bottom:1px solid #21262d;background:transparent;color:#d8dee9;font:12px Menlo,monospace;cursor:pointer}
 .script-item:hover{background:#1c2533}
 .script-item.sel{background:#1f2937;color:#58a6ff}
+/* ---- 对战页 ---- */
+.fight-side{display:flex;gap:12px;align-items:center}
+.fight-card{flex:1;background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:8px;text-align:center}
+.fight-card .fc-img{width:96px;height:96px;margin:0 auto;background:#161b22;border:1px solid #30363d;border-radius:8px;display:flex;align-items:center;justify-content:center;overflow:hidden;font-size:22px;color:#8b949e}
+.fight-card .fc-img img{width:100%;height:100%;object-fit:contain}
+.fc-name{font-size:14px;margin-top:6px;color:#d8dee9;font-weight:bold}
+.fc-lv{font-size:11px;color:#8b949e;margin:2px 0}
+.hpbar{height:12px;background:#21262d;border:1px solid #30363d;border-radius:6px;overflow:hidden;margin:4px 0}
+.hpbar .hp{height:100%;background:linear-gradient(90deg,#3fb950,#2ea043);transition:width .3s}
+.hpbar .hp.low{background:linear-gradient(90deg,#f85149,#da3633)}
+.hptxt{font-size:11px;color:#9aa5b1}
+.fc-page{font-size:11px;color:#8b949e;margin-top:4px}
+.battle-team{display:flex;flex-wrap:wrap;gap:8px}
+.pt-chip{width:76px;background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:4px;text-align:center;font:11px Menlo,monospace}
+.pt-chip img{width:56px;height:56px;object-fit:contain;margin:0 auto;display:block}
+.pt-chip .pn{color:#d8dee9;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pt-chip .ph{color:#9aa5b1;font-size:10px}
+.skill-btn{min-width:96px;padding:8px 12px;margin:0;background:#238636;border:0;color:#fff;border-radius:6px;cursor:pointer;font-size:12px}
+.ops-btn{min-width:96px;padding:8px 12px;margin:0;background:#6e7681;border:0;color:#fff;border-radius:6px;cursor:pointer;font-size:12px}
  .bagwrap{display:flex;gap:12px;padding:12px}
  .avrow{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin:0 0 12px}
  .av-btn{display:block;min-width:0;margin:0;padding:6px;background:#21262d;border:1px solid #30363d;border-radius:8px;text-align:center;cursor:pointer;color:#d8dee9;overflow:hidden;font:12px Menlo,monospace;line-height:1.2;touch-action:none;-webkit-tap-highlight-color:transparent}
@@ -1282,6 +1701,7 @@ PAGE = r"""<!DOCTYPE html>
   <button class="tab active" data-tab="login">登录</button>
   <button class="tab" data-tab="bag">背包</button>
   <button class="tab" data-tab="scripts">脚本</button>
+  <button class="tab" data-tab="battle">对战</button>
 </div>
 <div id="tab-login" class="tab-panel active">
 <main>
@@ -1417,6 +1837,47 @@ PAGE = r"""<!DOCTYPE html>
     </div>
   </div>
 </div><!-- /tab-scripts -->
+
+<div id="tab-battle" class="tab-panel">
+  <!-- 发起对战: 输入带cmdid的完整HEX包 (任意命令号) -->
+  <div style="padding:12px">
+    <div class="card">
+      <h2>发起对战 (输入带 cmdid 的完整 HEX 包 <sup style="color:#888">支持任意对战命令号, 不限于 41129</sup>)</h2>
+      <div class="rowflex" style="align-items:center;gap:8px">
+        <input id="battleHex" type="text" spellcheck="false" placeholder="粘贴完整十六进制包, 如 00000015310000A0A9383934A300000255000030A0">
+        <button id="battleHexBtn" disabled>发送</button>
+        <button id="battleClearBtn" class="off">清空对战状态</button>
+      </div>
+      <div id="battleHexInfo" style="font-size:12px;color:#8b949e;margin-top:4px">—</div>
+    </div>
+  </div>
+  <!-- 对战双方展示 -->
+  <div style="display:flex;gap:12px;padding:0 12px 12px;flex-wrap:wrap">
+    <div class="card" style="flex:1;min-width:300px">
+      <h2>我方</h2>
+      <div id="battleMy" class="fight-side"><div style="color:#8b949e">等待对战包(2503/2504)...</div></div>
+      <h2 style="margin-top:10px">我方投技</h2>
+      <div id="battleSkills" style="display:flex;flex-wrap:wrap;gap:8px;margin:4px 0 8px"><div style="color:#8b949e">—</div></div>
+      <div id="battleOps" style="display:flex;flex-wrap:wrap;gap:8px"></div>
+      <div id="battleActionStatus" style="font-size:12px;color:#8b949e;margin-top:6px">—</div>
+    </div>
+    <div class="card" style="flex:1;min-width:300px">
+      <h2>敌方</h2>
+      <div id="battleOther" class="fight-side"><div style="color:#8b949e">等待对战包...</div></div>
+      <h2 style="margin-top:10px">我方出场队伍 (2503)</h2>
+      <div id="battleMyTeam" class="battle-team"><div style="color:#8b949e">—</div></div>
+      <h2 style="margin-top:10px">敌方出场队伍</h2>
+      <div id="battleOtherTeam" class="battle-team"><div style="color:#8b949e">—</div></div>
+    </div>
+  </div>
+  <!-- 战报记录 -->
+  <div style="padding:0 12px 12px">
+    <div class="card">
+      <h2>战报记录 <button id="battleReportCopyBtn" class="off" style="float:right;margin:0 6px 0 0;padding:2px 10px;font-size:12px">复制</button><button id="battleReportClearBtn" class="off" style="float:right;margin:0;padding:2px 10px;font-size:12px">清空</button></h2>
+      <div id="battleReport" style="max-height:32vh;overflow:auto;background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:8px;font:12px/1.5 Menlo,monospace;white-space:pre-wrap;color:#9ecbff">（对战中逐回合记录: 技能/换宠/HP变化/道具/捕捉/结束）</div>
+    </div>
+  </div>
+</div><!-- /tab-battle -->
 
 <script>
 const logEl=document.getElementById('log');
@@ -1703,6 +2164,7 @@ function activateTab(name){
   const p=document.getElementById('tab-'+name); if(p) p.classList.add('active');
   if(name==='bag') refreshBag();
   if(name==='scripts') loadScripts();
+  if(name==='battle') refreshBattle();
 }
 document.querySelectorAll('.tabs .tab').forEach(t=>{
   t.addEventListener('click',()=>activateTab(t.dataset.tab));
@@ -1757,6 +2219,163 @@ scriptStopBtn.onclick=async()=>{
 };
 document.getElementById('scriptClearBtn').onclick=()=>{ scriptOutEl.innerHTML=''; };
 loadScripts();   // 预加载脚本列表 (登录后可立即看到)
+
+// ---- 对战页: 轮询 /api/battle, 图形化双方头像/血量/参数 + 技能/操作按钮 + 发起HEX包 ----
+async function refreshBattle(){
+  try{
+    const r=await fetch('/api/battle'); const j=await r.json();
+    renderBattleState(j);
+  }catch(e){}
+}
+function hpPct(hp,max){ if(hp==null||max==null||!max) return 0; return Math.max(0,Math.min(100,Math.round(hp*100/max))); }
+function renderFighterBox(el, p){
+  el.innerHTML='';
+  if(!p){ el.innerHTML='<div style="color:#8b949e">—</div>'; return; }
+  const pid=p.id||p.petID;
+  const card=document.createElement('div'); card.className='fight-card';
+  const img=document.createElement('div'); img.className='fc-img';
+  if(p.avatar){ const im=document.createElement('img'); im.src=p.avatar; im.alt=''; im.onerror=()=>{img.textContent=(p.name||pid||'?');}; img.appendChild(im); }
+  else img.textContent=(p.name||pid||'?');
+  card.appendChild(img);
+  const nm=document.createElement('div'); nm.className='fc-name'; nm.textContent=(p.name||('id='+pid));
+  card.appendChild(nm);
+  const lv=document.createElement('div'); lv.className='fc-lv'; lv.textContent='Lv.'+(p.lv!=null?p.lv:'?')+'  catch='+(p.catchTime!=null?p.catchTime:'?');
+  card.appendChild(lv);
+  const hp=(p.hp!=null)?p.hp:p.xinHp, mhp=(p.maxHP!=null)?p.maxHP:p.xinMaxHp;
+  const bar=document.createElement('div'); bar.className='hpbar';
+  const f=document.createElement('div'); f.className='hp'+(hpPct(hp,mhp)<30?' low':''); f.style.width=hpPct(hp,mhp)+'%';
+  bar.appendChild(f); card.appendChild(bar);
+  const ht=document.createElement('div'); ht.className='hptxt'; ht.textContent=(hp!=null?hp:'?')+' / '+(mhp!=null?mhp:'?');
+  card.appendChild(ht);
+  const pg=document.createElement('div'); pg.className='fc-page';
+  pg.textContent=(p.siteBuff&&p.siteBuff.siteBuffId)?('场地buff '+p.siteBuff.siteBuffId+' 回合'+p.siteBuff.siteBuffTurn):'';
+  card.appendChild(pg);
+  el.appendChild(card);
+}
+function renderTeamBox(el, team){
+  el.innerHTML='';
+  if(!team||!team.length){ el.innerHTML='<div style="color:#8b949e">—</div>'; return; }
+  for(const p of team){
+    const d=document.createElement('div'); d.className='pt-chip';
+    const im=document.createElement('img'); im.src=p.avatar||('/head/'+(p.id)+'.png'); im.onerror=()=>{im.style.display='none';};
+    d.appendChild(im);
+    const n=document.createElement('div'); n.className='pn'; n.textContent=(p.name||('id='+p.id));
+    d.appendChild(n);
+    const h=document.createElement('div'); h.className='ph'; h.textContent='HP '+(p.hp!=null?p.hp:'?');
+    d.appendChild(h);
+    el.appendChild(d);
+  }
+}
+function renderBattleState(j){
+  if(!j) return;
+  renderFighterBox(document.getElementById('battleMy'), j.my);
+  renderFighterBox(document.getElementById('battleOther'), j.other);
+  renderTeamBox(document.getElementById('battleMyTeam'), j.myTeam);
+  renderTeamBox(document.getElementById('battleOtherTeam'), j.otherTeam);
+  const skills=j.mySkills||[];
+  renderSkillButtons(skills);
+  ensureSkillNames(skills);   // 拉取技能名, 加载后自动重渲染
+  const ops=document.getElementById('battleOps'); ops.innerHTML='';
+  [['换宠(2407)',2407],['用药(2406)',2406],['逃跑(2410)',2410],['捕捉(2409)',2409]].forEach(([label,cmd])=>{
+    const b=document.createElement('button'); b.className='ops-btn'; b.textContent=label;
+    b.title='发送 cmd='+cmd;
+    b.onclick=()=>sendBattleCmd(cmd,[]);
+    ops.appendChild(b);
+  });
+  const bhi=document.getElementById('battleHexInfo');
+  if(bhi) bhi.textContent=(j.active?('对战中 mode='+j.mode+' | 上次更新='+(j.lastCmd||'-')):'未在对战中');
+  document.getElementById('battleHexBtn').disabled=!(j.client_present);
+  // 战报
+  const rep=document.getElementById('battleReport');
+  if(rep){
+    const entries=j.report||[];
+    // 从上到下(时间正序): 首条在最上, 新增追加到最下; 不强制滚动,
+    // 仅当用户本就停在底部时才跟随新内容滚动(正常日志行为)
+    const nearBottom=(rep.scrollTop+rep.clientHeight)>=(rep.scrollHeight-40);
+    rep.innerHTML=entries.length? '' : '<div style="color:#8b949e">（暂无战报记录）</div>';
+    entries.forEach(e=>{
+      const d=document.createElement('div');
+      d.textContent=e.t+'  '+e.msg;
+      rep.appendChild(d);
+    });
+    if(entries.length && nearBottom) rep.scrollTop=rep.scrollHeight;
+  }
+}
+let _SKILL_NAMES={};   // sid -> 技能名 (由 /api/skills 拉取)
+function renderSkillButtons(skills){
+  const sk=document.getElementById('battleSkills'); sk.innerHTML='';
+  if(!skills.length){ sk.innerHTML='<div style="color:#8b949e">—</div>'; return; }
+  skills.forEach(sid=>{
+    const b=document.createElement('button'); b.className='skill-btn';
+    b.textContent=String(_SKILL_NAMES[sid]!=null? _SKILL_NAMES[sid] : sid);
+    b.title='技能ID='+sid+'  点击发送 USE_SKILL(2405)';
+    b.onclick=()=>sendBattleCmd(2405,[sid]);
+    sk.appendChild(b);
+  });
+}
+async function ensureSkillNames(ids){
+  const miss=[...new Set(ids.filter(sid=>_SKILL_NAMES[sid]==null))];
+  if(!miss.length) return;
+  try{
+    const r=await fetch('/api/skills?ids='+miss.join(','));
+    const j=await r.json();
+    for(const [k,v] of Object.entries(j.skills||{})) _SKILL_NAMES[k]=(v&&v.name)||k;
+    miss.forEach(sid=>{ if(_SKILL_NAMES[sid]==null) _SKILL_NAMES[sid]=String(sid); });
+    refreshBattle();   // 拿到名字后重绘
+  }catch(e){ miss.forEach(sid=>{ if(_SKILL_NAMES[sid]==null) _SKILL_NAMES[sid]=String(sid); }); }
+}
+document.getElementById('battleReportClearBtn').onclick=()=>{
+  try{ fetch('/api/battle/clear',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}); }catch(e){}
+  refreshBattle();
+};
+document.getElementById('battleReportCopyBtn').onclick=()=>{
+  const rep=document.getElementById('battleReport');
+  if(!rep) return;
+  const lines=[...rep.childNodes].map(n=>n.textContent||'').filter(Boolean);
+  const txt=lines.join('\n');
+  try{ navigator.clipboard.writeText(txt); }catch(e){}
+  const btn=document.getElementById('battleReportCopyBtn');
+  const old=btn.textContent; btn.textContent='已复制'; setTimeout(()=>{ btn.textContent=old; }, 1200);
+  appendLog({t:now(),level:'ok',msg:'已复制战报('+lines.length+'行)'});
+};
+async function sendBattleCmd(cmd, params){
+  const st=document.getElementById('battleActionStatus'); if(st){ st.textContent='发送中 cmd='+cmd+'...'; st.style.color='#d29922'; }
+  const label = (cmd===2405 && params && params.length) ? ('技能'+(_SKILL_NAMES[params[0]]||params[0])) : (window.__CM[cmd]||cmd);
+  // 先把"点击"记进战报, 让战报立即有变化
+  try{ await fetch('/api/battle/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({msg:'> 点击发送 '+label+' (cmd='+cmd+')'})}); }catch(e){}
+  try{
+    const body=(params||[]).map(x=>String(x)).join(',');
+    const r=await fetch('/api/battle/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cmd:cmd, body:body})});
+    const j=await r.json();
+    if(j.ok){
+      if(st){ st.textContent='✔ 已发送 cmd='+cmd+' '+label; st.style.color='#3fb950'; }
+      try{ await fetch('/api/battle/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({msg:'  服务器已受理发送 cmd='+cmd+' '+label})}); }catch(e){}
+      appendLog({t:now(),level:'ok',msg:'[对战] 已发送 cmd='+cmd+' '+label+' body='+(j.sent.body||'')});
+    }else{
+      if(st){ st.textContent='✘ 发送失败: '+(j.error||''); st.style.color='#f85149'; }
+      appendLog({t:now(),level:'error',msg:'对战发包失败: '+(j.error||'')});
+    }
+  }catch(e){
+    if(st){ st.textContent='✘ 发送出错: '+e; st.style.color='#f85149'; }
+    appendLog({t:now(),level:'error',msg:'对战发包出错: '+e});
+  }
+}
+document.getElementById('battleHexBtn').onclick=async()=>{
+  const hex=document.getElementById('battleHex').value.trim();
+  if(!hex){ appendLog({t:now(),level:'tip',msg:'请先粘贴完整HEX包'}); return; }
+  try{
+    const r=await fetch('/api/battle/hex',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({hex:hex})});
+    const j=await r.json();
+    if(j.ok) appendLog({t:now(),level:'ok',msg:'已发起对战包 cmd='+j.sent.cmd+' '+(window.__CM[j.sent.cmd]||'')});
+    else appendLog({t:now(),level:'error',msg:'发起失败: '+(j.error||'')});
+  }catch(e){ appendLog({t:now(),level:'error',msg:'发起出错: '+e}); }
+};
+document.getElementById('battleClearBtn').onclick=async()=>{
+  try{ await fetch('/api/battle/clear',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}); }catch(e){}
+  refreshBattle();
+};
+refreshBattle();
+setInterval(refreshBattle, 800);   // 对战状态实时轮询
 
 // 精灵按钮文本: 仅显示名字; 无名字则显示 id 数字 (统一背包+仓库)
 function displayName(p){
@@ -2381,7 +3000,7 @@ def main():
     args = ap.parse_args()
 
     # 启动前先确保本地"需要的文件"(目前=全部精灵头像)是最新的:
-    # 记录并检查版本(assets_updater 用 refs/head/.avatar_state.json 记录), 版本一致则跳过.
+    # 记录并检查版本(assets_updater 用 data/head/.avatar_state.json 记录), 版本一致则跳过.
     # 需要解析时自动 pip 安装 UnityPy 到项目 vendor/, 再从 bundle 解出头像.
     if not args.no_update:
         try:
@@ -2401,7 +3020,7 @@ def main():
         srv = ThreadingHTTPServer((args.host, args.port), Handler)
     except OSError as e:
         print(f"端口 {args.port} 被占用: {e}")
-        print("已自动改到空闲端口; 或换一个: python3 webui.py --port <端口>")
+        print("已自动改到空闲端口; 或换一个: python3 app/webui.py --port <端口>")
         srv = ThreadingHTTPServer((args.host, 0), Handler)
     actual = srv.server_address[1]
     print(f"赛尔号协议调试台: http://{args.host}:{actual}/")

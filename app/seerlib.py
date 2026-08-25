@@ -34,6 +34,12 @@ import urllib.error
 import urllib.request
 
 
+# 源码目录 (app/) 与项目根目录 (其上一级); 运行时数据(petbook.json/webui_addr.json)在 data/ 下
+_SRC_DIR = os.path.dirname(os.path.abspath(__file__))
+_PROJ = os.path.dirname(_SRC_DIR)
+_DATA_DIR = os.path.join(_PROJ, "data")
+
+
 class SeerError(Exception):
     """库调用失败 (未登录 / 参数错误 / 等待响应超时 / 取值越界等)."""
 
@@ -52,7 +58,7 @@ def _pet_name(sid) -> str:
     if _PETBOOK is None:
         _PETBOOK = {}
         try:
-            p = os.path.join(os.path.dirname(os.path.abspath(__file__)), "petbook.json")
+            p = os.path.join(_DATA_DIR, "petbook.json")
             with open(p, "r", encoding="utf-8") as f:
                 _PETBOOK = json.load(f)
         except (OSError, ValueError, json.JSONDecodeError):
@@ -67,7 +73,7 @@ DEFAULT_BASE = "http://127.0.0.1:8680"
 
 # 后端(webui.py)启动时会把"实际监听地址"写入该文件, 供脚本运行时定位.
 # 位置固定在本文件同目录, 与 webui.py 的 _ADDR_FILE 一致.
-_ADDR_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "webui_addr.json")
+_ADDR_FILE = os.path.join(_DATA_DIR, "webui_addr.json")
 
 # 逐端口探测的端口范围: webui 默认 8680; --port 0 / 换端口时可能落到这附近.
 _PROBE_PORTS = list(range(8680, 8700))
