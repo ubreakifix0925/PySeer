@@ -13,23 +13,42 @@
 
 ## ⚡ 快速开始（一键部署 + 启动）
 
-只需 Python 3.8+，一条命令即可把 WebUI 控制台跑起来（之后在页面上登录账号）：
+### A. 未下载项目？一行脚本全自动安装并启动（从零机器）
+
+只要机器有 Python（或能自动装 Python），一条命令即完成：**下载项目 → 装 Python → 启动 WebUI**：
 
 ```bash
-# 方式一：一键脚本（推荐）
+bash <(curl -fsSL https://raw.githubusercontent.com/ubreakifix0925/PySeer/main/deploy.sh)
+# 换端口:  ... deploy.sh) 9000
+# 监听所有网卡:  PYSEER_HOST=0.0.0.0 bash <(curl -fsSL <同上>) 
+```
+
+> `deploy.sh` 会：`①` 校验/安装 `python3`（缺失时按 `apt/brew/dnf/pacman` 自动装）；`②` `git clone`
+> （或下载源码包）到 `./PySeer`；`③` 执行 `./start.sh` 启动控制台。等价于：
+> ```bash
+> git clone https://github.com/ubreakifix0925/PySeer.git PySeer && cd PySeer && ./start.sh
+> ```
+> 环境变量 `PYSEER_REPO` / `PYSEER_DIR` / `PYSEER_HOST` / `PYSEER_PORT` / `PYSEER_NO_UPDATE=1` 可覆盖默认。
+
+### B. 已下载项目（本地一键启动）
+
+```bash
 ./start.sh                          # 默认 http://127.0.0.1:8680/
 ./start.sh 9000                     # 换端口
 ./start.sh --update                 # 启动前先刷新一次游戏数据(精灵名/属性/技能/魂印/头像)
 PYSEER_HOST=0.0.0.0 ./start.sh      # 监听所有网卡
+```
 
-# 方式二：一条命令（不依赖脚本）
+### C. 不依赖脚本的一条命令
+
+```bash
 python3 -u app/webui.py --port 8680 --no-update
 # 需要游戏数据自更新时(需 vendor/unitypy):
 PYTHONPATH=vendor/unitypy python3 -u app/webui.py --port 8680
 ```
 
 > 浏览器打开 **http://127.0.0.1:8680/** ，在「登录」页填米米号 + 密码即可。
-> `start.sh` 会在缺失 `vendor/unitypy` 时自动加 `--no-update`，保证**无需任何第三方依赖也能一键启动**。
+> `start.sh`/`deploy.sh` 会在缺失 `vendor/unitypy` 时自动加 `--no-update`，保证**无需任何第三方依赖也能一键启动**。
 
 ---
 
@@ -114,7 +133,8 @@ PySeer/
 ├── analysis/                # 抓包分析工具与产物 (git 忽略)
 ├── docs/                    # 文档 (开发成果/协议复现/PySeer API)
 ├── cache/  vendor/  webui_logs/   # 运行时缓存/用具/日志 (git 忽略)
-├── start.sh                # 一键启动 WebUI 控制台
+├── start.sh                # 本地一键启动 WebUI 控制台
+├── deploy.sh               # 从零一键部署(下载项目+装 Python+启动) — 未下载项目时用
 └── README.md               # 本文档
 ```
 
