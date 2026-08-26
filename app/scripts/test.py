@@ -1,6 +1,6 @@
 import time
-from seerlib import Battle
-from seerlib import Seer
+from PySeer import Battle
+from PySeer import Seer
 s = Seer()
 print("test")
 s.set_bag([3512,3329,3463])

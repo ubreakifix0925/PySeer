@@ -1,4 +1,4 @@
-from seerlib import Seer
+from PySeer import Seer
 s = Seer()
 s.send(41597,[1])
 favor = s.get_recv_value(46046,[1,1707],1)
@@ -9,6 +9,7 @@ s.send(41597,[2])
 cnt = 0
 while s.get_recv_value(46046,[1,1707],1)>favor:
     cnt += 1
+    favor = s.get_recv_value(46046,[1,1707],1)
     s.send(41597,[2])
 print("喂食",cnt,"次")
 print("喂食完成")
@@ -20,6 +21,7 @@ s.send(41597,[3])
 cnt = 0
 while s.get_recv_value(46046,[1,1707],1)>favor:
     cnt += 1
+    favor = s.get_recv_value(46046,[1,1707],1)
     s.send(41597,[3])
 print("打扫",cnt,"次")
 print("打扫完成")
@@ -31,6 +33,7 @@ s.send(41597,[4])
 cnt = 0
 while s.get_recv_value(46046,[1,1707],1)>favor:
     cnt += 1
+    favor = s.get_recv_value(46046,[1,1707],1)
     s.send(41597,[4])
 print("治病",cnt,"次")
 print("治病完成")

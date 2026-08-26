@@ -9,6 +9,7 @@
 # ---- 运行必需：程序文件 (app/) ----
 !.gitignore
 !README.md
+!start.sh
 
 !app/
 !app/**
