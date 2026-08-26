@@ -198,6 +198,8 @@ class Seer:
 
     def __init__(self, base=None, timeout: float = 30.0, probe: bool = True,
                  probe_timeout: float = None):
+        # 通用能力: 可由环境变量 PYSEER_ACCOUNT 指定请求附带的标识(由后端扩展件解释, 默认 None).
+        self.account = os.environ.get("PYSEER_ACCOUNT") or None
         self.base = discover_backend(base,
                                      probe=probe,
                                      timeout=probe_timeout or _PROBE_TIMEOUT)
@@ -205,6 +207,8 @@ class Seer:
 
     # ---------- 底层 HTTP ----------
     def _post(self, path: str, data: dict) -> dict:
+        if self.account is not None:
+            data.setdefault("account", self.account)   # 附加请求标识(若指定)
         req = urllib.request.Request(
             self.base + path,
             data=json.dumps(data).encode("utf-8"),
@@ -305,6 +309,10 @@ class Seer:
     # ---------- 换背包 (物种 id -> 物理重排 12 格) ----------
     def _get_json(self, path: str) -> dict:
         """GET 请求 -> JSON dict (后端 /api/bag、/api/storage 等)."""
+        if self.account is not None:
+            import urllib.parse as _up
+            sep = "&" if "?" in path else "?"
+            path = f"{path}{sep}account={_up.quote(str(self.account))}"
         req = urllib.request.Request(self.base + path, method="GET")
         with urllib.request.urlopen(req, timeout=self.timeout) as r:
             return json.loads(r.read().decode("utf-8"))

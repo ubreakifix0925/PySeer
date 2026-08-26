@@ -140,6 +140,27 @@ _BATTLE = {
 # 本场对战收到的完整(解密后)包体暂存: [(t, direction, cmd, body_hex)], 每场结束写入日志文件
 _BATTLE_PKTS = []
 
+# ---- 线程局部"当前处理上下文"(未绑定时回落全局) ----
+# 供可选扩展件在处理某请求/某连接时绑定一个上下文; 未绑定则用全局, 行为不变.
+_TL = threading.local()
+
+
+def _cur_ctx():
+    """当前线程绑定的处理上下文 dict; 无则 None."""
+    return getattr(_TL, "ctx", None)
+
+
+def _b():
+    """当前线程应读写的对战状态; 绑定了上下文则用其 battle, 否则全局 _BATTLE."""
+    c = _cur_ctx()
+    return c["battle"] if c is not None else _BATTLE
+
+
+def _ctx_client():
+    """当前请求应使用的客户端; 绑定了上下文则用其 client, 否则全局 _STATE["client"]."""
+    c = _cur_ctx()
+    return c["client"] if c is not None else _STATE["client"]
+
 # 技能名查询 (skills.json): id -> 中文名
 def _skill_name(sid):
     try:
@@ -289,8 +310,7 @@ def _pet_state(p):
 
 
 def _update_battle(cmd, hex_body, me_id):
-    """解析对战包(2503/2504)并更新 _BATTLE 状态; me_id=当前账号米米号, 用于区分我方/敌方."""
-    global _BATTLE
+    """解析对战包(2503/2504)并更新当前账号对战状态(走 _b()); me_id=当前账号米米号."""
     try:
         me_id = int(me_id)          # 统一为 int, 便于与包内 id 比较
         data = bytes.fromhex(hex_body) if isinstance(hex_body, str) else bytes(hex_body)
@@ -301,26 +321,26 @@ def _update_battle(cmd, hex_body, me_id):
             my_u = (a if a["id"] == me_id else b) if a and b else a
             ot_u = (b if a["id"] == me_id else a) if a and b else b
             with _LOCK:
-                _fresh = not _BATTLE.get("active")     # 之前未在对战中 -> 本轮为全新对战开始
-                _BATTLE["mode"] = r.get("mode")
-                _BATTLE["active"] = True
-                _BATTLE["finished"] = False          # 新一轮对战开始, 清掉上一场结束标记
-                _BATTLE["lastSkill"] = None          # 清掉上一场最后一次回合数据, 防止跨场误读
-                _BATTLE["round"] = 0                 # 新一场对战, 回合计数清零
-                _BATTLE["myId"] = me_id
-                _BATTLE["myTeam"] = [_battle_view(p) for p in (my_u or {}).get("pets", [])]
-                _BATTLE["otherTeam"] = [_battle_view(p) for p in (ot_u or {}).get("pets", [])]
-                _BATTLE["mySkills"] = _active_skills(_BATTLE)
+                _fresh = not _b().get("active")     # 之前未在对战中 -> 本轮为全新对战开始
+                _b()["mode"] = r.get("mode")
+                _b()["active"] = True
+                _b()["finished"] = False          # 新一轮对战开始, 清掉上一场结束标记
+                _b()["lastSkill"] = None          # 清掉上一场最后一次回合数据, 防止跨场误读
+                _b()["round"] = 0                 # 新一场对战, 回合计数清零
+                _b()["myId"] = me_id
+                _b()["myTeam"] = [_battle_view(p) for p in (my_u or {}).get("pets", [])]
+                _b()["otherTeam"] = [_battle_view(p) for p in (ot_u or {}).get("pets", [])]
+                _b()["mySkills"] = _active_skills(_b())
                 # my/other 先取各自队伍第一只(出战首发); 后续 2504 会按需覆盖为真正当前精灵
-                _BATTLE["my"] = _battle_view(_BATTLE["myTeam"][0]) if _BATTLE["myTeam"] else None
-                _BATTLE["other"] = _battle_view(_BATTLE["otherTeam"][0]) if _BATTLE["otherTeam"] else None
-                _BATTLE["lastCmd"] = 2503
-                _BATTLE["version"] += 1
+                _b()["my"] = _battle_view(_b()["myTeam"][0]) if _b()["myTeam"] else None
+                _b()["other"] = _battle_view(_b()["otherTeam"][0]) if _b()["otherTeam"] else None
+                _b()["lastCmd"] = 2503
+                _b()["version"] += 1
             if _fresh:
                 # 后台监听到"对战开始" -> 前端自动切换到对战界面并开始监听对战流程
                 log("battle", "检测到对战行为(2503 出场队伍), 已自动切换至对战界面")
-            _report(f"对战开始 mode={r.get('mode')} | 我方{len(_BATTLE['myTeam'])}只 敌方{len(_BATTLE['otherTeam'])}只", clear=True)
-            log("ok", f"对战(2503): mode={r.get('mode')} 我方{len(_BATTLE['myTeam'])}只 敌方{len(_BATTLE['otherTeam'])}只")
+            _report(f"对战开始 mode={r.get('mode')} | 我方{len(_b()['myTeam'])}只 敌方{len(_b()['otherTeam'])}只", clear=True)
+            log("ok", f"对战(2503): mode={r.get('mode')} 我方{len(_b()['myTeam'])}只 敌方{len(_b()['otherTeam'])}只")
         elif cmd == 2504:
             r = parse_fight_start_info(data)
             a, b = r.get("fightPetA"), r.get("fightPetB")
@@ -332,13 +352,13 @@ def _update_battle(cmd, hex_body, me_id):
             else:
                 my_f, ot_f = a, b
             with _LOCK:
-                _BATTLE["active"] = True
-                _BATTLE["myId"] = me_id
-                _BATTLE["my"] = _battle_view(my_f) if my_f else None
-                _BATTLE["other"] = _battle_view(ot_f) if ot_f else None
-                _BATTLE["mySkills"] = _active_skills(_BATTLE)
-                _BATTLE["lastCmd"] = 2504
-                _BATTLE["version"] += 1
+                _b()["active"] = True
+                _b()["myId"] = me_id
+                _b()["my"] = _battle_view(my_f) if my_f else None
+                _b()["other"] = _battle_view(ot_f) if ot_f else None
+                _b()["mySkills"] = _active_skills(_b())
+                _b()["lastCmd"] = 2504
+                _b()["version"] += 1
             _report(f"开场 [我方] {_pet_state(my_f)} | [敌方] {_pet_state(ot_f)}")
             log("ok", "对战(2504): 双方当前出战精灵已更新")
         elif cmd == 2407:
@@ -354,29 +374,29 @@ def _update_battle(cmd, hex_body, me_id):
                 ch["maxHp"] = ch.get("maxHp")
                 ch["maxHP"] = ch.get("maxHp")       # 大写 maxHP, 供前端血条读取
                 with _LOCK:
-                    _BATTLE["active"] = True
-                    _BATTLE["myId"] = me_id
+                    _b()["active"] = True
+                    _b()["myId"] = me_id
                     pv = _battle_view(ch)
                     if uid == me_id:
                         # 我方换宠: 新当前精灵 = 该 ChangePetInfo; 从 team 里找到这只, 同步其技能/等级
-                        _BATTLE["my"] = pv
-                        for p in _BATTLE.get("myTeam", []):
+                        _b()["my"] = pv
+                        for p in _b().get("myTeam", []):
                             if p.get("catchTime") == ch.get("catchTime"):
                                 p.update({"hp": ch.get("hp"), "maxHp": ch.get("maxHp"),
                                           "maxHP": ch.get("maxHp"),
                                           "id": pid, "level": ch.get("level"),
                                           "skills": [s[0] for s in ch.get("skillList", [])]})
                     else:
-                        _BATTLE["other"] = pv
-                        for p in _BATTLE.get("otherTeam", []):
+                        _b()["other"] = pv
+                        for p in _b().get("otherTeam", []):
                             if p.get("catchTime") == ch.get("catchTime"):
                                 p.update({"hp": ch.get("hp"), "maxHp": ch.get("maxHp"),
                                           "maxHP": ch.get("maxHp"),
                                           "id": pid, "level": ch.get("level"),
                                           "skills": [s[0] for s in ch.get("skillList", [])]})
-                    _BATTLE["mySkills"] = _active_skills(_BATTLE)
-                    _BATTLE["lastCmd"] = 2407
-                    _BATTLE["version"] += 1
+                    _b()["mySkills"] = _active_skills(_b())
+                    _b()["lastCmd"] = 2407
+                    _b()["version"] += 1
                 lv = ch.get("level")
                 _report(f"换宠 [{side}] → {_pet_state(ch)}")
                 log("ok", f"对战(2407): 换宠 [{side}] pet={pid} lv={lv} hp={ch.get('hp')}/{ch.get('maxHp')} catch={ch.get('catchTime')}")
@@ -391,25 +411,25 @@ def _update_battle(cmd, hex_body, me_id):
                 upd = sk.get("hpUpdates") or []
                 blocks = sk.get("attackBlocks") or []
                 with _LOCK:
-                    _BATTLE["lastSkill"] = sk
-                    _BATTLE["lastCmd"] = 2505
-                    _BATTLE["round"] = _BATTLE.get("round", 0) + 1   # 本场已进行回合数 +1
+                    _b()["lastSkill"] = sk
+                    _b()["lastCmd"] = 2505
+                    _b()["round"] = _b().get("round", 0) + 1   # 本场已进行回合数 +1
                     _apply_hp_updates(upd)
                     # AttackValue.remainHP/maxHp 是本回合**施法者**的权威血量;
                     # 按 userID 匹配到当前精灵, 避免换宠后当前血量停留在满值(未显示掉血)
                     _apply_attack_hp(blocks, me_id)
                     # AttackValue.skillList 的 [技能id, 当前pp] 是服务器权威 PP, 同步前端
                     _apply_skill_pp(blocks, me_id)
-                    _BATTLE["version"] += 1
+                    _b()["version"] += 1
                 # —— 精简战报: 每回合只在场精灵"使用技能 + 状态" ——
-                round_no = _BATTLE.get("round", 0)
+                round_no = _b().get("round", 0)
                 recs = blocks or (sk.get("skillRecords") or [])
                 if not recs and sk.get("skillID") is not None:
                     recs = [sk]                        # 兜底: 用 2505 前导
                 for r in recs:
                     rid = r.get("userID")
                     side = "我方" if rid == me_id else ("敌方" if rid == 0 else f"?{rid}")
-                    pet = _BATTLE.get("my") if rid == me_id else _BATTLE.get("other")
+                    pet = _b().get("my") if rid == me_id else _b().get("other")
                     nm = _pet_state(pet).split(" HP ")[0] if pet else f"id={rid}" if rid else "?"
                     atk = r.get("skillID")
                     hp, mh = r.get("remainHP"), r.get("maxHp")
@@ -443,8 +463,8 @@ def _update_battle(cmd, hex_body, me_id):
             flushed = _flush_battle_pkts()
             # 在清空状态前, 取本场最终双方当前精灵 HP, 用于判定胜负
             with _LOCK:
-                fin_my = _BATTLE.get("my")
-                fin_ot = _BATTLE.get("other")
+                fin_my = _b().get("my")
+                fin_ot = _b().get("other")
             fin_my_hp = (fin_my or {}).get("hp")
             fin_ot_hp = (fin_ot or {}).get("hp")
             # 2506 FightOverInfo 的 **winnerID 即胜者账号** —— 我方账号=>我胜; 敌方(0)=>我负. 以此为权威
@@ -467,17 +487,17 @@ def _update_battle(cmd, hex_body, me_id):
                 verdict = "对战结束(胜负未判定)"
             _report(f"对战结束 —— 结果: {verdict}")
             with _LOCK:
-                _BATTLE.update({"active": False, "finished": True, "mode": 0, "my": None, "other": None,
+                _b().update({"active": False, "finished": True, "mode": 0, "my": None, "other": None,
                                 "myTeam": [], "otherTeam": [], "mySkills": [],
                                 "mySkillPP": {}, "otherSkillPP": {},
                                 "_ready_sent_mode": None, "lastCmd": 2506})
-                _BATTLE["version"] += 1
+                _b()["version"] += 1
             log("info", "对战(2506): 对战结束, 已重置对战状态")
         elif cmd in (2405, 2394, 2410, 2507, 2508, 2404):
             # 其它回合/技能相关包: 仅更新状态, 不进精简战报
             with _LOCK:
-                _BATTLE["lastCmd"] = cmd
-                _BATTLE["version"] += 1
+                _b()["lastCmd"] = cmd
+                _b()["version"] += 1
     except Exception as e:
         log("error", f"解析对战包({cmd})失败: {e}")
 
@@ -499,7 +519,7 @@ def _active_skills(battle):
 
 
 def _apply_hp_updates(updates):
-    """按 catchTime 把 2505/回合包里的 hp/maxHp 写回 _BATTLE 的 my/other 与双方队伍."""
+    """按 catchTime 把 2505/回合包里的 hp/maxHp 写回 _b() 的 my/other 与双方队伍."""
     if not updates:
         return
     by_ct = {u["catchTime"]: u for u in updates}
@@ -514,11 +534,11 @@ def _apply_hp_updates(updates):
             # 同步大写 maxHP, 供前端血条读取 (前端读 p.maxHP)
             entry["maxHP"] = u["maxHp"]
 
-    upd(_BATTLE.get("my"))
-    upd(_BATTLE.get("other"))
-    for p in _BATTLE.get("myTeam", []):
+    upd(_b().get("my"))
+    upd(_b().get("other"))
+    for p in _b().get("myTeam", []):
         upd(p)
-    for p in _BATTLE.get("otherTeam", []):
+    for p in _b().get("otherTeam", []):
         upd(p)
 
 
@@ -538,9 +558,9 @@ def _apply_attack_hp(blocks, me_id):
         if remain is None or mh is None:
             continue
         if uid == me_id:
-            tgt = _BATTLE.get("my")
+            tgt = _b().get("my")
         else:
-            tgt = _BATTLE.get("other")
+            tgt = _b().get("other")
         if tgt is not None:
             tgt["hp"] = remain
             tgt["maxHp"] = mh
@@ -551,11 +571,11 @@ def _apply_skill_pp(blocks, me_id):
     """把 2505 AttackValue.skillList 的 [技能id, 当前pp] 同步为当前精灵的剩余 PP 表.
 
     AttackValue.skillList 的第二个元素是服务器下发的**技能当前剩余 PP**
-    (实测: 用过的技能 PP 递减, 未用则为满). 这里按 userID 存到 _BATTLE 的
+    (实测: 用过的技能 PP 递减, 未用则为满). 这里按 userID 存到 _b() 的
     mySkillPP / otherSkillPP (dict: {sid: 当前pp}), 前端据此同步显示 PP.
     """
     for key in ("mySkillPP", "otherSkillPP"):
-        _BATTLE[key] = {}
+        _b()[key] = {}
     if not blocks:
         return
     for bk in blocks:
@@ -565,20 +585,20 @@ def _apply_skill_pp(blocks, me_id):
         for sid, pp in sl:
             pp_map[str(sid)] = pp
         if uid == me_id:
-            _BATTLE["mySkillPP"] = pp_map
+            _b()["mySkillPP"] = pp_map
         else:
-            _BATTLE["otherSkillPP"] = pp_map
+            _b()["otherSkillPP"] = pp_map
 
 
 def _report(msg, clear=False, limit=500):
-    """往 _BATTLE.report 追加一条战报; clear=True 时先清空."""
+    """往 _b()(当前账号对战状态).report 追加一条战报; clear=True 时先清空."""
     import time as _t
     with _LOCK:
         if clear:
-            _BATTLE["report"] = []
-        _BATTLE["report"].append({"t": _t.strftime("%H:%M:%S"), "msg": msg})
-        if len(_BATTLE["report"]) > limit:
-            _BATTLE["report"] = _BATTLE["report"][-limit:]
+            _b()["report"] = []
+        _b()["report"].append({"t": _t.strftime("%H:%M:%S"), "msg": msg})
+        if len(_b()["report"]) > limit:
+            _b()["report"] = _b()["report"][-limit:]
 
 
 def _capture_battle(cmd, body_hex, direction="RECV"):
@@ -705,7 +725,7 @@ def load_creds():
 
 
 def save_creds(account, password):
-    """登录成功后保存 (或更新) 一对账号密码, 按账号去重. 返回当前列表."""
+    """登录成功后保存 (或更新) 一组登录凭据, 同名账号仅保留一条. 返回当前列表."""
     accounts = load_creds()
     # 去掉同账号的旧记录
     accounts = [a for a in accounts if a.get("account") != account]
@@ -918,7 +938,7 @@ def run_login(account, password, host, port, session=None):
                 with _LOCK_RECV:
                     _RECV_SEQ[c] = _RECV_SEQ.get(c, 0) + 1
                     _RECV_LATEST[c] = body
-                # 对战包: 更新 _BATTLE 状态 (2503 队伍 / 2504 当前出战)
+                # 对战包: 更新 _b() 状态 (2503 队伍 / 2504 当前出战)
                 if c in (2503, 2504, 2404, 2407, 2505, 2406, 2409, 2506, 2405, 2394, 2410, 2507, 2508):
                     # 解密后的完整包体落盘(不截断), 供解码 2505 等真实字节布局
                     try:
@@ -932,10 +952,10 @@ def run_login(account, password, host, port, session=None):
                     # 收到对战就绪(2503) -> 自动发送 READY_TO_FIGHT(2404) 请求正式开战 (每个对战只发一次)
                     if c == 2503:
                         try:
-                            mode_now = _BATTLE.get("mode")
-                            if _BATTLE.get("_ready_sent_mode") != mode_now:
+                            mode_now = _b().get("mode")
+                            if _b().get("_ready_sent_mode") != mode_now:
                                 global_client.send_game_packet(2404, "")
-                                _BATTLE["_ready_sent_mode"] = mode_now
+                                _b()["_ready_sent_mode"] = mode_now
                                 _report("> 自动发送 READY_TO_FIGHT(2404) 请求正式开战")
                                 log("info", "[对战] 收到2503, 已自动发送 2404 READY_TO_FIGHT")
                         except Exception as e2:
@@ -1129,7 +1149,7 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/battle":
             # 对战页: 当前对战状态 (双方当前精灵/队伍/可用技能)
             with _LOCK:
-                b = dict(_BATTLE)
+                b = dict(_b())
             b["client_present"] = _STATE.get("client") is not None
             self._send(200, "application/json", json.dumps(b, ensure_ascii=False).encode("utf-8"))
         elif path.startswith("/api/pet-info"):
@@ -1248,8 +1268,7 @@ class Handler(BaseHTTPRequestHandler):
             data = self._json_body()
         except Exception as e:
             return self._send_json({"ok": False, "error": f"JSON 解析失败: {e}"}, 400)
-        # 本函数多处会读写模块级 _BATTLE(对战状态), 声明为 global 以免被当作局部变量.
-        global _BATTLE
+        # 对战状态经 _b()(线程局部) 读写, 无需 global; _STATE 仍在 _LOCK 下访问.
 
         if path == "/api/login":
             account = str(data.get("account", "")).strip()
@@ -1269,7 +1288,7 @@ class Handler(BaseHTTPRequestHandler):
 
         elif path == "/api/disconnect":
             with _LOCK:
-                cli = _STATE["client"]
+                cli = _ctx_client()
                 _STATE["client"] = None
                 _STATE["conn"] = ""
                 _STATE["detail"] = "已断开"
@@ -1281,6 +1300,7 @@ class Handler(BaseHTTPRequestHandler):
                     pass
             log("info", "已断开当前连接")
             return self._send_json({"ok": True})
+
 
         elif path == "/api/credentials/delete":
             with _COND:
@@ -1296,7 +1316,7 @@ class Handler(BaseHTTPRequestHandler):
 
         elif path == "/api/send":
             with _LOCK:
-                cli = _STATE["client"]
+                cli = _ctx_client()
             if cli is None:
                 return self._send_json({"ok": False, "error": "尚未登录, 无法发包"}, 400)
             try:
@@ -1332,7 +1352,7 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/send-recv":
             # 脚本库用: 发送 SEND 包并等待该命令的 RECV 应答, 返回完整包体(hex) + 十进制 ints.
             with _LOCK:
-                cli = _STATE["client"]
+                cli = _ctx_client()
             if cli is None:
                 return self._send_json({"ok": False, "error": "尚未登录, 无法发包"}, 400)
             try:
@@ -1374,7 +1394,7 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/teams/fetch":
             # 拉取阵容列表: 发 41921 [0], 由监听线程解析进 _TEAMS
             with _LOCK:
-                cli = _STATE["client"]
+                cli = _ctx_client()
             if cli is None:
                 return self._send_json({"ok": False, "error": "尚未登录"}, 400)
             try:
@@ -1388,7 +1408,7 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/teams/switch":
             # 切换阵容: 发 41922 [2, 阵容id]
             with _LOCK:
-                cli = _STATE["client"]
+                cli = _ctx_client()
             if cli is None:
                 return self._send_json({"ok": False, "error": "尚未登录"}, 400)
             try:
@@ -1409,7 +1429,7 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/pets/store":
             # 入库: 发 PET_RELEASE(2304) [catchTime, posIndex] (0=第一背包->仓库, 3=第二背包->仓库)
             with _LOCK:
-                cli = _STATE["client"]
+                cli = _ctx_client()
             if cli is None:
                 return self._send_json({"ok": False, "error": "尚未登录"}, 400)
             try:
@@ -1432,7 +1452,7 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/pets/default":
             # 设为首发: 发 PET_DEFAULT(2308) [catchTime]
             with _LOCK:
-                cli = _STATE["client"]
+                cli = _ctx_client()
             if cli is None:
                 return self._send_json({"ok": False, "error": "尚未登录"}, 400)
             try:
@@ -1452,7 +1472,7 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/storage/fetch":
             # 拉取仓库列表: 发 2303 GET_PET_LIST 分页 (0-6000, 每1000一页), 由监听线程解析进 _STORAGE
             with _LOCK:
-                cli = _STATE["client"]
+                cli = _ctx_client()
             if cli is None:
                 return self._send_json({"ok": False, "error": "尚未登录"}, 400)
             try:
@@ -1469,7 +1489,7 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/exe/fetch":
             # 拉取精英(爱宠)仓库: 发 2361 GET_LOVE_PET_LIST, 由监听线程解析进 _EXE
             with _LOCK:
-                cli = _STATE["client"]
+                cli = _ctx_client()
             if cli is None:
                 return self._send_json({"ok": False, "error": "尚未登录"}, 400)
             try:
@@ -1484,7 +1504,7 @@ class Handler(BaseHTTPRequestHandler):
             # 拉取单只精灵完整信息: 发 2301 GET_PET_INFO [catchTime], 监听线程缓存进 _PET_INFO.
             # 已缓存则跳过, 避免重复拉取 (养成信息缓存).
             with _LOCK:
-                cli = _STATE["client"]
+                cli = _ctx_client()
             if cli is None:
                 return self._send_json({"ok": False, "error": "尚未登录"}, 400)
             try:
@@ -1503,7 +1523,7 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/pets/warehouse-swap":
             # 仓库精灵 <-> 背包精灵 互换: 先退背包精灵入库, 再把仓库精灵取出到该背包
             with _LOCK:
-                cli = _STATE["client"]
+                cli = _ctx_client()
             if cli is None:
                 return self._send_json({"ok": False, "error": "尚未登录"}, 400)
             try:
@@ -1528,7 +1548,7 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/pets/swap":
             # 切换两只精灵位置: 发 41462 [sortIndex1, catchTime1, sortIndex2, catchTime2]
             with _LOCK:
-                cli = _STATE["client"]
+                cli = _ctx_client()
             if cli is None:
                 return self._send_json({"ok": False, "error": "尚未登录"}, 400)
             try:
@@ -1552,7 +1572,7 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/pets/move":
             # 拖到另一背包空位 => 直接移动: 仓库->背包 用2304(取仓库到背包); 背包->另一背包 用41462(目标空位catchTime=0)
             with _LOCK:
-                cli = _STATE["client"]
+                cli = _ctx_client()
             if cli is None:
                 return self._send_json({"ok": False, "error": "尚未登录"}, 400)
             try:
@@ -1629,7 +1649,7 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/battle/send":
             # 对战页发包: {cmd, body, encode} (命令号可为任意对战命令, 用当前连接发送)
             with _LOCK:
-                cli = _STATE["client"]
+                cli = _ctx_client()
             if cli is None:
                 return self._send_json({"ok": False, "error": "尚未登录, 无法发包"}, 400)
             try:
@@ -1657,15 +1677,15 @@ class Handler(BaseHTTPRequestHandler):
             # 发起对战: 输入"带cmdid的完整HEX包", 从包头提取命令号+包体, 重建(decode)后经当前连接发送.
             # 支持任意对战命令号 (不止 41129); uid/序列号会用当前账号重算.
             with _LOCK:
-                cli = _STATE["client"]
+                cli = _ctx_client()
             if cli is None:
                 return self._send_json({"ok": False, "error": "尚未登录, 无法发包"}, 400)
             # 发起对战即视为"新一场对战开始": 清掉上一场遗留的结束标记与最后回合数据.
             # 否则脚本端(PySeer.Battle)在等待本场 2503 期间, 会把它误判成"上一场结束包"
             # (二次运行会因此抛"对战未能正常进入(收到了结束包)")。
             with _LOCK:
-                _BATTLE["finished"] = False
-                _BATTLE["lastSkill"] = None
+                _b()["finished"] = False
+                _b()["lastSkill"] = None
             try:
                 hexs = "".join(ch for ch in str(data.get("hex", "")) if ch in "0123456789abcdefABCDEF")
                 raw = bytes.fromhex(hexs)
@@ -1683,11 +1703,11 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/battle/clear":
             # 清空对战状态
             with _LOCK:
-                _BATTLE.update({"active": False, "finished": False, "mode": 0, "my": None, "other": None,
+                _b().update({"active": False, "finished": False, "mode": 0, "my": None, "other": None,
                                 "myTeam": [], "otherTeam": [], "mySkills": [],
                                 "mySkillPP": {}, "otherSkillPP": {}, "myId": None, "lastCmd": None,
                                 "lastSkill": None})
-                _BATTLE["version"] += 1
+                _b()["version"] += 1
             return self._send_json({"ok": True})
 
         elif path == "/api/battle/action":
@@ -1704,7 +1724,7 @@ class Handler(BaseHTTPRequestHandler):
             # 参数: {id: 物种id} 由后端从当前对战阵容(myTeam)里查一只可用该id精灵并取它的 catchTime;
             #       也可直接 {catchTime: 目标精灵catchTime}. 两者取其一.
             with _LOCK:
-                cli = _STATE["client"]
+                cli = _ctx_client()
             if cli is None:
                 return self._send_json({"ok": False, "error": "尚未登录, 无法发包"}, 400)
             try:
@@ -1713,8 +1733,8 @@ class Handler(BaseHTTPRequestHandler):
                 if sid is not None:
                     # 从"当前对战阵容"myTeam 里找一只该物种id的可用精灵(排除已在场上的当前精灵)
                     sid = int(sid)
-                    my_team = _BATTLE.get("myTeam") or []
-                    cur_ct = (_BATTLE.get("my") or {}).get("catchTime")
+                    my_team = _b().get("myTeam") or []
+                    cur_ct = (_b().get("my") or {}).get("catchTime")
                     cands = [p for p in my_team
                              if p.get("id") == sid and p.get("catchTime")
                              and p.get("catchTime") != cur_ct]
@@ -1741,9 +1761,9 @@ class Handler(BaseHTTPRequestHandler):
 
         elif path == "/api/battle/wait":
             # 脚本库对战体用: 阻塞等待"对战状态变化" (version 递增 或 对战结束).
-            # 返回最新 _BATTLE 快照; changed=False 表示超时(该时段无新对战事件).
+            # 返回最新 _b() 快照; changed=False 表示超时(该时段无新对战事件).
             with _LOCK:
-                cli = _STATE["client"]
+                cli = _ctx_client()
             if cli is None:
                 return self._send_json({"ok": False, "error": "尚未登录"}, 400)
             try:
@@ -1753,9 +1773,9 @@ class Handler(BaseHTTPRequestHandler):
                 ver, fin, b, changed = 0, False, {}, False
                 while time.time() < deadline:
                     with _LOCK:
-                        ver = _BATTLE.get("version", 0)
-                        fin = _BATTLE.get("finished", False)
-                        b = dict(_BATTLE)
+                        ver = _b().get("version", 0)
+                        fin = _b().get("finished", False)
+                        b = dict(_b())
                     if ver > from_version or fin:
                         changed = True
                         break
@@ -2418,6 +2438,7 @@ scriptStopBtn.onclick=async()=>{
 };
 document.getElementById('scriptClearBtn').onclick=()=>{ scriptOutEl.innerHTML=''; };
 loadScripts();   // 预加载脚本列表 (登录后可立即看到)
+
 
 // ---- 对战页: 轮询 /api/battle, 图形化双方头像/血量/参数 + 技能/操作按钮 + 发起HEX包 ----
 // 自动切换: 后台一监听到对战行为(2503 开始), 就自动切到"对战"界面并开始监听展示对战流程.
@@ -3399,6 +3420,19 @@ def main():
         print("\n正在退出...")
     finally:
         save_logs("shutdown")
+
+
+# ---- 可选扩展件: 若本地存在 app/multi.py, 其 install(globals(), Handler) 可为本后端注入额外能力.
+# 缺省时后端行为不变.
+if os.path.isfile(os.path.join(_SRC_DIR, "multi.py")):
+    try:
+        import multi
+        multi.install(globals(), Handler)
+    except Exception as _e:
+        try:
+            log("warn", f"扩展件加载失败(不影响原有行为): {_e}")
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":
