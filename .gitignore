@@ -19,6 +19,10 @@
 !app/cmdmap.json
 !app/requirements.txt
 
+# ---- 忽略：用户脚本目录 (不入库; 即 WebUI "脚本"页的本地脚本目录) ----
+app/scripts/
+app/scripts/**
+
 # ---- 文档 ----
 !docs/
 !docs/**

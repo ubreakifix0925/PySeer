@@ -14,16 +14,42 @@
 
 ## 快速开始
 
-**未下载项目**（一条命令自动下载 + 装 Python + 启动）：
+前置：Python 3.8+。
+
+### 未下载项目
+
+**Linux / macOS**
 
 ```bash
 bash <(curl -fsSL https://raw.githubusercontent.com/ubreakifix0925/PySeer/main/deploy.sh)
 ```
 
-**已下载项目**：
+**Windows（PowerShell，需 Git）**
+
+```powershell
+git clone https://github.com/ubreakifix0925/PySeer.git
+cd PySeer
+python app\webui.py --port 8680
+```
+
+### 已下载项目
+
+**Linux / macOS**
 
 ```bash
-./start.sh                # http://127.0.0.1:8680/
+./start.sh
+```
+
+**Windows（PowerShell）**
+
+```powershell
+python app\webui.py --port 8680
+```
+
+**Windows（Git Bash / WSL）**
+
+```bash
+bash start.sh
 ```
 
 启动后打开 `http://127.0.0.1:8680/` 并登录。
@@ -32,7 +58,7 @@ bash <(curl -fsSL https://raw.githubusercontent.com/ubreakifix0925/PySeer/main/d
 
 ### WebUI 控制台
 
-登录 → 实时日志/响应表 → 精灵详情/背包管理 → 脚本运行 → 对战页（后台检测到对战即自动打开）。
+登录 → 实时日志/响应表 → 精灵详情/背包管理 → 脚本运行（脚本放本地 `app/scripts/`，不入库）→ 对战页（后台检测到对战即自动打开）。
 
 ### 第三方库 PySeer
 
@@ -59,18 +85,32 @@ while not battle.finished:
 ## 目录结构
 
 ```
-app/                # 程序文件
-├── webui.py        # WebUI 控制台
-├── PySeer.py       # 第三方库 (Seer/Battle)
-├── seerlib.py      # PySeer 旧名兼容别名
+app/                    # 程序文件
+├── webui.py            # WebUI 控制台
+├── PySeer.py           # 第三方库 (Seer/Battle)
+├── seerlib.py          # PySeer 旧名兼容别名
 ├── assets_updater.py   # 自更新游戏数据管线
-├── login_test.py   # 登录协议自检
-├── cmdmap.json     # 命令 id -> 命令名
-└── seer/           # 协议客户端包 (后端)
-docs/               # 文档
-data/  refs/  cache/  vendor/  webui_logs/   # 运行时资源(部分 git 忽略)
-start.sh            # 本地一键启动
-deploy.sh           # 从零一键部署
+├── login_test.py       # 登录协议自检
+├── mock_server.py      # 模拟网关
+├── cmdmap.json         # 命令 id -> 命令名
+├── requirements.txt
+└── seer/               # 协议客户端包 (后端)
+    ├── algorithm.py    # MD5/加解密/序列号
+    ├── body.py         # 包体打包/拆分
+    ├── packet.py       # 封包构建/解析
+    ├── session.py      # 淘米认证
+    ├── client.py       # SeerClient 连接/登录/心跳
+    ├── ws_client.py    # WebSocket 客户端
+    ├── tcp_client.py   # 游戏服务器裸 TCP 客户端
+    ├── petinfo.py      # 精灵信息解析
+    ├── fightinfo.py    # 对战包解析
+    └── misc.py
+docs/                   # 文档
+├── PySeer.md           # 第三方库 API
+├── REPRODUCTION.md     # 协议复现
+└── DEVELOPMENT.md     # 开发成果
+start.sh                # 本地一键启动
+deploy.sh               # 从零一键部署
 ```
 
 ## 文档
