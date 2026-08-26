@@ -210,15 +210,67 @@ deltaTopLv i32, deltaTopHonour u32, maxH u32, totalH u32, roundNum u32.
 - 兜底：若无 `winnerID`（极旧/异常包），可退化为用本场最后一次 2505 的 HP 推
   （敌方HP==0 且我>0 → 我方胜利；我==0 且敌>0 → 我败；双双0 → 同归于尽）。
 
-### 5.5 已确认的其它战斗命令
+### 5.5 换宠 2407 CHANGE_PET（已完整解出）
+
+**客户端→服务器**：`SocketConnection.send(2407, 目标精灵catchTime)` —— 包体 = 目标精灵
+catchTime 的 **int32 大端（4B）**。反编译 `PlayerModel.changePet` / `setAutoChangePet`
+确认：客户端就发这一个 int；被换下的精灵由服务器按"存活/自动换宠"规则决定。
+WebUI 的「换宠」按钮会弹出我方出战队伍选择器，选好后发 `2407 + catchTime`
+（`/api/battle/change-pet`）。
+
+**服务器→客户端**：应答携带 `ChangePetInfo` —— **新入场（换上场）精灵的完整状态**，
+结构与 `FightPetInfo` 相近但无 `catchType`。读取顺序（`parse_change_pet_info`，已验证
+可精确消费到包体末尾）：
+
+```
+userID, petID, catchTime, petName(16B), level, hp, maxHp,
+[skillList: count + (id,pp)×count],
+resistance(56B), skinId,
+[changehps: count + {id,hp,maxhp,lock,chujueNumber,chujueRound}×count + MarkBuffInfo each],
+xinHp, xinMaxHp, isChangeFace,
+[skillRunawayMarks: count + u32×count],
+holyAndEvilThoughts, yearVip2022_shengjian, yearVip2022_chujue,
+laborDay2022_yinji, suli2022, mulian2022,
+siteBuff(u16+u8), bothSiteBuff(u16+u8), markBuff(u8 cnt + (u16,u8)×cnt),
+[signInfo: count + FightSignInfo(8B)×count],
+lockedSkillArr(5×u32), commonChangeFaceValue.
+```
+
+- **`userID==0`** → 敌方 NPC 换宠（存 `NpcChangePetData`，随后在下一回合结算时应用）；
+- **`userID==我方账号`** → 我方换宠，立即应用（`_loc3_.changePet`）；
+- **其它 userID**（敌方玩家）→ 存入 `changePetData`，在 `onUseSkill` 时延迟到回合内应用。
+- 换宠后当前精灵的 `catchTime/skillList/level/hp` 都会更新，WebUI 会同步 `_BATTLE` 的
+  `my/other` 与该精灵在队伍里的记录，并刷新可用技能栏。
+
+### 5.6 已确认的其它战斗命令
 | cmd | 含义 | 解析 |
 |---|---|---|
 | 2404 | 准备就绪 | 空包体；服务器回 2503 后客户端应自动发一条，否则不出回合 |
-| 2405 | 使用技能 | —— |
+| 2405 | 使用技能 | 包体 = 技能id(int32) |
 | 2406 | 用道具 | `UsePetItemInfo`：userID/itemID/userHP/changeHp/round |
-| 2407 | 换宠 | `ChangePetInfo`（结构与 FightPetInfo 相近） |
+| 2407 | 换宠 | `ChangePetInfo`（见 5.5）；请求发 `catchTime` |
 | 2409 | 捕捉 | `CatchPetInfo`：catchTime + petID |
-| 2410 | 逃跑 | —— |
+| 2410 | 逃跑 | 空包体 |
+
+### 5.7 脚本级对战体（`seerlib.Battle`）
+
+`seerlib.py` 的 **`Battle`** 是对**整场对战**的脚本驱动封装：以“带 `cmdid` 的完整 HEX 包”进入对战，
+构造时**自动等待对战成功发起**（等 `active`＋双方当前精灵，且该状态连续稳定一段时间无回退才返回，
+防止只收到 2503 队伍或瞬态就误判；后端本就在对战则直接返回），无法进入则抛 `SeerError`；随后按**操作即
+回合**推进——每个会消耗
+回合的操作（`use_skill`/`use_item`/`capture`/`escape`）在发包后都会**自动等待本回合结算(2505)** 并返回，
+因此脚本**无需手动等回合**；只有**死亡切换** `change_pet` 不消耗回合（换上新精灵后可在同一回合继续出招）。
+每回合可读当前回合数据（`round` = 2505 `parse_note_use_skill` 结果）、当前出战（`my`/`other`），
+收到**结束包 2506** 后 `finished` 置 `True` 自动终止。
+它在后端之上新增两个接口：
+
+- `_BATTLE` 增加 **`finished`**（2506→True；新一轮 2503/清空时复位），并进入新回合时清掉 `lastSkill`。
+- **`POST /api/battle/wait`**（`{version,timeout}`）长轮询：阻塞到 `_BATTLE.version` 递增或 `finished`，
+  返回最新快照。`version` 每处理一个对战包递增一次，因此 `Battle.wait()` 能以“下一个事件”为步长推进。
+
+> 对战命令包语义为**回合制**：客户端发 `2405/2407/…` 后，服务端以 `2505`（回合结果）推进，
+> 若干次后以 `2506`（`FightOverInfo`，见 5.4）结束；`Battle` 正是对这一套“发→等→判→再发”的封装，
+> 并把这些“等待”自动收进每个操作里，让脚本只写判断逻辑。
 
 ---
 

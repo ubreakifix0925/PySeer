@@ -124,19 +124,23 @@ spd support transform type vip is_fly is_ride
 
 ### 对战页（第四个页签“对战”）
 - **图形化对战**：轮询 `/api/battle`，图形化显示**我方/敌方**当前出战精灵的头像（`data/head/<id>.png`）、血条(`hp/maxHP`)、等级、以及各自**出场队伍**（2503）的精灵缩略图。
-- **技能/操作按钮**：下方一排技能按钮（来自我方当前出战精灵的 `skills`），点击即发 **2405 USE_SKILL**；另有 换宠(2407)/用药(2406)/逃跑(2410)/捕捉(2409) 操作按钮。
+- **技能/操作按钮**：下方一排技能按钮（来自我方当前出战精灵的 `skills`），点击即发 **2405 USE_SKILL**（包体=技能id）；另有 换宠(2407)/用药(2406)/逃跑(2410)/捕捉(2409) 操作按钮。**换宠**会弹出我方出战队伍选择器，选好后发 `2407 + 目标catchTime`（int32），不用再手填空包体。
 - **实时更新**：后台 `on_frame` 解析 **2503 NOTE_READY_TO_FIGHT**（`NoteReadyToFightInfo`，双方队伍+血量+技能）与 **2504 NOTE_START_FIGHT**（`FightStartInfo`，开场当前出战精灵画像）填充 `_BATTLE`，前端每 800ms 轮询刷新。
+- **自动切换（检测到对战即打开）**：后台 `on_frame` 监听到**对战开始（2503 出场队伍）**且此前不在对战中时，推送一条 **`level='battle'`** 的日志事件；前端 SSE 收到后立即 `refreshBattle()`，若 `/api/battle` 显示 `active && !finished` 就**自动切到“对战”页签**并开始监听展示整场对战流程。前端另每 800ms 轮询 `/api/battle`（若对战已在进行——如非本页发起的对战——也会自动切过去）。**“对战”标签上会亮起绿色圆点**表示对战进行中；对战结束(2506)或清空后复位，下一场对战可再次自动切换。这样脚本/后台一旦打起对战，界面会自动弹到对战页并实时显示；已进行的对战不会强制拉回你当前页签（只对“新一场对战开始”自动切）。
 - **发起对战**：输入**带 cmdid 的完整 HEX 包**（支持任意对战命令号，如 41129 之外的命令），`/api/battle/hex` 从包头提取命令号+包体，按当前账号重建 uid/序列号并加密封包发送。
 - 解析器：`seer/fightinfo.py`（`parse_note_ready_to_fight`/`parse_fight_start_info`/`parse_change_pet_info`/`parse_fight_sign` 等）。**2504 `FightPetInfo` 已完整解析**（含 `FightSignInfo`=8B：`id(16b)|lvNum(8b)|roundNum(8b)` + `spValue`(u32)，以及 `lockedSkillArr`），因此 2504 能解出**双方**当前出战精灵。
-- **逐回合刷新**：后台 `on_frame` 处理——**2505 NOTE_USE_SKILL**（实测确认前导 `[userID][skillID][round][actorCatchTime]`，血量记录为 `[catchTime][type][1][val][0][0][hp][maxHp]` 的 32B 记录，`hp=0` 表示阵亡）会**按 catchTime 逐回合刷新**双方当前精灵与双方队伍的 HP（`extract_pet_hp_updates` 兼容相邻三段式/32B 两种布局 / `_apply_hp_updates`）；**2407 CHANGE_PET** 按 `ChangePetInfo` 更新对应一方；2406 用道具、2409 捕捉会解析并写日志。2505 中间的伤害/经验等字段布局仍待 `com.robot.app.fight.FightManager` 类，未解。
+- **逐回合刷新**：后台 `on_frame` 处理——**2505 NOTE_USE_SKILL**（精确解出双方 `AttackValue`，见「双方技能识别」）会**按 catchTime 逐回合刷新**双方当前精灵与双方队伍的 HP（`extract_pet_hp_updates` 兼容相邻三段式/32B 两种布局 / `_apply_hp_updates`）；**2407 CHANGE_PET** 按 `ChangePetInfo`（新入场精灵完整状态）更新对应一方当前精灵与其在队伍的记录，并刷新可用技能栏；2406 用道具、2409 捕捉会解析并写日志。
+- **换宠闭环**：客户端**发** `2407 CHANGE_PET`，包体 = 目标精灵 catchTime（int32 大端，`/api/battle/change-pet`）；**收** 2407 应答即 `ChangePetInfo`（新上场精灵），`parse_change_pet_info` 依 `refs/fightinfo/ChangePetInfo.as` 逐字段解（已验证精确消费到末尾）。`userID==0`→敌方NPC换宠（存 `NpcChangePetData` 延迟应用）；其余→存 `changePetData` 在 `onUseSkill` 回合内应用。**强制换宠**：当**我方当前精灵阵亡**（`my.hp<=0`，兼容 `xinHp`）且**我方队伍里仍有存活替补**时，对战页自动弹出换宠选择器（`_isForcedChange`），并**禁用技能与除换宠外的操作按钮**（`_setBattleOpsLocked`，技能按其 `data-ppzero` 额外禁用），直到选一只替换（2407）后强制态解除、按钮恢复；换宠选择器统一读 `_petHp(p)`（`hp` 或 `xinHp` 回退）判定存活。
 - **双方技能识别（敌我，已依 AttackValue.as 完整解出）**：一个 **2505 = 一整回合 = `UseSkillInfo`**，内含 `firstAttackInfo` + `secondAttackInfo` 两个 **AttackValue**，首尾相接（我方块最前、敌方块随后）。`parse_attack_value()` 按 `refs/attack/AttackValue.as` 逐字段解（并对每个实战包**逐字节验证精确消耗到末尾**）：`userID, skillID, (2×丢弃), effectName, atkTimes, lostHP(伤害), realHurtHp, gainHP(回血), remainHP(结算后HP), maxHp, state, petStatus, [skillList], isCrit, status(u8数组), specailArr, sideEffects(PetStatusEffectInfo列表), battle_lv/change_bitset/priority, immunizationStates, changehps, requireSwitchCthTime, maxHpSelf, maxHpOther, secretLaw, skillRunawayMarks, siteBuff/bothSiteBuff/markBuff, signInfo, lockedSkillArr(5), skillResult, zhuijiId, zhuijiHurt`。**`remainHP/maxHp` = 双方施法精灵结算后权威血量**（斩杀回合敌方 remainHP==0），`lostHP`=本技能造成伤害，`isCrit`=暴击。敌块 `userID==0`，斩妖回合敌块为空块（全0，`extract_attack_blocks()` 已跳过）。实测敌方(`uid=0`)技能：**10995 旋灭裂空阵(圣灵·135，伤害40-343)**、**20500 圣光气(普通·0·必中，回复/属性类，伤害0)**；我方 `37381 星光·浪打千击(水·30·必中，每回合暴击，伤害1269-3301)`。`specailArr` 语义索引：`[5..9]`状态、`[10]`追击败、`[11]`lostHP、`[14]`reSetAliveNum、`[26]`变身标志。
-- **战报记录**：`_BATTLE.report` 按时间记录整场对战——`对战开始(mode/双方队伍)`→`开场双方当前`→逐回合 `回合 用户X 使用技能 **技能名[技能id]** + 伤害/回血/剩余HP/暴击`、`换宠`、`用道具`、`捕捉`→`对战结束`；`/api/battle` 返回 `report`，对战页底部「战报记录」整栏**从上到下(时间正序)** 实时展示（新增在底部，仅当用户停在底部时才跟随滚动；可清空/复制）。**点击技能等操作会先通过 `/api/battle/action` 记入 `> 点击发送…`**。**每场结束(2506)会把本场所有完整(解密后)包体写入 `webui_logs/battle_<时间>.log`**，供研究分析；历史包体另持续追加到 `webui_logs/battle_capture.log`。每回合伤害/血量变化以**精灵名 + 实际掉血/回血量**呈现（替身原先调试用的 `HP变化 catch=<id>` 输出）：如 `[我方] 星光·鲁斯王(id=4648) 掉血 70 → 923/993`、`[敌方] 谱尼(id=300) 掉血 2755 → 2245/5000`，掉血/回血按上回合结束时血量与本回合结算后血量之差计算；阵亡标注 `⚠️阵亡`。
+- **战报记录（精简）**：`_BATTLE.report` 按时间记录整场对战，只保留三类信息——`对战开始(mode/双方数量)`、`开场双方当前精灵`、**每回合约一条** `回合 N [我方/敌方] 名字(id) 使用技能 技能名[技能id] 剩余HP h/m [暴击] [⚠️阵亡]`（由 2505 的 `AttackValue.remainHP/maxHp` 权威血量驱动，`换宠` 也会记录一条）→`对战结束 —— 结果: 胜/负`；不再打印逐精灵的掉血/回血明细、道具/捕捉细节、结束包原始字段等。`/api/battle` 返回 `report`，对战页底部「战报记录」整栏**从上到下(时间正序)** 实时展示（仅当用户停在底部时才跟随滚动；可清空/复制）。**点击技能等操作会先通过 `/api/battle/action` 记入 `> 点击发送…`**。**每场结束(2506)仍会把本场所有完整(解密后)包体写入 `webui_logs/battle_<时间>.log`** 供研究，历史包体另持续追加到 `webui_logs/battle_capture.log`——这两份日志**不**随战报精简，仍保留完整细节。
 - **对战结束结果**：**2506 FIGHT_OVER**（`FightOverInfo`）经 `parse_fight_over()` 按 `refs/attack/FightOverInfo.as` 解（包体57B 恰好消费完）：`type(u8), reason(u32), **winnerID(u32)**, isCanSave(u32), twoTimes/threeTimes/autoFightTimes/btlDetectTimes/energyTimes/learnTimes(各u32), deltaTopLv(i32), deltaTopHonour(u32), maxH(u32), totalH(u32), roundNum(u32)`。**`winnerID` = 胜者账号**（我方账号→我方胜利；0→我败/未开打）——权威判定。实测战胜场 `winner==<账号>, reason=0`；取消场 `winner=0, reason=1`。战报输出 `对战结束 —— 结果: …` + 最终双方血量 + 结束包(winID/原因/回合数)。
 - 注：`refs/BattleFightManager.as` 是 **BattleRoyale（雪球大战/大逃杀）** 管理器（`BATTLEROYALE_*`/`RoyaleUserInfo`/道具伤害），`refs/FightManager.as` 是**发起对战**（fightWithPlayer/Npc/Boss、MIBAO_FIGHT、邀请）；两者均**不解析**精灵对战 2505 回合包，2505 的完整结构仍需 **`com.robot.app.fight.FightManager`**，其派发的**回合/结算类在 `com.robot.core.info.fightInfo.attack.*`**（如 `attack.FightOverInfo`，见 `FightManager.as` import）。**PetFightDLL** 是 `FightManager._petFightClass` 指向的**动态战斗引擎类**：`FightManager.setup()` 里写死 `_petFightClass = "PetFightDLL_201308"`（另有 `"PetFightDLL"` 一版，靠缓冲记录 939 切换，但当前固定 201308）；它由 `getDefinitionByName` 按**完全限定类名**实例化，`petFightClass` getter 只返回**短名**，其完整包路径为 `com.robot.app.fight.PetFightDLL_201308` / `com.robot.app.fight.PetFightDLL`（与 `com.robot.app.fight.FightManager` 同包）。**真正逐字段解 2505 回合结果的读者类就在这个 PetFightDLL 里**，本仓库未收录其源码。
 
 ---
 
 ## 5. 脚本库 `seerlib.py`（供赛尔号脚本用）
+
+> 📘 本部分的**完整 API / 用法 / 示例**另见专项文档 [docs/seerlib.md](./seerlib.md)。
 
 后端启动并登录后，脚本用本库即可让后端发/收包并取值（自包含，仅 stdlib `urllib`）。
 
@@ -160,6 +164,8 @@ print(pkt.ints, pkt.body, v)
 | `send(cmd, params)` | 发送 SEND 包（不等待响应） | `cmd`(id 或命令名如 `ENTER_MAP`)、`params`(参数列表) | 后端应答 dict |
 | `recv(cmd, params, timeout=8)` | 发送并**等待该命令的 RECV** | 同上 + 超时 | `Packet`(`body`=完整包体hex, `ints`=十进制, `raw`=bytes) |
 | `get_value(body, index)` | 从包体取第 `index` 个值（int32 大端） | `body`(Packet/hex/bytes)、`index` | int |
+| `get_recv_value(cmd, params, index, timeout=8)` | **一步"发包→等 RECV→取应答第 index 个值"**：等价 `get_value(recv(cmd,params), index)` | `cmd`、`params`(发送包体)、`index`(应答参数序号) | int |
+| `get_item_count(item_id, timeout=8)` | **获取指定物品 id 的数量**：发 `42399(MULTI_ITEM_LIST)` `[1,物品id]`，取应答包体(不含命令号)的**第 3 个参数**(索引2) | `item_id`(物品id) | int |
 | `set_bag(ids)` | 把背包**全部**切换为指定**物种id**列表，物理重排 12 格（前6=出战，后6=待命）；读背包+仓库+**精英背包**→全部存仓库(2304)→按列表从仓库/精英取回(2304)→设首发(2308)→摆正顺序(41462) | `ids`(物种id列表，≤12) | `{"ok":True,"target":ids}` |
 | `find_pet(ids)` | **查找**指定物种 id 是否存在及所在位置，在**背包(出战/待命)+仓库+精英背包**三类来源中搜索（精英背包=2361 GET_LOVE_PET_LIST） | `ids`(id 或 id 列表) | `{str(id):{"locations":[位置...],"count":n}}` |
 
@@ -172,6 +178,72 @@ print(pkt.ints, pkt.body, v)
 ### 后端配套
 - on_frame 记录每个命令最近 RECV：`_RECV_LATEST`/`_RECV_SEQ`（脚本库用于判断“新响应”）。
 - 新增 `/api/send-recv`：发包 → 等到该 cmd 出现**新的** RECV（序号变化）→ 返回完整包体 + ints。
+
+### 对战体（`Battle`）—— 脚本驱动整场对战
+
+`seerlib` 新增 **`Battle`（对战体）** 类，用于**脚本按回合推进一场对战**。它以
+**带 `cmdid` 的完整 HEX 包**作为对战输入（只须这一个包，无需事先知道命令号语义），
+随后进入回合循环：每回合可读取**当前回合数据**，也可执行**各种操作**（发包/用技能/
+换宠/用道具/逃跑…），甚至用任意复杂的 `if/else/while` 判断结构来驱动决策。
+收到**结束包（2506 FIGHT_OVER）** 后 `finished` 置 `True`，循环自动终止。
+
+```python
+from seerlib import Battle
+battle = Battle("带cmdid的完整HEX包")   # 发送对战包 + 自动进场; 无法进入时抛 SeerError
+while not battle.finished:
+    my, other = battle.my, battle.other  # 双方当前出战精灵
+    if my and (my.get('hp') or 0) <= 0:        # —— 任意复杂的判断结构 ——
+        battle.change_pet(battle.my_team[1]['catchTime'])  # 死亡切换, 不消耗回合
+        battle.use_skill(battle.skills[0])                  # 同一回合内继续出招
+    elif my and (my.get('hp') or 0) < 300:
+        battle.use_item(70001)                 # 用药回血(消耗一回合)
+    else:
+        battle.use_skill(battle.skills[0])     # 使用技能(消耗一回合)
+    rnd = battle.round                         # 本回合(2505)数据
+    print(rnd.get('first', {}).get('lostHP'))  # 例如读取本回合伤害
+```
+
+> **操作即回合**：每个会消耗回合的操作（`use_skill`/`use_item`/`capture`/`escape`）在发包后都会
+> **自动等待本回合结算(2505)** 并返回，所以脚本里**不用再写** `wait`/`wait_round`。只有**死亡切换**
+> `change_pet` 不消耗回合——它把新精灵换上并更新 `my`/`skills`，之后可在**同一个回合内**继续出招。
+
+它与 `Seer.send/recv` 的不同：`send/recv` 是**命令级**（发一条、等一条），`Battle` 是
+**对局级**的会话抽象，封装了“出战队伍(2503)→开场(2504)→逐回合(2505)→结束(2506)”的整套
+推进逻辑，并让脚本在回合间注入决策。
+
+| 成员 | 说明 |
+|---|---|
+| `Battle(hex, ...)` / `start(hex)` | 发送带 `cmdid` 的完整 HEX 包进入对战，并**充分等待对战成功发起**（等 `active`＋双方当前精灵，且该状态**连续稳定约 0.8s** 无回退才返回，防止只收到 2503 队伍或瞬态就误判）；无法进入时抛 `SeerError`；若后端本就在对战中则直接返回当前状态、不再重复发触发包 |
+| `wait(t)` | 低级原语：阻塞直到对战状态变化（`version` 递增）或结束；返回快照，超时返回 `None` |
+| `wait_active(t)` / `wait_round(t)` | 低级原语：等进场 / 等一回合结果(2505)（通常无需手动调用，action 已自动） |
+| `state` | 当前对战快照 `{active,finished,mode,my,other,myTeam,otherTeam,...}` |
+| `my` / `other` | 我方/敌方**当前出战精灵**（结束前/结束后都可读，结束后保留最后一帧） |
+| `my_team` / `other_team` | 双方出战队伍 |
+| `skills` | 我方当前可用技能 id 列表 |
+| `round` | **当前回合数据**：2505 `parse_note_use_skill` 结果（`first`/`second`/`hpUpdates`/…） |
+| `report` / `events` | 后端战报 / 本对象观察到的事件记录 |
+| `finished` | 是否已收到结束包（2506），对战体据此终止 |
+| `send(cmd, params)` / `send_hex(hex)` | 任意发包（命令名或命令号 / 原始 HEX 包），**不自动等回合** |
+| `use_skill(sid)` | 用技能(2405)，发包后**自动等本回合结算(2505)**，消耗一回合 |
+| `use_item(...)` / `capture(...)` | 用道具(2406)/捕捉(2409)，发包后**自动等本回合结算**，消耗一回合 |
+| `change_pet(id)` | **换宠**(2407)：传**物种 id**，后端从当前对战阵容(`myTeam`)查一只可用该 id 精灵取 `catchTime` 发包（也可 `change_pet(None, catchTime=…)` 直接指定）。然后**等到新精灵真正成为我方当前出战**(`my.catchTime` 变化，可能被后续 2505 覆盖 `lastCmd` 或对端换宠不更新 `my`，因此不等 `lastCmd==2407`)。`death=None` 自动判断——当前精灵阵亡→**死亡切换**(不消耗回合，换完可继续出招)；还活着→**主动切换**(消耗一回合，等 2505)；`death=True/False` 可强制 |
+| `escape()` | 逃跑(2410)，发包后**自动等对战结束(2506)** |
+| `act(msg)` | 把一条脚本动作记入后端战报（便于观察/回放） |
+| `run(decide, t)` | **自动驱动**整场对战直到结束包：循环调用 `decide(this)`（回调里写复杂判断并出招），每个动作自动等回合，收到 2506 返回 `True` |
+
+**后端配套**：`_BATTLE` 新增 `finished` 字段（收到 2506 置 True；新一轮 2503、`/api/battle/clear`、
+**`/api/battle/hex`（发起对战）** 都会复位为 False），并在
+进入新回合时清掉上一场 `lastSkill`（防止跨场误读当前回合）；新增 **`POST /api/battle/wait`**
+（参数 `{version, timeout}`）：**长轮询**阻塞到 `_BATTLE.version` 递增或 `finished`，返回最新快照，
+供脚本按“下一个事件”推进。`wait` 的 `version` 语义与 `_BATTLE.version`（每处理一个对战包递增）一致。
+
+> 关于“二次运行脚本即报错”：上一场对战结束后 `finished` 会留在 True，若新一场触发前未清除，
+> 脚本端等待本场 2503 时会把它误判成“收到结束包”。已通过 **发起对战(`/api/battle/hex`)时复位
+> `finished`** 以及 **`Battle._wait_entry` 在本场进入前忽略遗留 `finished`** 双重修复。
+
+> 说明：`use_item`/`capture`/`escape` 默认发送**空包体**（与 WebUI 页面按钮行为一致）；若需自定义
+> 包体请用通用 `send(cmd, params)`。对战命令号 `2405/2406/2407/2409/2410/2503/2504/2505/2506`
+> 见 `app/cmdmap.json` 与 `docs/REPRODUCTION.md`。
 
 ---
 
@@ -256,5 +328,6 @@ PYTHONPATH=vendor/unitypy python3 -m app.seerlib
 
 - 背包↔背包移动命令（仓库→背包用 2304 已确定；背包↔背包用 41462 目标空位 catchTime=0 为推断，需实测确认）。
 - 更立体的“技能/专属特性”富文本（`analyze` 中的颜色/图标标记）渲染。
-- 在 `seerlib.py` 基础上封装更高层 API（读背包、移动精灵、战斗…）。
+- 在 `seerlib.py` 基础上封装更高层 API：读背包（`set_bag`/`find_pet`）与**战斗**（`Battle` 对战体，
+  见上）已有；后续可再封装“自动练级/刷BOSS”等复合策略（需真实对战触发 HEX 包）。
 - `refs/monsters.json`/`refs/monsters.txt` 已基本被自解析取代，仅作参照。

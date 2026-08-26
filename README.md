@@ -11,7 +11,8 @@
 
 > 📘 **相关文档**：自更新游戏数据管线、精灵详情界面功能、协议逆向结论、脚本库 `seerlib.py`
 > 等成果详见 [docs/DEVELOPMENT.md](./docs/DEVELOPMENT.md)；给 AI / 二次开发者的**协议技术复现**
-> 速查见 [docs/REPRODUCTION.md](./docs/REPRODUCTION.md)。
+> 速查见 [docs/REPRODUCTION.md](./docs/REPRODUCTION.md)；**脚本库 `seerlib` 的完整 API/用法**
+> 见 [docs/seerlib.md](./docs/seerlib.md)。
 
 ---
 

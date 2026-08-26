@@ -19,10 +19,19 @@
     send(cmd, params)      -> 发送 SEND 包 (不等待响应), 返回后端应答 dict
     recv(cmd, params)      -> 发送 SEND 包并等待 RECV, 返回 Packet(body/ints/raw)
     get_value(body, index) -> 从包体取第 index 个值 (int32 大端)
+    get_recv_value(cmd, params, index) -> 发包并等 RECV, 直接取应答包体第 index 个值
 
 高阶: set_bag(ids) <-> 把背包全部切换为指定物种 id 列表 (物理重排, 会发真实游戏命令).
       find_pet(ids) <-> 查找指定物种 id 是否存在, 及所在位置(背包1/背包2/仓库/**精英背包**).
+      get_item_count(item_id) <-> 获取指定物品 id 的数量 (发 42399 [1,物品id], 取应答第 3 个参数).
     get_value(body, index) -> 从包体取第 index 个值 (int32 大端)
+
+对战体 (Battle): 以"带 cmdid 的完整 HEX 包"作为进入对战的输入(构造时自动发送并等待进场, 失败抛
+    SeerError), 然后**自动按回合推进**: 每个会消耗回合的操作(use_skill/use_item/capture/escape)
+    在发包后都会自动等待本回合结算(2505), 因此无需手动等回合; 只有**死亡切换** change_pet 不消耗
+    回合, 换上新精灵后可在同一回合内再执行一次操作. 期间可读取当前回合数据(round/my/other 等),
+    并用任意复杂的 if/else/循环判断结构驱动决策; 收到结束包(2506)后 finished 置 True, 循环自动终止.
+    详见 Battle 类.
 """
 
 from __future__ import annotations
@@ -30,6 +39,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time as _time
 import urllib.error
 import urllib.request
 
@@ -262,6 +272,35 @@ class Seer:
         """从包体取第 index 个值(int32 大端). body 可为 Packet/hex str/bytes."""
         return get_value(body, index)
 
+    def get_recv_value(self, cmd, params, index: int, timeout: float = 8.0) -> int:
+        """发送命令并等待其 RECV, 直接返回**应答包体**中第 ``index`` 个值 (int32 大端).
+
+        等价于 ``get_value(self.recv(cmd, params), index)`` 的一步封装: 一次调用即拿到
+        "发包 → 等该命令应答 → 取应答包体(不含命令号/包头)某个参数序号的值".
+
+        :param cmd: 命令号(或命令名, 如 ``'ENTER_MAP'``)
+        :param params: 发送包体(参数列表, 见 spec 语法: 数字→int32, ``s:/b:/h:`` 等)
+        :param index: 应答包体的**参数序号**(0 基 int32 索引); 越界抛 ``SeerError``
+        :param timeout: 等 RECV 超时(秒), 默认 8
+        :return: int
+        """
+        pkt = self.recv(cmd, params, timeout=timeout)
+        return get_value(pkt, index)
+
+    def get_item_count(self, item_id, timeout: float = 8.0) -> int:
+        """获取指定**物品 id** 的数量.
+
+        发 ``42399(MULTI_ITEM_LIST)`` 包体 ``[1, 物品id]``(先 1, 后物品 id, 各 int32 大端);
+        服务器应答包体(**不含命令号/包头**)按 4 字节大端 int32 拆, 取其**第三个**参数(索引 2)
+        即为该物品的数量. 返回 int; 若应答取不到第 3 个参数抛 ``SeerError``.
+
+        :param item_id: 物品 id (int)
+        :param timeout: 等 RECV 超时(秒), 默认 8
+        :return: 物品数量 (int)
+        """
+        pkt = self.recv(42399, [1, int(item_id)], timeout=timeout)
+        return get_value(pkt, 2)
+
     # ---------- 换背包 (物种 id -> 物理重排 12 格) ----------
     def _get_json(self, path: str) -> dict:
         """GET 请求 -> JSON dict (后端 /api/bag、/api/storage 等)."""
@@ -491,10 +530,424 @@ class Seer:
         return {str(k): v for k, v in locs.items()}
 
 
+# ---------- 对战体 (Battle) ----------
+class Battle:
+    """对战体: 绑定已登录后端的一场对战会话, **自动按回合推进**, 无需手动等待回合或进场.
+
+    以**带 cmdid 的完整 HEX 包**作为进入对战的输入: ``Battle(hex_packet)`` 构造时会自动发送该包
+    并等服务端下发进场数据(2503 出场队伍 / 2504 当前出战); 若无法正常进入(超时/收到结束包),
+    直接抛 ``SeerError``. 进场成功后即可立即按回合操作.
+
+    **操作即回合**的模型(与你的理解一致): 每个会消耗回合的操作(``use_skill``/``use_item``/
+    ``capture``/``escape``)在发包后都会**自动等待该回合结算(2505)**并返回, 因此你**不需要**再写
+    ``wait``/``wait_round``. 唯一例外是**死亡切换** ``change_pet``(当前精灵阵亡时的强制换宠): 它只把
+    新精灵换上而不消耗回合, 之后可在同一个回合内继续执行一次操作. 收到结束包(2506 FIGHT_OVER)
+    后 ``finished`` 置 True, 循环自动终止.
+
+    后端(webui)在后台已把 2503/2504/2505/2506/2407/2406/2409 等对战包解析进统一对战状态
+    (``_BATTLE``), 本类只是再提供一层"自动回合"的脚本驱动封装.
+
+    用法示例::
+
+        from seerlib import Battle
+        battle = Battle("带cmdid的完整HEX包")   # 发送对战包 + 自动进场; 失败抛 SeerError
+        while not battle.finished:
+            my, other = battle.my, battle.other
+            # —— 任意复杂的判断结构 ——
+            if my and (my.get('hp') or 0) <= 0:
+                battle.change_pet(battle.my_team[1]['id'])  # 死亡切换(传物种id), 不消耗回合
+                battle.use_skill(battle.skills[0])                  # 同一回合内继续出招
+            elif my and (my.get('hp') or 0) < 300:
+                battle.use_item(70001)                              # 用道具(消耗一回合)
+            else:
+                battle.use_skill(battle.skills[0])                  # 使用技能(消耗一回合)
+            rnd = battle.round                                      # 本回合(2505)数据
+            print(rnd.get('first', {}).get('lostHP'))               # 例如读取本回合伤害
+    """
+
+    # 进场"稳定性窗口": 对战状态刚变就绪时, 再连续稳定该时长(秒)内无回退才判定"成功发起".
+    # 防止误判: 只收到 2503(队伍, my/other=队伍首只) 或瞬态就绪时, 不会立刻当作可操作.
+    ENTRY_SETTLE = 0.8
+
+    @staticmethod
+    def _battle_ready(snap) -> bool:
+        """判定对战是否已具备"可操作"的基础状态: 进行中 + 双方当前精灵都在.
+
+        放宽到不要求双方队伍列表(某些模式的 2503 未必给出完整队伍, 但双方当前出战仍会来),
+        配合 ENTRY_SETTLE 稳定窗口, 既能防"2503 半开场就误判", 又不会因队伍缺失而进场超时.
+        """
+        if not snap:
+            return False
+        return bool(snap.get("active") and snap.get("my") and snap.get("other"))
+
+    def __init__(self, hex_packet=None, base=None, timeout: float = 30.0, probe: bool = True,
+                 entry_timeout: float = 15.0):
+        self._seer = Seer(base=base, timeout=timeout, probe=probe)
+        self.entry_timeout = entry_timeout   # 进入对战/单次等待的超时
+        self._hex = hex_packet
+        self._version = 0         # 已观察到的后端对战版本号 (用于 wait 判断"新事件")
+        self._snap = {}           # 最近一次 _BATTLE 快照
+        self._finished = False    # 是否已收到结束包(2506)
+        self._events = []         # 事件记录: [{version, cmd, ts}]
+        self._last_my = None      # 记录最后(结账前)的我方当前精灵, 便于结束后仍可读
+        self._last_other = None
+        if hex_packet:
+            self.start(hex_packet)
+
+    # ---------- 进入对战 / 读取快照 ----------
+    def _fetch(self) -> dict:
+        """GET /api/battle, 返回后端当前对战快照(dict)."""
+        return self._seer._get_json("/api/battle")
+
+    def start(self, hex_packet=None, entry_timeout: float = None) -> dict:
+        """发送"带 cmdid 的完整 HEX 包"进入对战, 并**充分等待对战成功发起**; 失败抛 SeerError.
+
+        - 若发送前后端**已在对战中**(active + 双方当前精灵), 视为已就绪, 直接返回当前状态,
+          不重复等待(避免把"已有对战"误判成"尚未进入")。
+        - 否则发送触发包后, 等待到对战状态**连续稳定**进入"可操作"态(见 ``_wait_entry``),
+          防止仅凭 2503(队伍) 或瞬态就误判为已发起。
+        """
+        if hex_packet is not None:
+            self._hex = hex_packet
+        if not self._hex:
+            raise SeerError("对战体需要一个带 cmdid 的完整 HEX 包作为对战包输入")
+        pre = self._fetch() or {}                     # 发送前状态
+        base_ver = int(pre.get("version", 0))
+        self._version = base_ver
+        self._snap = pre
+        if self._battle_ready(pre):                   # 本来就在对战 -> 直接认为已就绪
+            return pre
+        j = self._seer._post("/api/battle/hex", {"hex": self._hex})
+        if not j.get("ok"):
+            raise SeerError(j.get("error", "发送对战进入包失败"))
+        return self._wait_entry(entry_timeout)
+
+    # ---------- 等待/推进 ----------
+    def wait(self, timeout: float = 8.0):
+        """阻塞直到对战状态发生变化(新事件)或对**战结束**; 返回最新快照(dict).
+
+        超时返回 None(此时段无新对战事件). 用于让脚本按回合推进: 例如发技能后调用,
+        会阻塞到服务端回发 2505 回合结果(或 2506 结束包).
+        """
+        j = self._seer._post("/api/battle/wait", {"version": self._version, "timeout": timeout})
+        if not j.get("ok"):
+            raise SeerError(j.get("error", "wait 失败"))
+        if not j.get("changed"):
+            return None                     # 超时: 该时段无新对战事件
+        b = j.get("battle") or {}
+        self._snap = b
+        self._version = max(self._version, int(b.get("version", 0)))
+        self._finished = bool(b.get("finished", False))
+        self._record_event(b)
+        return b
+
+    def wait_active(self, timeout: float = 15.0):
+        """阻塞直到进入对战(收到 2503, active=True), 返回最新快照; 超时抛 SeerError."""
+        end = _time.time() + timeout
+        while _time.time() < end:
+            self.wait(2.0)
+            if self._snap.get("active") or self._finished:
+                return self._snap
+        raise SeerError("等待进入对战超时 (未收到 2503 出场队伍)")
+
+    def wait_round(self, timeout: float = 15.0):
+        """阻塞直到收到一回合结果(2505 NOTE_USE_SKILL)或对**战结束**, 返回该回合快照; 超时抛 SeerError.
+
+        会自动跳过非回合事件(如 2404 应答/2507 更新等), 直到真正解出一回合.
+        """
+        end = _time.time() + timeout
+        while _time.time() < end:
+            self.wait(2.0)
+            if self._finished:
+                return self._snap
+            if (self._snap or {}).get("lastCmd") == 2505:
+                return self._snap
+        raise SeerError("等待回合结果(2505)超时")
+
+    # ---- 内部: 面向"自动回合"的等待 ----
+    def _wait_entry(self, timeout: float = None):
+        """等对战**充分发起**并稳定, 才返回; 防止误判.
+
+        避免把**上一场对战遗留的 ``finished=True``**(或开盘前的瞬态) 误判成"本场进入失败":
+        - 在**本场对战真正进入之前**(``entered`` 为 False), 若看到 ``finished``, 一律忽略并继续等
+          新的 2503(它会把它复位为 False 并置 active=True); 只有超时仍未进入才抛 SeerError。
+        - 一旦本场已进入(``active``+双方当前精灵+双方队伍), 再要求该状态**连续稳定 ``ENTRY_SETTLE``
+          秒**无回退; 若进入后立刻收到结束包(2506), 抛 SeerError("收到了结束包")。
+        """
+        timeout = timeout or self.entry_timeout
+        end = _time.time() + timeout
+        stable_since = None
+        entered = False                         # 是否已看到"本场对战"真正进入(active+就绪)
+        while _time.time() < end:
+            self.wait(0.4)                      # 推进到下一个对战事件(或超时)
+            snap = self._snap
+            if self._finished:
+                if entered:
+                    raise SeerError("对战未能正常进入(收到了结束包)")
+                # 未进入就收到结束标志: 可能是上一场遗留, 忽略并继续等本场 2503
+                stable_since = None
+                _time.sleep(0.05)
+                continue
+            if self._battle_ready(snap):
+                entered = True
+                if stable_since is None:
+                    stable_since = _time.time()  # 首次进入就绪态, 开始计稳定窗口
+                elif (_time.time() - stable_since) >= self.ENTRY_SETTLE:
+                    return snap                 # 已稳定 ENTRY_SETTLE 秒 -> 成功发起
+            else:
+                stable_since = None             # 状态不完整/回到未就绪 -> 重置稳定计时
+        raise SeerError(
+            f"进入对战超时({timeout}s): 未收到 2503 出场队伍或 2504 开场; 请确认对战触发 HEX 包有效")
+
+    def _wait_finish(self, timeout: float = None):
+        """内部: 等对战结束包(2506); 超时抛 SeerError."""
+        timeout = timeout or self.entry_timeout
+        end = _time.time() + timeout
+        while _time.time() < end:
+            self.wait(1.5)
+            if self._finished:
+                return self._snap
+        raise SeerError("等待对战结束(2506)超时")
+
+    def _after_round(self, settle: float = 0.6):
+        """回合结算后: 若某一方队伍**全体阵亡**(终局回合), 再短暂等待随后的结束包(2506).
+
+        这样"真正分出胜负的那一回合"结束后 ``finished`` 就已置 True, 循环不会再误发一次多余操作.
+        单只精灵阵亡(body `remainHP==0`)只是触发死亡切换/换宠, 并不等于终局, 不在这里多等.
+        """
+        if self._finished:
+            return
+        snap = self._snap
+
+        def side_dead(team):
+            if not team:
+                return False
+            known = [p for p in team if p.get("hp") is not None]
+            if not known or len(known) < len(team):
+                return False            # 有未知血量的精灵时不判定, 避免误判
+            return all((p.get("hp") or 0) <= 0 for p in known)
+
+        if side_dead(snap.get("myTeam")) or side_dead(snap.get("otherTeam")):
+            self.wait(settle)
+
+    def _record_event(self, b):
+        cmd = b.get("lastCmd")
+        self._events.append({"version": b.get("version"), "cmd": cmd,
+                             "ts": _time.strftime("%H:%M:%S")})
+        # 结束后端把 my/other 清空, 这里保留最后一帧供脚本回读最终状态
+        if b.get("my") is not None:
+            self._last_my = b.get("my")
+        if b.get("other") is not None:
+            self._last_other = b.get("other")
+
+    def run(self, decide, timeout: float = 15.0) -> bool:
+        """自动驱动整场对战, 直到收到**结束包(2506)** 后返回 True.
+
+        ``decide(this)`` 是每回合的**决策回调**: 每回合对战体已更新好状态(可直接读 ``this.my``/
+        ``this.other``/``this.round``/``this.skills``), 回调里**决定并发出本回合动作**(如
+        ``this.use_skill(...)``; 若当前精灵阵亡可先 ``this.change_pet(...)`` 再 ``this.use_skill``;
+        想逃跑可 ``this.escape()``). 因为每个动作都会**自动等待回合结算**, 所以本方法只需循环调用
+        ``decide`` 直到 ``finished`` —— 你只写判断逻辑, 不用理会何时等回合/何时进场.
+
+        注意: ``decide`` 每回合至少要发一个**消耗回合**的动作(use_skill/use_item/capture/escape),
+        否则会原地空转.
+        """
+        if not self.active:
+            raise SeerError("对战尚未进入(请用 Battle(hex) 构造或先调用 start(hex))")
+        while not self.finished:
+            decide(self)
+        return self.finished
+
+    def __repr__(self):
+        return (f"<Battle active={self.active} finished={self.finished} "
+                f"version={self._version} last_cmd={self.last_cmd}>")
+
+    # ---------- 读: 当前对战 / 回合数据 ----------
+    @property
+    def state(self) -> dict:
+        """当前对战快照(dict): {active, finished, mode, my, other, myTeam, otherTeam, ...}."""
+        return self._snap
+
+    @property
+    def finished(self) -> bool:
+        """是否已收到结束包(2506 FIGHT_OVER), 对战体据此终止."""
+        return self._finished
+
+    @property
+    def active(self) -> bool:
+        return bool(self._snap.get("active"))
+
+    @property
+    def last_cmd(self):
+        return self._snap.get("lastCmd")
+
+    @property
+    def version(self) -> int:
+        return self._version
+
+    @property
+    def mode(self):
+        return self._snap.get("mode")
+
+    @property
+    def my(self):
+        """我方当前出战精灵(dict), 结束后返回最后一帧."""
+        return self._snap.get("my") or self._last_my
+
+    @property
+    def other(self):
+        """敌方当前出战精灵(dict), 结束后返回最后一帧."""
+        return self._snap.get("other") or self._last_other
+
+    @property
+    def my_team(self) -> list:
+        return self._snap.get("myTeam") or []
+
+    @property
+    def other_team(self) -> list:
+        return self._snap.get("otherTeam") or []
+
+    @property
+    def skills(self) -> list:
+        """我方当前出战精灵可用的技能 id 列表."""
+        return self._snap.get("mySkills") or []
+
+    @property
+    def round(self):
+        """当前回合数据: 2505 NOTE_USE_SKILL 的解析结果(dict) 或 None.
+
+        内含 first/second 两个 AttackValue(我方/敌方)、hpUpdates、skillRecords、
+        attackBlocks、endOffset 等, 详见 seer/fightinfo.py::parse_note_use_skill.
+        """
+        return self._snap.get("lastSkill")
+
+    @property
+    def report(self) -> list:
+        """后端战报记录(chronological [{t,msg}])."""
+        return self._snap.get("report") or []
+
+    @property
+    def events(self) -> list:
+        """本对战体观察到的每个事件: [{version, cmd, ts}]."""
+        return list(self._events)
+
+    # ---------- 操作: 发包 / 用技能 / 换宠 / 用道具 / 捕捉 / 逃跑 ----------
+    def send(self, cmd, params=None, encode: str = "pack") -> dict:
+        """发送任意对战命令(可为命令号或命令名), params 为参数列表(默认打包为 int32 包体).
+
+        encode="hex" 时把 params 原样当作十六进制包体下发. 返回后端应答 dict.
+        """
+        j = self._seer._post("/api/battle/send", {
+            "cmd": str(cmd), "body": self._seer._spec(params), "encode": encode})
+        if not j.get("ok"):
+            raise SeerError(j.get("error", "对战发包失败"))
+        return j
+
+    def send_hex(self, hex_packet: str) -> dict:
+        """发送一条带 cmdid 的完整 HEX 包; 后端会重建 uid/序列号并加密封包下发."""
+        j = self._seer._post("/api/battle/hex", {"hex": hex_packet})
+        if not j.get("ok"):
+            raise SeerError(j.get("error", "发送 HEX 包失败"))
+        return j
+
+    def use_skill(self, skill_id, timeout: float = None) -> dict:
+        """使用技能(2405): 发包后**自动等待本回合结算(2505)**, 即"一个操作=过一回合".
+
+        返回本回合后的最新对战快照(含 ``round``/``my``/``other``). 若本回合为终局回合,
+        会顺带等到结束包(2506)并把 ``finished`` 置 True.
+        """
+        self.send(2405, [skill_id])
+        snap = self.wait_round(timeout or self.entry_timeout)
+        self._after_round()
+        return snap
+
+    def use_item(self, *params, timeout: float = None) -> dict:
+        """用道具(2406): 发包后**自动等待本回合结算(2505)**, 消耗一回合."""
+        self.send(2406, list(params))
+        snap = self.wait_round(timeout or self.entry_timeout)
+        self._after_round()
+        return snap
+
+    def capture(self, *params, timeout: float = None) -> dict:
+        """捕捉(2409): 发包后**自动等待本回合结算(2505)**, 消耗一回合."""
+        self.send(2409, list(params))
+        snap = self.wait_round(timeout or self.entry_timeout)
+        self._after_round()
+        return snap
+
+    def change_pet(self, species_id, catchTime=None, *, death: bool = None,
+                   timeout: float = None) -> dict:
+        """换宠(2407): 既可作为**死亡切换**(不消耗回合), 也可作为**主动切换**(消耗一回合).
+
+        - 推荐传 **物种 id**(如 ``battle.change_pet(5000)``): 后端会从**当前对战阵容**(``myTeam``)
+          里查一只该 id 的可用精灵, 取其 ``catchTime`` 发包; 避免脚本里手填 catchTime(那个值很难拿对)。
+        - 也可传 ``catchTime=目标精灵catchTime`` 直接指定(后端用它发包)。
+
+        ``death`` 控制"这个切换是否消耗回合":
+        - ``None``(默认): **自动判断**——当前我方出战精灵阵亡(``my.hp<=0`` 或未知) → **死亡切换**,
+          不消耗回合(换完可继续出招); 否则(精灵还活着) → **主动切换**, 消耗一回合。
+        - ``True``: 强制**死亡切换**(不消耗回合)。
+        - ``False``: 强制**主动切换**(消耗一回合, 换完后等待本回合结算 2505)。
+
+        两种情况都会发 ``2407`` + 目标精灵 catchTime, 然后**等到新精灵真正成为我方当前出战精灵**
+        (``my.catchTime`` 发生变化) 并把 ``my``/``skills`` 刷新为它. 作为主动切换时, 还会继续等一个
+        回合结果(2505), 以便调用方知道这一回合已被这次换宠消耗掉.
+
+        之所以等"状态变化"而不是 ``lastCmd==2407``: 后端的 2407 应答可能被紧随其后的回合包(如 2505)
+        覆盖(``lastCmd`` 变成 2505), 或对端(NPC)换宠(userID==0)不更新我方 ``my``; 这些都可能导致
+        误判超时. 等到 ``my.catchTime`` 变成目标精灵是**权威**的"已换上"信号.
+
+        返回换宠后的最新对战快照(``my``/``skills`` 已更新为新精灵).
+        """
+        if catchTime is not None:
+            payload = {"catchTime": int(catchTime)}      # 直接指定 catchTime
+        else:
+            payload = {"id": int(species_id)}            # 按物种 id, 后端从阵容查 catchTime
+        prev_ct = (self._snap.get("my") or {}).get("catchTime")   # 我方当前出战 catchTime
+        # 主动切换判定: 默认按当前精灵存活情况自动判断
+        if death is None:
+            _hp = (self._snap.get("my") or {}).get("hp")
+            death = True if (_hp is None or _hp <= 0) else False
+        j = self._seer._post("/api/battle/change-pet", payload)
+        if not j.get("ok"):
+            raise SeerError(j.get("error", "换宠失败"))
+        # 等新精灵上场 (my.catchTime 变化)
+        end = _time.time() + (timeout or self.entry_timeout)
+        while _time.time() < end:
+            self.wait(1.0)
+            if self._finished:
+                return self._snap
+            my_ct = (self._snap.get("my") or {}).get("catchTime")
+            if my_ct is not None and my_ct != prev_ct:         # 新精灵已上场
+                break
+        else:
+            raise SeerError(f"换宠超时: 未收到新精灵上场 (目标 id={species_id} catchTime={catchTime})")
+        if death:
+            return self._snap                                  # 死亡切换: 不消耗回合
+        # 主动切换: 消耗一回合 -> 等本回合结算(2505), 并处理终局
+        snap = self.wait_round(timeout or self.entry_timeout)
+        self._after_round()
+        return snap
+
+    def escape(self, timeout: float = None) -> dict:
+        """逃跑(2410): 发包后**自动等待对战结束包(2506)**. 返回结束后的快照."""
+        self.send(2410, [])
+        return self._wait_finish(timeout or self.entry_timeout)
+
+    def act(self, msg: str) -> dict:
+        """把一条脚本动作记入后端战报(便于观察/回放). 返回后端应答 dict."""
+        return self._seer._post("/api/battle/action", {"msg": str(msg)})
+
+
 # ---------- 取值函数 (模块级) ----------
 def get_value(body, index: int) -> int:
-    """从包体取第 index 个值(int32 大端). body 可为 Packet / hex str / bytes."""
+    """从包体取第 index 个值(int32 大端). body 可为 Packet / hex str / bytes.
+
+    越界统一抛 ``SeerError``.
+    """
     if isinstance(body, Packet):
+        if index < 0 or index >= len(body.ints):
+            raise SeerError(f"取值索引 {index} 越界 (包体共 {len(body.ints)} 个 int32)")
         return body.ints[index]
     if isinstance(body, bytes):
         b = body

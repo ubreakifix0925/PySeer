@@ -217,52 +217,59 @@ def parse_fight_start_info(body):
 
 
 def parse_change_pet_info(b, o=0):
-    """ChangePetInfo (战斗中换宠的一只精灵) — 依据 refs/fightinfo/ChangePetInfo.as."""
+    """ChangePetInfo (战斗中换宠的一只精灵) — 依据 refs/fightinfo/ChangePetInfo.as.
+
+    任一子字段越界时**优雅退出**(返回已解到的最远偏移), 兼容不同长度包体.
+    """
     d = {}
-    d["userID"] = _u32(b, o); o += 4
-    d["petID"] = _u32(b, o); o += 4
-    d["catchTime"] = _u32(b, o); o += 4
-    d["petName"] = _name(b, o, 16); o += 16
-    d["level"] = _u32(b, o); o += 4
-    d["hp"] = _u32(b, o); o += 4
-    d["maxHp"] = _u32(b, o); o += 4
-    sk = _u32(b, o); o += 4
-    d["skillList"] = []
-    for _ in range(sk):
-        d["skillList"].append([_u32(b, o), _u32(b, o + 4)]); o += 8
-    from .petinfo import parse_resistance as _res
-    d["resistance"], o = _res(b, o)
-    d["skinId"] = _u32(b, o); o += 4
-    chg = _u32(b, o); o += 4
-    d["changehps"] = []
-    for _ in range(chg):
-        d["changehps"].append({
-            "id": _u32(b, o), "hp": _u32(b, o + 4), "maxhp": _u32(b, o + 8),
-            "lock": _u32(b, o + 12), "chujueNumber": _u32(b, o + 16),
-            "chujueRound": _u32(b, o + 20)}); o += 24
-        _mb, o = parse_mark_buff(b, o)
-    d["xinHp"] = _u32(b, o); o += 4
-    d["xinMaxHp"] = _u32(b, o); o += 4
-    d["isChangeFace"] = _u32(b, o); o += 4
-    run_cnt = _u32(b, o); o += 4
-    d["skillRunawayMarks"] = []
-    for _ in range(run_cnt):
-        d["skillRunawayMarks"].append(_u32(b, o)); o += 4
-    for k in ("holyAndEvilThoughts", "yearVip2022_shengjian", "yearVip2022_chujue",
-              "laborDay2022_yinji", "suli2022", "mulian2022"):
-        d[k] = _u32(b, o); o += 4
-    d["siteBuff"], o = parse_site_buff(b, o)
-    d["bothSiteBuff"], o = parse_site_buff(b, o)
-    d["markBuff"], o = parse_mark_buff(b, o)
-    sign_cnt = _u32(b, o); o += 4
-    d["signInfo"] = []
-    for _ in range(sign_cnt):
-        sig, o = parse_fight_sign(b, o)
-        d["signInfo"].append(sig)
-    d["lockedSkillArr"] = []
-    for _ in range(5):
-        d["lockedSkillArr"].append(_u32(b, o)); o += 4
-    d["commonChangeFaceValue"] = _u32(b, o); o += 4
+    try:
+        d["userID"] = _u32(b, o); o += 4
+        d["petID"] = _u32(b, o); o += 4
+        d["catchTime"] = _u32(b, o); o += 4
+        d["petName"] = _name(b, o, 16); o += 16
+        d["level"] = _u32(b, o); o += 4
+        d["hp"] = _u32(b, o); o += 4
+        d["maxHp"] = _u32(b, o); o += 4
+        sk = _u32(b, o); o += 4
+        d["skillList"] = []
+        for _ in range(sk):
+            d["skillList"].append([_u32(b, o), _u32(b, o + 4)]); o += 8
+        from .petinfo import parse_resistance as _res
+        d["resistance"], o = _res(b, o)
+        d["skinId"] = _u32(b, o); o += 4
+        chg = _u32(b, o); o += 4
+        d["changehps"] = []
+        for _ in range(chg):
+            d["changehps"].append({
+                "id": _u32(b, o), "hp": _u32(b, o + 4), "maxhp": _u32(b, o + 8),
+                "lock": _u32(b, o + 12), "chujueNumber": _u32(b, o + 16),
+                "chujueRound": _u32(b, o + 20)}); o += 24
+            _mb, o = parse_mark_buff(b, o)
+        d["xinHp"] = _u32(b, o); o += 4
+        d["xinMaxHp"] = _u32(b, o); o += 4
+        d["isChangeFace"] = _u32(b, o); o += 4
+        run_cnt = _u32(b, o); o += 4
+        d["skillRunawayMarks"] = []
+        for _ in range(run_cnt):
+            d["skillRunawayMarks"].append(_u32(b, o)); o += 4
+        for k in ("holyAndEvilThoughts", "yearVip2022_shengjian", "yearVip2022_chujue",
+                  "laborDay2022_yinji", "suli2022", "mulian2022"):
+            d[k] = _u32(b, o); o += 4
+        d["siteBuff"], o = parse_site_buff(b, o)
+        d["bothSiteBuff"], o = parse_site_buff(b, o)
+        d["markBuff"], o = parse_mark_buff(b, o)
+        sign_cnt = _u32(b, o); o += 4
+        d["signInfo"] = []
+        for _ in range(sign_cnt):
+            sig, o = parse_fight_sign(b, o)
+            d["signInfo"].append(sig)
+        d["lockedSkillArr"] = []
+        for _ in range(5):
+            d["lockedSkillArr"].append(_u32(b, o)); o += 4
+        d["commonChangeFaceValue"] = _u32(b, o); o += 4
+        d["_incomplete"] = False
+    except (IndexError, ValueError):
+        d["_incomplete"] = True
     return d, o
 
 

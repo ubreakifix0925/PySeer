@@ -119,15 +119,19 @@ _PET_INFO = {}
 # 对战状态 (由 2503 NOTE_READY_TO_FIGHT / 2504 NOTE_START_FIGHT 解析填充, 供"对战"页展示)
 _BATTLE = {
     "active": False,          # 是否进入对战 (收到 2503 置 True)
+    "finished": False,        # 是否已结束 (收到 2506 FIGHT_OVER 置 True; 脚本库对战体以此终止)
     "mode": 0,                # 对战模式 (2503)
     "my": None,               # 我方当前出战精灵 ({id,petID,nick,...}) (2504)
     "other": None,            # 敌方当前出战精灵 (2504)
     "myTeam": [],             # 我方出战队伍 ({id,catchTime,hp,skills,...}) (2503)
     "otherTeam": [],          # 敌方出战队伍 (2503)
     "mySkills": [],           # 我方当前可使用的技能 id 列表
+    "mySkillPP": {},          # 我方当前技能剩余 PP ({技能id: 当前pp}, 由 2505 AttackValue.skillList 同步)
+    "otherSkillPP": {},       # 敌方当前技能剩余 PP
     "myId": None,             # 我方账号(米米号), 用于区分 my/other
     "lastCmd": None,          # 最近触及更新的命令 (2503/2504)
     "lastSkill": None,        # 最近一次回合技能 (2505 前导: {userID,skillID,count,actorCatchTime})
+    "round": 0,               # 本场已进行的回合数 (每收到 2505 回合包 +1, 供战报"回合 N")
     "report": [],             # 战报记录 (chronological [{t,msg}])
     "_ready_sent_mode": None, # 已自动发送过 2404 的对战模式 (防重复)
     "version": 0,
@@ -245,61 +249,43 @@ def _storage_view(p):
 
 
 def _battle_view(p):
-    """给对战精灵补充头像 URL 与名字 (按物种id), 供"对战"页显示."""
+    """给对战精灵补充头像 URL 与名字 (按物种id), 供"对战"页显示.
+
+    统一血量字段名: 前端血条读 **maxHP**(大写). 不同来源命名字段不一
+    (2504 FightPetInfo 用 maxHP; ChangePetInfo/2503 用 maxHp 或无), 这里统一成
+    同时提供 maxHP 与 maxHp, 避免换宠后最大HP显示为 0.
+    """
     out = dict(p)
     pid = out.get("id") or out.get("petID")
+    if out.get("id") is None and pid is not None:
+        out["id"] = pid        # 统一 id 字段 (2504 FightPetInfo 只给 petID), 供 resolve_name 查名
     fname = "%s.png" % pid if isinstance(pid, int) and pid > 0 else None
     out["avatar"] = ("/head/%s" % fname) if (fname and os.path.isfile(os.path.join(_HEAD_DIR, fname))) else None
     out["name"] = out.get("petName") or out.get("nick") or resolve_name(out)
+    # 血量统一: maxHP = maxHp|xinMaxHp|maxHP (取任一非空), 并回填两种大小写
+    mh = out.get("maxHP")
+    if mh is None:
+        mh = out.get("maxHp")
+    if mh is None:
+        mh = out.get("xinMaxHp")
+    if mh is not None:
+        out["maxHP"] = mh
+        out["maxHp"] = mh
     return out
 
 
-def _ptag(p):
-    """战报用精灵描述串: id / Lv / HP."""
+def _pet_state(p):
+    """战报用精灵状态串: 名字(id=…) HP x/y (带阵亡标记)."""
     if not p:
         return "—"
-    return (f"id={p.get('petID') or p.get('id')} Lv{p.get('lv') or p.get('level') or '?'} "
-            f"HP {p.get('hp') or p.get('xinHp') or '?'}/{p.get('maxHP') or p.get('maxHp') or p.get('xinMaxHp') or '?'}")
-
-
-def _pet_entry(ct):
-    """按 catchTime 从对战状态找精灵: 返回 (pet_dict, side) 或 (None, None).
-
-    side: "我方"/"敌方". pet 用 _battle_view 补过名字/头像.
-    """
-    if ct is None:
-        return None, None
-    for p in _BATTLE.get("myTeam", []):
-        if p.get("catchTime") == ct:
-            return p, "我方"
-    for p in _BATTLE.get("otherTeam", []):
-        if p.get("catchTime") == ct:
-            return p, "敌方"
-    m = _BATTLE.get("my")
-    if m and m.get("catchTime") == ct:
-        return m, "我方"
-    o = _BATTLE.get("other")
-    if o and o.get("catchTime") == ct:
-        return o, "敌方"
-    return None, None
-
-
-def _pet_label(ct, p=None, side=None):
-    """战报里精灵的友好名: [我方] 星丝·鲁斯王(id=4648)."""
-    if p is None and ct is not None:
-        p, side = _pet_entry(ct)
-    pid = (p or {}).get("id") or (p or {}).get("petID")
-    nm = (p or {}).get("name") or resolve_name({"id": pid}) if pid else "(未知)"
-    side = side or "?"
-    return f"[{side}] {nm}(id={pid})"
-
-
-def _hp_delta(old, new):
-    """血量变化: 掉血用负数, 回血用正数; None 表示未知."""
-    try:
-        return round(int(new) - int(old)) if old is not None and new is not None else None
-    except (TypeError, ValueError):
-        return None
+    pid = p.get("petID") or p.get("id")
+    nm = p.get("petName") or p.get("name") or (resolve_name({"id": pid}) if pid else "(未知)")
+    hp = p.get("hp") if p.get("hp") is not None else p.get("xinHp")
+    mh = p.get("maxHP") if p.get("maxHP") is not None else (p.get("maxHp") or p.get("xinMaxHp"))
+    hp_s = "?" if hp is None else str(int(hp))
+    mh_s = "?" if mh is None else str(int(mh))
+    dead = " ⚠️阵亡" if (hp is not None and hp <= 0) else ""
+    return f"{nm}(id={pid}) HP {hp_s}/{mh_s}{dead}"
 
 
 def _update_battle(cmd, hex_body, me_id):
@@ -315,8 +301,12 @@ def _update_battle(cmd, hex_body, me_id):
             my_u = (a if a["id"] == me_id else b) if a and b else a
             ot_u = (b if a["id"] == me_id else a) if a and b else b
             with _LOCK:
+                _fresh = not _BATTLE.get("active")     # 之前未在对战中 -> 本轮为全新对战开始
                 _BATTLE["mode"] = r.get("mode")
                 _BATTLE["active"] = True
+                _BATTLE["finished"] = False          # 新一轮对战开始, 清掉上一场结束标记
+                _BATTLE["lastSkill"] = None          # 清掉上一场最后一次回合数据, 防止跨场误读
+                _BATTLE["round"] = 0                 # 新一场对战, 回合计数清零
                 _BATTLE["myId"] = me_id
                 _BATTLE["myTeam"] = [_battle_view(p) for p in (my_u or {}).get("pets", [])]
                 _BATTLE["otherTeam"] = [_battle_view(p) for p in (ot_u or {}).get("pets", [])]
@@ -326,9 +316,10 @@ def _update_battle(cmd, hex_body, me_id):
                 _BATTLE["other"] = _battle_view(_BATTLE["otherTeam"][0]) if _BATTLE["otherTeam"] else None
                 _BATTLE["lastCmd"] = 2503
                 _BATTLE["version"] += 1
+            if _fresh:
+                # 后台监听到"对战开始" -> 前端自动切换到对战界面并开始监听对战流程
+                log("battle", "检测到对战行为(2503 出场队伍), 已自动切换至对战界面")
             _report(f"对战开始 mode={r.get('mode')} | 我方{len(_BATTLE['myTeam'])}只 敌方{len(_BATTLE['otherTeam'])}只", clear=True)
-            _report(f"  我方队伍: " + "、".join(f"id={p['id']}(HP {p.get('hp')})" for p in _BATTLE['myTeam']))
-            _report(f"  敌方队伍: " + "、".join(f"id={p['id']}(HP {p.get('hp')})" for p in _BATTLE['otherTeam']))
             log("ok", f"对战(2503): mode={r.get('mode')} 我方{len(_BATTLE['myTeam'])}只 敌方{len(_BATTLE['otherTeam'])}只")
         elif cmd == 2504:
             r = parse_fight_start_info(data)
@@ -348,25 +339,47 @@ def _update_battle(cmd, hex_body, me_id):
                 _BATTLE["mySkills"] = _active_skills(_BATTLE)
                 _BATTLE["lastCmd"] = 2504
                 _BATTLE["version"] += 1
-            _report(f"开场 我方当前 {_ptag(my_f)} | 敌方当前 {_ptag(ot_f)}")
+            _report(f"开场 [我方] {_pet_state(my_f)} | [敌方] {_pet_state(ot_f)}")
             log("ok", "对战(2504): 双方当前出战精灵已更新")
         elif cmd == 2407:
-            # 换宠: 2407 CHANGE_PET 应答带当前精灵状态(ChangePetInfo), 更新对应一方血量/等级.
+            # 换宠: 2407 CHANGE_PET 应答携带**新入场精灵**的 ChangePetInfo (完整状态).
+            # 客户端发起时发 2407 + 目标精灵 catchTime (int32); 服务器据此回发新当前精灵.
             try:
                 ch, _ = parse_change_pet_info(data)
                 uid = ch.get("userID")
+                side = "我方" if uid == me_id else ("敌方" if uid == 0 else f"?{uid}")
+                pid = ch.get("petID")
+                ch["id"] = pid                     # 统一 id 字段, 供名字/头像解析
+                ch["petName"] = ch.get("petName") or resolve_name({"id": pid})
+                ch["maxHp"] = ch.get("maxHp")
+                ch["maxHP"] = ch.get("maxHp")       # 大写 maxHP, 供前端血条读取
                 with _LOCK:
                     _BATTLE["active"] = True
                     _BATTLE["myId"] = me_id
+                    pv = _battle_view(ch)
                     if uid == me_id:
-                        _BATTLE["my"] = _battle_view(ch)
+                        # 我方换宠: 新当前精灵 = 该 ChangePetInfo; 从 team 里找到这只, 同步其技能/等级
+                        _BATTLE["my"] = pv
+                        for p in _BATTLE.get("myTeam", []):
+                            if p.get("catchTime") == ch.get("catchTime"):
+                                p.update({"hp": ch.get("hp"), "maxHp": ch.get("maxHp"),
+                                          "maxHP": ch.get("maxHp"),
+                                          "id": pid, "level": ch.get("level"),
+                                          "skills": [s[0] for s in ch.get("skillList", [])]})
                     else:
-                        _BATTLE["other"] = _battle_view(ch)
+                        _BATTLE["other"] = pv
+                        for p in _BATTLE.get("otherTeam", []):
+                            if p.get("catchTime") == ch.get("catchTime"):
+                                p.update({"hp": ch.get("hp"), "maxHp": ch.get("maxHp"),
+                                          "maxHP": ch.get("maxHp"),
+                                          "id": pid, "level": ch.get("level"),
+                                          "skills": [s[0] for s in ch.get("skillList", [])]})
                     _BATTLE["mySkills"] = _active_skills(_BATTLE)
                     _BATTLE["lastCmd"] = 2407
                     _BATTLE["version"] += 1
-                _report(f"换宠 用户{uid}{( ' 我方' if uid == me_id else ' 敌方')} → {_ptag(ch)}")
-                log("ok", f"对战(2407): 换宠 用户{uid} pet={ch.get('petID')} hp={ch.get('hp')}/{ch.get('maxHp')}")
+                lv = ch.get("level")
+                _report(f"换宠 [{side}] → {_pet_state(ch)}")
+                log("ok", f"对战(2407): 换宠 [{side}] pet={pid} lv={lv} hp={ch.get('hp')}/{ch.get('maxHp')} catch={ch.get('catchTime')}")
             except Exception:
                 pass
         elif cmd == 2505:
@@ -377,58 +390,38 @@ def _update_battle(cmd, hex_body, me_id):
                 sk = parse_note_use_skill(data)
                 upd = sk.get("hpUpdates") or []
                 blocks = sk.get("attackBlocks") or []
-                # 记录更新前各精灵 HP, 供战报显示血条变化(掉血/回血)
                 with _LOCK:
-                    pre_hp = {}
-                    for p in _BATTLE.get("myTeam", []) + _BATTLE.get("otherTeam", []):
-                        ct = p.get("catchTime")
-                        if ct is not None:
-                            pre_hp[ct] = p.get("hp")
                     _BATTLE["lastSkill"] = sk
                     _BATTLE["lastCmd"] = 2505
+                    _BATTLE["round"] = _BATTLE.get("round", 0) + 1   # 本场已进行回合数 +1
                     _apply_hp_updates(upd)
+                    # AttackValue.remainHP/maxHp 是本回合**施法者**的权威血量;
+                    # 按 userID 匹配到当前精灵, 避免换宠后当前血量停留在满值(未显示掉血)
+                    _apply_attack_hp(blocks, me_id)
+                    # AttackValue.skillList 的 [技能id, 当前pp] 是服务器权威 PP, 同步前端
+                    _apply_skill_pp(blocks, me_id)
                     _BATTLE["version"] += 1
-                # 用精确的 AttackValue 双方块报告 (确定性的), 退化回 skillRecords
-                if blocks:
-                    for r in blocks:
-                        rid = r.get("userID")
-                        side = "我方" if rid == me_id else ("敌方" if rid == 0 else f"?{rid}")
-                        hp = r.get("remainHP")
-                        crit = " 暴击!" if r.get("isCrit") else ""
-                        atk = r.get("skillID")
-                        _report(f"回合 用户{rid}({side}) 使用技能 {_skill_name(atk)}[{atk}] "
-                                f"伤害{r.get('lostHP')} 回血{r.get('gainHP')} 剩余HP {hp}/{r.get('maxHp')}{crit}"
-                                + (" ⚠️阵亡" if hp == 0 else ""))
-                else:
-                    recs = sk.get("skillRecords") or []
-                    for r in recs:
-                        rid = r.get("userID")
-                        side = "我方" if rid == me_id else ("敌方" if rid == 0 else f"?{rid}")
-                        _report(f"回合 用户{rid}({side}) 使用技能 {_skill_name(r.get('skillID'))}[{r.get('skillID')}] 回合数{r.get('count')}")
-                # 血条变化: 按精灵名呈现, 掉血/回血/阵亡 (替代原先的 catch 调试输出)
-                for u in upd:
-                    ct = u.get("catchTime")
-                    new = u.get("hp")
-                    mh = u.get("maxHp")
-                    old = pre_hp.get(ct)
-                    # 只显示真正在场的精灵 (跳过未识别/幻影的 catchTime)
-                    pet, side = _pet_entry(ct)
-                    if pet is None:
-                        continue
-                    delta = _hp_delta(old, new)
-                    label = _pet_label(ct, pet, side)
-                    d_txt = ("掉血 %d" % -delta) if (delta is not None and delta < 0) else \
-                            ("回血 +%d" % delta) if (delta is not None and delta > 0) else \
-                            ("HP 不变") if delta == 0 else "血条变化"
-                    note = " ⚠️阵亡" if (new is not None and new <= 0) else \
-                           (" ⚠️残血" if (new is not None and mh and 0 < new <= mh * 0.2) else "")
-                    _report(f"  {label} {d_txt} → {new}/{mh}{note}")
-                if not blocks and not sk.get("skillRecords"):
-                    side = "我方" if sk.get("userID") == me_id else "敌方"
-                    _report(f"回合 用户{sk.get('userID')}({side}) 使用技能 {_skill_name(sk.get('skillID'))}[{sk.get('skillID')}] 目标数{sk.get('count')}")
-                if not upd:
-                    _report(f"  (本回合未解析到血量变化; 包体{len(data)}B, 已存 webui_logs/battle_capture.log, 点『复制』后我读文件解码)")
-                log("info", f"对战(2505 回合): 我方技能{sk.get('skillID')} 敌方技能"
+                # —— 精简战报: 每回合只在场精灵"使用技能 + 状态" ——
+                round_no = _BATTLE.get("round", 0)
+                recs = blocks or (sk.get("skillRecords") or [])
+                if not recs and sk.get("skillID") is not None:
+                    recs = [sk]                        # 兜底: 用 2505 前导
+                for r in recs:
+                    rid = r.get("userID")
+                    side = "我方" if rid == me_id else ("敌方" if rid == 0 else f"?{rid}")
+                    pet = _BATTLE.get("my") if rid == me_id else _BATTLE.get("other")
+                    nm = _pet_state(pet).split(" HP ")[0] if pet else f"id={rid}" if rid else "?"
+                    atk = r.get("skillID")
+                    hp, mh = r.get("remainHP"), r.get("maxHp")
+                    crit = " [暴击]" if r.get("isCrit") else ""
+                    dead = " ⚠️阵亡" if (hp is not None and hp == 0) else ""
+                    if hp is not None:
+                        mh_s = "?" if mh is None else str(int(mh))
+                        _report(f"回合 {round_no} [{side}] {nm} 使用技能 {_skill_name(atk)}[{atk}] "
+                                f"剩余HP {int(hp)}/{mh_s}{crit}{dead}")
+                    else:
+                        _report(f"回合 {round_no} [{side}] {nm} 使用技能 {_skill_name(atk)}[{atk}]{crit}{dead}")
+                log("info", f"对战(2505 回合): 回合{round_no} 我方技能{sk.get('skillID')} 敌方技能"
                             f"{[r.get('skillID') for r in blocks if r.get('userID') == 0]} "
                             f"攻击块{len(blocks)} HP更新{len(upd)}")
             except Exception:
@@ -436,14 +429,12 @@ def _update_battle(cmd, hex_body, me_id):
         elif cmd in (2406,):
             try:
                 it, _ = parse_use_pet_item(data)
-                _report(f"用道具 用户{it.get('userID')} 道具{it.get('itemID')} 改血{it.get('changeHp')}")
                 log("info", f"对战(2406 用道具): 用户{it.get('userID')} 道具{it.get('itemID')} 改血{it.get('changeHp')}")
             except Exception:
                 pass
         elif cmd in (2409,):
             try:
                 cp, _ = parse_catch_pet(data)
-                _report(f"捕捉 catchTime={cp.get('catchTime')} 精灵={cp.get('petID')}")
                 log("info", f"对战(2409 捕捉): 捕获 catchTime={cp.get('catchTime')} 精灵={cp.get('petID')}")
             except Exception:
                 pass
@@ -475,28 +466,15 @@ def _update_battle(cmd, hex_body, me_id):
             else:
                 verdict = "对战结束(胜负未判定)"
             _report(f"对战结束 —— 结果: {verdict}")
-            if fin_my_hp is not None or fin_ot_hp is not None:
-                def _hp(v):
-                    return "?" if v is None else str(v)
-                _report(f"  最终血量 我方 {_hp(fin_my_hp)} | 敌方 {_hp(fin_ot_hp)}")
-            if fo.get("winnerID") is not None:
-                _report(f"  结束包(winID): 胜者={fo['winnerID']}"
-                        f" 原因{fo.get('reason')} 类型{fo.get('type')} 回合数{fo.get('roundNum')} (包体{len(data)}B)")
-            else:
-                _report(f"  结束包: 无胜负信息 (包体{len(data)}B, 前48B {data[:48].hex()})")
-            if flushed:
-                _report(f"  本场完整包体已存 {flushed[0]} ({flushed[1]} 包)")
             with _LOCK:
-                _BATTLE.update({"active": False, "mode": 0, "my": None, "other": None,
+                _BATTLE.update({"active": False, "finished": True, "mode": 0, "my": None, "other": None,
                                 "myTeam": [], "otherTeam": [], "mySkills": [],
+                                "mySkillPP": {}, "otherSkillPP": {},
                                 "_ready_sent_mode": None, "lastCmd": 2506})
                 _BATTLE["version"] += 1
             log("info", "对战(2506): 对战结束, 已重置对战状态")
         elif cmd in (2405, 2394, 2410, 2507, 2508, 2404):
-            # 其它回合/技能相关包: 记录到战报 (便于观察服务器回合推进)
-            name = {2405:"USE_SKILL应答", 2394:"PET_BOOK_UPDATE", 2410:"ESCAPE_FIGHT",
-                    2507:"NOTE_UPDATE_SKILL", 2508:"NOTE_UPDATE_PROP", 2404:"READY_TO_FIGHT应答"}.get(cmd, str(cmd))
-            _report(f"收到 {name}({cmd}) 包体({len(data)}B)")
+            # 其它回合/技能相关包: 仅更新状态, 不进精简战报
             with _LOCK:
                 _BATTLE["lastCmd"] = cmd
                 _BATTLE["version"] += 1
@@ -533,6 +511,8 @@ def _apply_hp_updates(updates):
         if u:
             entry["hp"] = u["hp"]
             entry["maxHp"] = u["maxHp"]
+            # 同步大写 maxHP, 供前端血条读取 (前端读 p.maxHP)
+            entry["maxHP"] = u["maxHp"]
 
     upd(_BATTLE.get("my"))
     upd(_BATTLE.get("other"))
@@ -540,6 +520,54 @@ def _apply_hp_updates(updates):
         upd(p)
     for p in _BATTLE.get("otherTeam", []):
         upd(p)
+
+
+def _apply_attack_hp(blocks, me_id):
+    """把 2505 AttackValue.remainHP/maxHp 按 userID 写回当前精灵 (my/other).
+
+    AttackValue 的 remainHP 是**施法者本回合结算后**的权威血量; 仅用 catchTime 扫描
+    (hpUpdates) 可能漏掉"换宠上来"的精灵, 导致其当前血量停留在满值. 这里按 userID
+    直接匹配到 my(我方账号)/other(敌方0) 并把血量写回.
+    """
+    if not blocks:
+        return
+    for bk in blocks:
+        uid = bk.get("userID")
+        remain = bk.get("remainHP")
+        mh = bk.get("maxHp")
+        if remain is None or mh is None:
+            continue
+        if uid == me_id:
+            tgt = _BATTLE.get("my")
+        else:
+            tgt = _BATTLE.get("other")
+        if tgt is not None:
+            tgt["hp"] = remain
+            tgt["maxHp"] = mh
+            tgt["maxHP"] = mh
+
+
+def _apply_skill_pp(blocks, me_id):
+    """把 2505 AttackValue.skillList 的 [技能id, 当前pp] 同步为当前精灵的剩余 PP 表.
+
+    AttackValue.skillList 的第二个元素是服务器下发的**技能当前剩余 PP**
+    (实测: 用过的技能 PP 递减, 未用则为满). 这里按 userID 存到 _BATTLE 的
+    mySkillPP / otherSkillPP (dict: {sid: 当前pp}), 前端据此同步显示 PP.
+    """
+    for key in ("mySkillPP", "otherSkillPP"):
+        _BATTLE[key] = {}
+    if not blocks:
+        return
+    for bk in blocks:
+        uid = bk.get("userID")
+        sl = bk.get("skillList") or []
+        pp_map = {}
+        for sid, pp in sl:
+            pp_map[str(sid)] = pp
+        if uid == me_id:
+            _BATTLE["mySkillPP"] = pp_map
+        else:
+            _BATTLE["otherSkillPP"] = pp_map
 
 
 def _report(msg, clear=False, limit=500):
@@ -1220,6 +1248,8 @@ class Handler(BaseHTTPRequestHandler):
             data = self._json_body()
         except Exception as e:
             return self._send_json({"ok": False, "error": f"JSON 解析失败: {e}"}, 400)
+        # 本函数多处会读写模块级 _BATTLE(对战状态), 声明为 global 以免被当作局部变量.
+        global _BATTLE
 
         if path == "/api/login":
             account = str(data.get("account", "")).strip()
@@ -1630,6 +1660,12 @@ class Handler(BaseHTTPRequestHandler):
                 cli = _STATE["client"]
             if cli is None:
                 return self._send_json({"ok": False, "error": "尚未登录, 无法发包"}, 400)
+            # 发起对战即视为"新一场对战开始": 清掉上一场遗留的结束标记与最后回合数据.
+            # 否则脚本端(seerlib.Battle)在等待本场 2503 期间, 会把它误判成"上一场结束包"
+            # (二次运行会因此抛"对战未能正常进入(收到了结束包)")。
+            with _LOCK:
+                _BATTLE["finished"] = False
+                _BATTLE["lastSkill"] = None
             try:
                 hexs = "".join(ch for ch in str(data.get("hex", "")) if ch in "0123456789abcdefABCDEF")
                 raw = bytes.fromhex(hexs)
@@ -1646,11 +1682,11 @@ class Handler(BaseHTTPRequestHandler):
 
         elif path == "/api/battle/clear":
             # 清空对战状态
-            global _BATTLE
             with _LOCK:
-                _BATTLE.update({"active": False, "mode": 0, "my": None, "other": None,
+                _BATTLE.update({"active": False, "finished": False, "mode": 0, "my": None, "other": None,
                                 "myTeam": [], "otherTeam": [], "mySkills": [],
-                                "myId": None, "lastCmd": None})
+                                "mySkillPP": {}, "otherSkillPP": {}, "myId": None, "lastCmd": None,
+                                "lastSkill": None})
                 _BATTLE["version"] += 1
             return self._send_json({"ok": True})
 
@@ -1661,6 +1697,75 @@ class Handler(BaseHTTPRequestHandler):
                 _report(msg)
                 return self._send_json({"ok": True, "msg": msg})
             return self._send_json({"ok": False, "error": "msg 为空"}, 400)
+
+        elif path == "/api/battle/change-pet":
+            # 换宠: 发 2407 CHANGE_PET, 包体 = 目标精灵的 catchTime (int32 大端).
+            # 依反编译 PlayerModel.changePet / setAutoChangePet: 客户端就发这一个 int.
+            # 参数: {id: 物种id} 由后端从当前对战阵容(myTeam)里查一只可用该id精灵并取它的 catchTime;
+            #       也可直接 {catchTime: 目标精灵catchTime}. 两者取其一.
+            with _LOCK:
+                cli = _STATE["client"]
+            if cli is None:
+                return self._send_json({"ok": False, "error": "尚未登录, 无法发包"}, 400)
+            try:
+                sid = data.get("id")
+                catch_raw = str(data.get("catchTime", "")).strip()
+                if sid is not None:
+                    # 从"当前对战阵容"myTeam 里找一只该物种id的可用精灵(排除已在场上的当前精灵)
+                    sid = int(sid)
+                    my_team = _BATTLE.get("myTeam") or []
+                    cur_ct = (_BATTLE.get("my") or {}).get("catchTime")
+                    cands = [p for p in my_team
+                             if p.get("id") == sid and p.get("catchTime")
+                             and p.get("catchTime") != cur_ct]
+                    if not cands:
+                        return self._send_json(
+                            {"ok": False,
+                             "error": f"对战阵容中找不到可用(非当前出战)的精灵 id={sid}"}, 400)
+                    alive = [p for p in cands if (p.get("hp") or 0) > 0]
+                    cand = alive[0] if alive else cands[0]      # 优先存活, 否则任取一只
+                    catch = int(cand["catchTime"])
+                elif catch_raw:
+                    catch = int(catch_raw)                       # 直接给 catchTime
+                else:
+                    return self._send_json({"ok": False, "error": "缺少精灵 id 或 catchTime"}, 400)
+                body_hex = pack_body(str(catch)).hex()      # int32 大端, 4B
+                cli.send_game_packet(2407, body_hex)
+                log("info", f"[对战] 换宠请求: 2407 CHANGE_PET id={sid} catchTime={catch} body={body_hex}")
+                return self._send_json({"ok": True,
+                                        "sent": {"cmd": 2407, "id": sid, "catchTime": catch,
+                                                 "body": body_hex}})
+            except Exception as e:
+                log("error", f"[对战] 换宠请求失败: {e}")
+                return self._send_json({"ok": False, "error": str(e)}, 400)
+
+        elif path == "/api/battle/wait":
+            # 脚本库对战体用: 阻塞等待"对战状态变化" (version 递增 或 对战结束).
+            # 返回最新 _BATTLE 快照; changed=False 表示超时(该时段无新对战事件).
+            with _LOCK:
+                cli = _STATE["client"]
+            if cli is None:
+                return self._send_json({"ok": False, "error": "尚未登录"}, 400)
+            try:
+                from_version = int(data.get("version", 0))
+                timeout = float(data.get("timeout", 8))
+                deadline = time.time() + timeout
+                ver, fin, b, changed = 0, False, {}, False
+                while time.time() < deadline:
+                    with _LOCK:
+                        ver = _BATTLE.get("version", 0)
+                        fin = _BATTLE.get("finished", False)
+                        b = dict(_BATTLE)
+                    if ver > from_version or fin:
+                        changed = True
+                        break
+                    time.sleep(0.05)
+                return self._send_json({"ok": True, "changed": changed,
+                                        "finished": fin, "version": ver,
+                                        "battle": b})
+            except Exception as e:
+                log("error", f"[对战] wait 异常: {e}")
+                return self._send_json({"ok": False, "error": str(e)}, 400)
 
         return self._send_json({"ok": False, "error": "unknown"}, 404)
 
@@ -1686,7 +1791,7 @@ PAGE = r"""<!DOCTYPE html>
  button{margin:8px 6px 0 0;padding:6px 12px;background:#238636;border:0;color:#fff;border-radius:6px;cursor:pointer;font-size:12px}
  button.off{background:#6e7681} button:disabled{opacity:.5;cursor:not-allowed}
  #log{width:100%;min-height:180px;max-height:56vh;overflow:auto;background:#0d1117;padding:8px;border:1px solid #30363d;border-radius:6px;font:12px/1.5 Menlo,monospace;white-space:pre-wrap}
- .lvl-info{color:#9aa5b1}.lvl-ok{color:#3fb950}.lvl-packet{color:#58a6ff}.lvl-error{color:#f85149}.lvl-tip{color:#d29922}.lvl-status{color:#e3b341}
+ .lvl-info{color:#9aa5b1}.lvl-ok{color:#3fb950}.lvl-packet{color:#58a6ff}.lvl-error{color:#f85149}.lvl-tip{color:#d29922}.lvl-status{color:#e3b341}.lvl-battle{color:#d2a8ff}
  #resp{width:100%;min-height:120px;background:#0d1117;padding:8px;border:1px solid #30363d;border-radius:6px;font:12px Menlo,monospace;color:#a5d6a7}
  .rowflex{display:flex;gap:6px}.rowflex>*{flex:1}
  .filterbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:0 0 8px}
@@ -1697,6 +1802,8 @@ PAGE = r"""<!DOCTYPE html>
  .tabs{display:flex;gap:4px;padding:10px 16px 0;background:#161b22;border-bottom:1px solid #30363d}
  .tabs .tab{padding:6px 18px;margin:0;background:#21262d;border:1px solid #30363d;border-bottom:0;border-radius:8px 8px 0 0;color:#8b949e}
  .tabs .tab.active{background:#0e1117;color:#58a6ff;border-color:#58a6ff}
+ .tabs .tab.live::before{content:'';display:inline-block;width:7px;height:7px;border-radius:50%;background:#3fb950;margin-right:6px;box-shadow:0 0 6px #3fb950;animation:blinkdot 1.1s infinite;vertical-align:middle}
+ @keyframes blinkdot{50%{opacity:.25}}
  .tab-panel{display:none}
  .tab-panel.active{display:block}
 .script-item{display:block;width:100%;text-align:left;padding:6px 8px;border:0;border-bottom:1px solid #21262d;background:transparent;color:#d8dee9;font:12px Menlo,monospace;cursor:pointer}
@@ -1719,7 +1826,11 @@ PAGE = r"""<!DOCTYPE html>
 .pt-chip img{width:56px;height:56px;object-fit:contain;margin:0 auto;display:block}
 .pt-chip .pn{color:#d8dee9;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .pt-chip .ph{color:#9aa5b1;font-size:10px}
-.skill-btn{min-width:96px;padding:8px 12px;margin:0;background:#238636;border:0;color:#fff;border-radius:6px;cursor:pointer;font-size:12px}
+.skill-btn{flex:1 1 0;min-width:0;margin:0;background:#238636;border:0;color:#fff;border-radius:6px;cursor:pointer;padding:6px 4px;text-align:center;display:flex;flex-direction:column;gap:2px;align-items:center;white-space:nowrap;overflow:hidden;min-width:64px}
+.skill-btn .sb-name{font-size:12px;color:#fff;text-overflow:ellipsis;overflow:hidden;max-width:100%}
+.skill-btn .sb-sub{font-size:10px;color:#c8e6c9;line-height:1.1}
+.skill-btn .sb-pp{font-size:10px;color:#a5d6a7}
+.skill-btn[disabled]{opacity:.45;cursor:not-allowed}
 .ops-btn{min-width:96px;padding:8px 12px;margin:0;background:#6e7681;border:0;color:#fff;border-radius:6px;cursor:pointer;font-size:12px}
  .bagwrap{display:flex;gap:12px;padding:12px}
  .avrow{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin:0 0 12px}
@@ -1931,23 +2042,30 @@ PAGE = r"""<!DOCTYPE html>
       <div id="battleHexInfo" style="font-size:12px;color:#8b949e;margin-top:4px">—</div>
     </div>
   </div>
-  <!-- 对战双方展示 -->
-  <div style="display:flex;gap:12px;padding:0 12px 12px;flex-wrap:wrap">
-    <div class="card" style="flex:1;min-width:300px">
-      <h2>我方</h2>
-      <div id="battleMy" class="fight-side"><div style="color:#8b949e">等待对战包(2503/2504)...</div></div>
-      <h2 style="margin-top:10px">我方投技</h2>
+  <!-- 对战信息区: 我方/敌方 各占一列, 头像+血条 + 各自出场队伍 -->
+  <div style="padding:0 12px 12px">
+    <div style="display:flex;gap:12px;flex-wrap:wrap">
+      <div class="card" style="flex:1;min-width:300px">
+        <h2>我方</h2>
+        <div id="battleMy" class="fight-side"><div style="color:#8b949e">等待对战包(2503/2504)...</div></div>
+        <h2 style="margin-top:10px">我方出场队伍</h2>
+        <div id="battleMyTeam" class="battle-team"><div style="color:#8b949e">—</div></div>
+      </div>
+      <div class="card" style="flex:1;min-width:300px">
+        <h2>敌方</h2>
+        <div id="battleOther" class="fight-side"><div style="color:#8b949e">等待对战包...</div></div>
+        <h2 style="margin-top:10px">敌方出场队伍</h2>
+        <div id="battleOtherTeam" class="battle-team"><div style="color:#8b949e">—</div></div>
+      </div>
+    </div>
+    <!-- 操作区: 单列, 位于对战信息区下方 -->
+    <div class="card" style="margin-top:12px">
+      <h2>操作区</h2>
+      <div style="font-size:12px;color:#8b949e;margin:4px 0 6px">技能 (点击发 2405 USE_SKILL)</div>
       <div id="battleSkills" style="display:flex;flex-wrap:wrap;gap:8px;margin:4px 0 8px"><div style="color:#8b949e">—</div></div>
       <div id="battleOps" style="display:flex;flex-wrap:wrap;gap:8px"></div>
       <div id="battleActionStatus" style="font-size:12px;color:#8b949e;margin-top:6px">—</div>
-    </div>
-    <div class="card" style="flex:1;min-width:300px">
-      <h2>敌方</h2>
-      <div id="battleOther" class="fight-side"><div style="color:#8b949e">等待对战包...</div></div>
-      <h2 style="margin-top:10px">我方出场队伍 (2503)</h2>
-      <div id="battleMyTeam" class="battle-team"><div style="color:#8b949e">—</div></div>
-      <h2 style="margin-top:10px">敌方出场队伍</h2>
-      <div id="battleOtherTeam" class="battle-team"><div style="color:#8b949e">—</div></div>
+      <div id="battleChangePetPicker" style="display:none;margin-top:8px;border:1px solid #30363d;background:#0d1117;border-radius:8px;padding:8px"></div>
     </div>
   </div>
   <!-- 战报记录 -->
@@ -2009,6 +2127,7 @@ es.onmessage = (ev)=>{
   let e; try{ e=JSON.parse(ev.data); }catch(_){ return; }
   if(e.seq && e.seq<=lastSeenSeq) return;                 // 去重断线回放
   if(e.level==='script'){ appendScriptOutput(e); }        // 脚本输出 -> 专用控制台
+  else if(e.level==='battle'){ appendLog(e); refreshBattle(); }   // 后台检测到对战行为 -> 显示提示并自动切到对战界面
   else if(shouldShow(e)){ appendLog(e); if(e.direction) appendTable(e); }
   if(e.seq && e.seq>lastSeenSeq) lastSeenSeq=e.seq;
 };
@@ -2301,10 +2420,23 @@ document.getElementById('scriptClearBtn').onclick=()=>{ scriptOutEl.innerHTML=''
 loadScripts();   // 预加载脚本列表 (登录后可立即看到)
 
 // ---- 对战页: 轮询 /api/battle, 图形化双方头像/血量/参数 + 技能/操作按钮 + 发起HEX包 ----
+// 自动切换: 后台一监听到对战行为(2503 开始), 就自动切到"对战"界面并开始监听展示对战流程.
+let _battleAutoOn = false;   // 本场对战是否已自动切到对战界面(避免重复切换/打扰用户)
+function battleTabLive(live){
+  const tb=document.querySelector('.tabs .tab[data-tab="battle"]');
+  if(tb) tb.classList.toggle('live', !!live);
+}
+function maybeOpenBattle(active, finished){
+  battleTabLive(active && !finished);               // "对战"标签上显示绿色亮点 = 对战进行中
+  if(active && !finished){                       // 对战进行中
+    if(!_battleAutoOn){ _battleAutoOn = true; activateTab('battle'); }
+  } else { _battleAutoOn = false; }              // 无对战 / 已结束 -> 复位, 下轮可再自动切
+}
 async function refreshBattle(){
   try{
     const r=await fetch('/api/battle'); const j=await r.json();
     renderBattleState(j);
+    maybeOpenBattle(j.active, j.finished);
   }catch(e){}
 }
 function hpPct(hp,max){ if(hp==null||max==null||!max) return 0; return Math.max(0,Math.min(100,Math.round(hp*100/max))); }
@@ -2346,6 +2478,28 @@ function renderTeamBox(el, team){
     el.appendChild(d);
   }
 }
+// 强制换宠相关状态: 是否已自动弹出过换宠(防重复)
+let _forcedChangeOpened=false;
+// 统一读取某只精灵的当前 HP (不同来源可能叫 hp 或 xinHp)
+function _petHp(p){ return p ? ((p.hp!=null)? p.hp : p.xinHp) : null; }
+// 判断是否处于"强制换宠": 我方当前精灵已阵亡(hp<=0) 且我方队伍里仍有存活替补
+function _isForcedChange(j){
+  if(!j || !j.active) return false;
+  const my=j.my; if(!my) return false;
+  const curHp=_petHp(my);
+  if(curHp==null || curHp>0) return false;         // 当前精灵还活着 -> 无需强制换
+  // 队伍里仍有 >0 血的精灵(且不是这只已阵亡的), 说明还能换 -> 强制换宠
+  const team=j.myTeam||[];
+  return team.some(p=> p.catchTime!==my.catchTime && _petHp(p) > 0);
+}
+// 锁定/恢复操作区: 禁用技能按钮 (ops 按钮由 renderBattleState 单独处理)
+function _setBattleOpsLocked(locked){
+  const sk=document.getElementById('battleSkills');
+  if(!sk) return;
+  Array.from(sk.querySelectorAll('button.skill-btn')).forEach(btn=>{
+    btn.disabled = locked || btn.getAttribute('data-ppzero')==='1';
+  });
+}
 function renderBattleState(j){
   if(!j) return;
   renderFighterBox(document.getElementById('battleMy'), j.my);
@@ -2353,18 +2507,43 @@ function renderBattleState(j){
   renderTeamBox(document.getElementById('battleMyTeam'), j.myTeam);
   renderTeamBox(document.getElementById('battleOtherTeam'), j.otherTeam);
   const skills=j.mySkills||[];
-  renderSkillButtons(skills);
+  window.__lastBattleSkills=skills;   // 供技能按钮 PP 重绘时取用
+  renderSkillButtons(skills, j.mySkillPP);
   ensureSkillNames(skills);   // 拉取技能名, 加载后自动重渲染
+  // ---- 强制换宠: 我方当前精灵阵亡(且仍有存活替补) 时锁定操作并弹出换宠 ----
+  const forced = _isForcedChange(j);
+  // 锁定其他操作(技能/非换宠按钮), 直到换宠完成
+  _setBattleOpsLocked(forced);
+  // 仅当"刚进入"强制状态时自动弹出一次换宠选择
+  if(forced && !_forcedChangeOpened){
+    _forcedChangeOpened=true;
+    openChangePetPicker(j, true);
+  } else if(!forced){
+    // 强制已解除: 若换宠框是之前"强制"自动弹出的(且用户未在框里选定), 收起, 避免残留
+    if(_forcedChangeOpened){
+      const cpk=document.getElementById('battleChangePetPicker');
+      if(cpk){ cpk.style.display='none'; cpk.innerHTML=''; }
+    }
+    _forcedChangeOpened=false;
+  }
   const ops=document.getElementById('battleOps'); ops.innerHTML='';
-  [['换宠(2407)',2407],['用药(2406)',2406],['逃跑(2410)',2410],['捕捉(2409)',2409]].forEach(([label,cmd])=>{
+  [['换宠(2407)',2407,true],['用药(2406)',2406,false],['逃跑(2410)',2410,false],['捕捉(2409)',2409,false]].forEach(([label,cmd,isChange])=>{
     const b=document.createElement('button'); b.className='ops-btn'; b.textContent=label;
     b.title='发送 cmd='+cmd;
-    b.onclick=()=>sendBattleCmd(cmd,[]);
+    if(isChange){ b.onclick=()=>openChangePetPicker(j, forced); }
+    else{ b.onclick=()=>sendBattleCmd(cmd,[]); }
+    if(forced && !isChange) b.disabled=true;   // 强制换宠期间禁用非换宠操作
     ops.appendChild(b);
   });
   const bhi=document.getElementById('battleHexInfo');
   if(bhi) bhi.textContent=(j.active?('对战中 mode='+j.mode+' | 上次更新='+(j.lastCmd||'-')):'未在对战中');
   document.getElementById('battleHexBtn').disabled=!(j.client_present);
+  // 未在对战中时收起换宠选择框 (避免残留)
+  if(!j.active){
+    const cpk=document.getElementById('battleChangePetPicker');
+    if(cpk){ cpk.style.display='none'; cpk.innerHTML=''; }
+    _forcedChangeOpened=false;
+  }
   // 战报
   const rep=document.getElementById('battleReport');
   if(rep){
@@ -2382,13 +2561,36 @@ function renderBattleState(j){
   }
 }
 let _SKILL_NAMES={};   // sid -> 技能名 (由 /api/skills 拉取)
-function renderSkillButtons(skills){
+let _SKILL_DATA={};    // sid -> 技能完整数据 (power/pp 等)
+let _SKILL_PP={};      // sid -> 当前可用 PP (优先用服务器下发的 mySkillPP, 无则按 maxpp)
+function renderSkillButtons(skills, ppMap){
   const sk=document.getElementById('battleSkills'); sk.innerHTML='';
   if(!skills.length){ sk.innerHTML='<div style="color:#8b949e">—</div>'; return; }
-  skills.forEach(sid=>{
+  // 记录服务器下发的当前 PP（dict: sid字符串->当前pp），供本函数与本地同步使用
+  if(ppMap){ for(const k in ppMap){ _SKILL_PP[k]=ppMap[k]; } }
+  // 五号位(第5个索引=4)技能移到最左侧; 其余按序
+  const ordered = [...skills];
+  if(ordered.length>=5){ const fifth=ordered.splice(4,1)[0]; ordered.unshift(fifth); }
+  ordered.forEach(sid=>{
     const b=document.createElement('button'); b.className='skill-btn';
-    b.textContent=String(_SKILL_NAMES[sid]!=null? _SKILL_NAMES[sid] : sid);
+    const d=_SKILL_DATA[sid]||{};
+    const name=_SKILL_NAMES[sid]!=null? _SKILL_NAMES[sid] : sid;
+    const power=d.power!=null? d.power : '';       // 威力
+    const maxp=d.pp!=null? d.pp : '';               // 最大 PP
+    const curp=_SKILL_PP[sid]!=null? _SKILL_PP[sid] : (_SKILL_PP[String(sid)]!=null? _SKILL_PP[String(sid)] : maxp);   // 当前 PP
+    // 名字
+    const nm=document.createElement('div'); nm.className='sb-name'; nm.textContent=String(name);
+    // 威力行
+    const sub=document.createElement('div'); sub.className='sb-sub';
+    sub.textContent=(power!==''?('威力'+power):'') + (d.typeName?(' · '+d.typeName):'');
+    // PP 行
+    const pp=document.createElement('div'); pp.className='sb-pp';
+    pp.textContent=(maxp!==''?('PP '+(curp!==''?curp:'?')+'/'+maxp):'');
+    b.appendChild(nm); b.appendChild(sub); b.appendChild(pp);
     b.title='技能ID='+sid+'  点击发送 USE_SKILL(2405)';
+    const ppZero = (curp!=='' && curp<=0);
+    b.setAttribute('data-ppzero', ppZero?'1':'0');   // 供强制换宠锁定/解锁时按 PP 决定禁用
+    if(ppZero){ b.disabled=true; }
     b.onclick=()=>sendBattleCmd(2405,[sid]);
     sk.appendChild(b);
   });
@@ -2399,7 +2601,12 @@ async function ensureSkillNames(ids){
   try{
     const r=await fetch('/api/skills?ids='+miss.join(','));
     const j=await r.json();
-    for(const [k,v] of Object.entries(j.skills||{})) _SKILL_NAMES[k]=(v&&v.name)||k;
+    for(const [k,v] of Object.entries(j.skills||{})){
+      _SKILL_NAMES[k]=(v&&v.name)||k;
+      _SKILL_DATA[k]=v||{};
+      const maxp=v&&v.pp;   // 最大 PP
+      if(maxp!=null && _SKILL_PP[k]==null) _SKILL_PP[k]=maxp;   // 初始=最大pp
+    }
     miss.forEach(sid=>{ if(_SKILL_NAMES[sid]==null) _SKILL_NAMES[sid]=String(sid); });
     refreshBattle();   // 拿到名字后重绘
   }catch(e){ miss.forEach(sid=>{ if(_SKILL_NAMES[sid]==null) _SKILL_NAMES[sid]=String(sid); }); }
@@ -2418,6 +2625,68 @@ document.getElementById('battleReportCopyBtn').onclick=()=>{
   const old=btn.textContent; btn.textContent='已复制'; setTimeout(()=>{ btn.textContent=old; }, 1200);
   appendLog({t:now(),level:'ok',msg:'已复制战报('+lines.length+'行)'});
 };
+async function openChangePetPicker(state, force){
+  // 换宠: 在我方出战队伍(myTeam)里选一只, 发 2407 + 其 catchTime (int32).
+  // 用**内联列表框**取代原生 prompt() (后者在嵌入式/部分环境会被拦截导致"点了没反应").
+  // force=true: 强制换宠(当前精灵阵亡且无其它操作), 不提供"取消", 必须选一只。
+  const picker=document.getElementById('battleChangePetPicker');
+  const team=(state&&state.myTeam)||[];
+  if(!picker) return;
+  if(!team.length){ appendLog({t:now(),level:'warn',msg:'换宠: 我方出战队伍为空(需先收到2503), 无法选择'}); return; }
+  const cur=state&&state.my && state.my.catchTime;
+  const alive=team.filter(p=>p.catchTime!==cur && _petHp(p) > 0);
+  const cands=(alive.length?alive:team.filter(p=>p.catchTime!==cur));
+  if(!cands.length){ appendLog({t:now(),level:'warn',msg:'换宠: 没有可换的出战精灵'}); if(force){ 
+      const st=document.getElementById('battleActionStatus'); if(st){ st.textContent='⚠️ 我方精灵阵亡, 但没有可上场的替补!'; st.style.color='#f85149'; }
+    } return; }
+  const st=document.getElementById('battleActionStatus');
+  // 渲染可点击的候选列表
+  picker.style.display='block';
+  picker.innerHTML='';
+  const head=document.createElement('div');
+  head.style.cssText='color:#58a6ff;font:12px Menlo,monospace;margin-bottom:6px';
+  head.textContent=force ? '⚠️ 我方精灵阵亡, 请选择场上精灵:' : '选择换上场的精灵:';
+  picker.appendChild(head);
+  for(const p of cands){
+    const b=document.createElement('button'); b.type='button'; b.className='ops-btn';
+    b.style.cssText=b.style.cssText+';flex:1 1 100%;text-align:left;display:block;margin-bottom:4px';
+    b.textContent=((p.name||('id='+p.id))+'  Lv'+(p.level!=null?p.level:'?')+'  HP '+(_petHp(p)!=null?_petHp(p):'?')+'  catch='+p.catchTime);
+    b.onclick=()=>{
+      const catchTime=p.catchTime;
+      picker.style.display='none'; picker.innerHTML='';
+      doChangePet(catchTime, p, st);
+    };
+    picker.appendChild(b);
+  }
+  // 强制换宠时不提供"取消"; 普通换宠才显示
+  if(!force){
+    const cancel=document.createElement('button'); cancel.type='button';
+    cancel.style.cssText='flex:1 1 100%;background:#21262d;border:1px solid #30363d;border-radius:8px;color:#f85149;padding:6px;cursor:pointer;font:12px Menlo,monospace';
+    cancel.textContent='取消';
+    cancel.onclick=()=>{ picker.style.display='none'; picker.innerHTML=''; };
+    picker.appendChild(cancel);
+  }
+  if(st){ st.textContent= force ? '⚠️ 强制换宠: 请选择上场精灵' : '请选择要换上场的精灵'; st.style.color='#d29922'; }
+}
+async function doChangePet(catchTime, chosen, st){
+  try{ await fetch('/api/battle/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({msg:('> 点击换宠 → '+(chosen&&(chosen.name||('id='+chosen.id)))+' (catch='+catchTime+')')})}); }catch(e){}
+  if(st){ st.textContent='换宠请求 catch='+catchTime+'...'; st.style.color='#d29922'; }
+  try{
+    const r=await fetch('/api/battle/change-pet',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({catchTime:catchTime})});
+    const j=await r.json();
+    if(j.ok){
+      if(st){ st.textContent='✔ 已发送 2407 换宠 catch='+catchTime; st.style.color='#3fb950'; }
+      try{ await fetch('/api/battle/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({msg:'  服务器已受理换宠 catch='+catchTime})}); }catch(e){}
+      appendLog({t:now(),level:'ok',msg:'[对战] 已发送 2407 换宠 catch='+catchTime+' body='+(j.sent.body||'')});
+    }else{
+      if(st){ st.textContent='✘ 换宠失败: '+(j.error||''); st.style.color='#f85149'; }
+      appendLog({t:now(),level:'error',msg:'换宠失败: '+(j.error||'')});
+    }
+  }catch(e){
+    if(st){ st.textContent='✘ 换宠出错: '+e; st.style.color='#f85149'; }
+    appendLog({t:now(),level:'error',msg:'换宠出错: '+e});
+  }
+}
 async function sendBattleCmd(cmd, params){
   const st=document.getElementById('battleActionStatus'); if(st){ st.textContent='发送中 cmd='+cmd+'...'; st.style.color='#d29922'; }
   const label = (cmd===2405 && params && params.length) ? ('技能'+(_SKILL_NAMES[params[0]]||params[0])) : (window.__CM[cmd]||cmd);
@@ -2431,6 +2700,13 @@ async function sendBattleCmd(cmd, params){
       if(st){ st.textContent='✔ 已发送 cmd='+cmd+' '+label; st.style.color='#3fb950'; }
       try{ await fetch('/api/battle/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({msg:'  服务器已受理发送 cmd='+cmd+' '+label})}); }catch(e){}
       appendLog({t:now(),level:'ok',msg:'[对战] 已发送 cmd='+cmd+' '+label+' body='+(j.sent.body||'')});
+      // 技能 PP 由服务器 2505 的 AttackValue.skillList 权威同步 (renderBattleState 每次轮询会刷新);
+      // 这里只是立即重绘一次, 让点击后的变化更直观(实际数值以服务器为准, 不本地扣减)
+      if(cmd===2405 && params && params.length){
+        const sid=params[0];
+        const skc=document.getElementById('battleSkills');
+        if(skc && (window.__lastBattleSkills||[]).length) renderSkillButtons(window.__lastBattleSkills);
+      }
     }else{
       if(st){ st.textContent='✘ 发送失败: '+(j.error||''); st.style.color='#f85149'; }
       appendLog({t:now(),level:'error',msg:'对战发包失败: '+(j.error||'')});
@@ -2821,8 +3097,8 @@ function renderAvRow(containerId, arr, bag){
       const txt=document.createElement('div'); txt.className='av-txt';
       txt.textContent=displayName(p);
       b.appendChild(img); b.appendChild(txt);
-      petSlotButtons.push({btn:b, pet:p, bag:bag, index:i, kind:'bag'});
       const slotRef={btn:b, pet:p, bag:bag, index:i, kind:'bag'};
+      petSlotButtons.push(slotRef);           // 每只精灵**只**一条记录 (此前重复 push 导致 endDrag 判定 tie, 拖拽失效)
       b.onclick=(e)=>{ if(suppressClick){ suppressClick=false; return; } bagSel={bag:bag,index:i}; renderBag(); if(warehouseMode){ warSel=null; showBagInfo(); } };
       // 拖拽: mousedown 记录起点, 一旦移动超过阈值即产生复制图标 (无需长按)
       b.addEventListener('mousedown',(e)=>{
