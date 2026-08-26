@@ -252,9 +252,9 @@ lockedSkillArr(5×u32), commonChangeFaceValue.
 | 2409 | 捕捉 | `CatchPetInfo`：catchTime + petID |
 | 2410 | 逃跑 | 空包体 |
 
-### 5.7 脚本级对战体（`seerlib.Battle`）
+### 5.7 脚本级对战体（`PySeer.Battle`）
 
-`seerlib.py` 的 **`Battle`** 是对**整场对战**的脚本驱动封装：以“带 `cmdid` 的完整 HEX 包”进入对战，
+`PySeer.py` 的 **`Battle`** 是对**整场对战**的脚本驱动封装：以“带 `cmdid` 的完整 HEX 包”进入对战，
 构造时**自动等待对战成功发起**（等 `active`＋双方当前精灵，且该状态连续稳定一段时间无回退才返回，
 防止只收到 2503 队伍或瞬态就误判；后端本就在对战则直接返回），无法进入则抛 `SeerError`；随后按**操作即
 回合**推进——每个会消耗
@@ -324,7 +324,7 @@ PYTHONPATH=vendor/unitypy nohup python3 -u app/webui.py --port 8680 >/tmp/webui8
 PYTHONPATH=vendor/unitypy python3 app/assets_updater.py --force
 
 # ③ 脚本库自检（后端已登录后；会刷背包并打印 43706 包体）
-PYTHONPATH=vendor/unitypy python3 -m app.seerlib
+PYTHONPATH=vendor/unitypy python3 -m app.PySeer
 
 # ④ 离线分析抓包（不联网）
 python3 analysis/analyze_gamedump.py --out-decoded /tmp/d.txt --out-named /tmp/n.txt

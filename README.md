@@ -1,334 +1,251 @@
-# 赛尔号 (Seer) 登录测试
+# PySeer — 可脱机的赛尔号后端 · WebUI 控制台 · 第三方库
 
-一个 **纯标准库** 实现的赛尔号脱机登录协议测试工具。它复刻了赛尔号 Flash/H5 客户端
-的登录流程（淘米帐号认证 → 网关握手 → WebSocket 登录封包 → 心跳保活），可以分步骤
-验证整条登录链路是否走通，适合逆向学习与协议验证。
+> **PySeer**（曾用项目名 `seer-login-test`）是一个**纯标准库**实现的赛尔号工具套件，专注三件事：
+> **①** 一个**可脱机运行**的赛尔号协议后端；**②** 一个用于调试/观察的 **WebUI 控制台**；
+> **③** 一个**高度可扩展**的第三方库 **`PySeer`**，供脚本按命令级或对局级驱动游戏。
+>
+> 它复刻了赛尔号客户端（Flash/H5）的登录与通信流程（淘米认证 → 网关握手 → WebSocket/裸 TCP 加密登录 →
+> 会话密钥派生 → 心跳保活），用于协议学习、验证与脚本开发。
 
-> ⚠️ **使用边界**：本工具仅用于对 **你自己拥有** 的赛尔号账号做登录协议测试与学习。
-> 请勿用于批量登录、账号盗取、凭证窃取（中间人攻击）或任何违反游戏服务条款的行为。
-> 本文参考的两篇 52pojie 帖文中，`thread-1468888` 是关于**通信协议逆向与模拟**的，
-> 其中“中间人攻击窃取登录凭证”的部分**不在此实现范围内**。
-
-> 📘 **相关文档**：自更新游戏数据管线、精灵详情界面功能、协议逆向结论、脚本库 `seerlib.py`
-> 等成果详见 [docs/DEVELOPMENT.md](./docs/DEVELOPMENT.md)；给 AI / 二次开发者的**协议技术复现**
-> 速查见 [docs/REPRODUCTION.md](./docs/REPRODUCTION.md)；**脚本库 `seerlib` 的完整 API/用法**
-> 见 [docs/seerlib.md](./docs/seerlib.md)。
+> ⚠️ **使用边界**：仅用于对**你自己拥有**的赛尔号账号做协议学习与验证。请勿用于批量登录、账号盗取、
+> 凭证窃取（中间人攻击）或任何违反游戏服务条款的行为。参考的 52pojie 帖文中，**中间人攻击窃取登录凭证**
+> 的部分不在本实现范围内。游戏自动化有账号冻结风险，请自行评估。
 
 ---
 
-## 参考来源
+## 目录
 
-- [《[原创] 赛尔号：通信协议逆向与模拟&中间人攻击窃取登录凭证》](https://www.52pojie.cn/thread-1468888-1-1.html) —— 协议逆向来源
-- [《[原创] 赛尔号逆向：封包捕获与分析》](https://www.52pojie.cn/thread-2053139-1-1.html) —— 封包捕获/抓包思路
-- 公开实现：[`Altriazyk/seerNew`](https://github.com/Altriazyk/seerNew)（脱机登录参考实现）、[`iyzyi/SeerPacket`](https://github.com/iyzyi/SeerPacket)、[`Starlitnightly/seer_py`](https://github.com/Starlitnightly/seer_py)
-
-下载到本地的参考页与源码位于 `refs/` 目录，便于比对。
+- [项目定位](#项目定位)
+- [特性](#特性)
+- [目录结构](#目录结构)
+- [部署](#部署)
+- [使用](#使用)
+- [文档索引](#文档索引)
+- [合规与免责](#合规与免责)
 
 ---
 
-## 登陆协议概览
+## 项目定位
 
-```
-账号 → 淘米认证 (account-co.61.com)         得到 session
-                 │
-                 ▼
-网关解析 (seerh5login.61.com/online_gate)   得到 ws://host:port
-                 │
-                 ▼
-WebSocket 连接 ──► 发送登录封包 (cmd 0x3E9 = 1001)
-                 │
-                 ◄── 服务器登录应答 (cmd 1001, 携带序列号)
-                 │
-                 ▼
-心跳保活 (cmd 1002) + 时间校验应答
-```
+PySeer 由三部分协同组成：
 
-封包结构（编解码时以十六进制字符串表示，传输时是裸字节）：
+1. **可脱机的赛尔号后端**（`app/seer/`）
+   纯标准库（`stdlib`）实现的协议客户端：淘米认证、网关解析、WebSocket/裸 TCP 连接、封包加解密
+   （位移 + XOR，密钥 `!crAckmE4nOthIng:-)`）、登录后**会话密钥派生**（参考帖规则）、心跳保活。
+   **核心价值**：不依赖第三方库即可在本地复现整条登录与通信链路，便于逆向学习与二次开发。
 
-```
-+--------+------+--------+--------+--------+----------+
-| length |  ver | cmdId  | userId | result |   body   |
-| 4B     | 1B   | 4B     | 4B     | 4B     |   ...    |
-+--------+------+--------+--------+--------+----------+
-```
+2. **WebUI 控制台**（`app/webui.py`）
+   一个 `http.server` + SSE 的调试控制台，提供：登录操作、每个收发封包实时日志、
+   **精灵详情（属性/能力值/专属特性/技能）**、**背包/仓库拖拽管理**、**脚本运行器**（内置脚本目录），
+   以及 **图形化对战页**（自动检测到对战即打开，实时显示双方精灵/技能/回合/战报）。
+   同时内置**自更新游戏数据管线**（`assets_updater.py`），从游戏资源自动导出精灵名/属性/技能/魂印等。
 
-关键算法：
+3. **第三方库 `PySeer`**（`app/PySeer.py`）
+   面向脚本开发者提供的高扩展库（仅 `urllib`），通过 HTTP 调用已登录的后端。分两个层次：
+   - **命令级 `Seer`**：发/收/取包、查/改背包、查物品数量（`send`/`recv`/`get_value`/`get_recv_value`
+     /`set_bag`/`find_pet`/`get_item_count`）。
+   - **对局级 `Battle`**（对战体）：以"带 `cmdid` 的完整 HEX 包"进入对战，**自动按回合推进**（操作即回合、
+     死亡切换不消耗回合、进场自动完成），可读取当前回合数据并用任意复杂判断驱动决策。
 
-- **MD5**：淘米认证中 `passwd` 字段 = 明文密码的 MD5。
-- **协议体加解密（`Encrypt`/`Decrypt`）**：`位移 + XOR` 的简单对称算法，密钥
-  `!crAckmE4nOthIng:-)`，详见 `seer/algorithm.py`。
-- **序列号（`MSerial`）**：用包体异或值 + 包体长度 + 命令号生成合法性序列号。
+> 旧名 **`seerlib`** 仍保留为兼容别名（`app/seerlib.py` 原样转出 `PySeer`），`from seerlib import ...`
+> 依旧可用；新代码请统一 `import PySeer`。
+
+---
+
+## 特性
+
+- **零第三方依赖**：后端与脚本库均只用 Python 标准库（`urllib`/`http.server`/`socket`/`ssl`）。
+- **可脱机**：整条登录链路 + 封包结构 + 算法在本地复刻，不依赖他人解析表；游戏数据也由内置管线**自更新**。
+- **WebUI 实时控制台**：SSE 实时日志、收发包过滤、命令名映射（`cmdmap.json`，约 2910 条）、精灵详情/专属特性/技能、
+  背包与仓库拖拽、脚本运行器、图形化对战页。
+- **高扩展第三方库**：`Seer`（命令级）与 `Battle`（对局级）分层；`Battle` 自动处理回合/进场/换宠，
+  脚本只需写判断逻辑。
+- **多端可跑**：从项目根或 `app/` 目录均可运行，只需 `PYTHONPATH` 含 `vendor/unitypy`（用于数据自更新）。
 
 ---
 
 ## 目录结构
 
 ```
-seer-login-test/
+PySeer/
 ├── app/                     # 程序文件 (运行必需)
-│   ├── login_test.py        # 入口：分步骤 PASS/FAIL 的运行器
-│   ├── webui.py             # 协议调试 WebUI (http://127.0.0.1:8680)
-│   ├── seerlib.py           # 脚本第三方库 (Seer.send/recv/get_value)
-│   ├── assets_updater.py    # 自更新游戏数据管线
-│   ├── seer/                # 可复用的协议包
+│   ├── webui.py             # WebUI 控制台 (http://127.0.0.1:8680): 登录/日志/精灵详情/脚本/对战页
+│   ├── PySeer.py            # 第三方库: Seer(命令级) + Battle(对战体)
+│   ├── seerlib.py           # PySeer 的旧名兼容别名 (from seerlib import ... 仍可用)
+│   ├── assets_updater.py    # 自更新游戏数据管线 (精灵名/属性/技能/魂印/头像)
+│   ├── login_test.py        # 登录协议自检/测试入口
+│   ├── mock_server.py       # 模拟网关 (不联网自检用)
+│   ├── cmdmap.json          # 命令 id -> 命令名 (约 2910 条)
+│   ├── seer/                # 协议客户端包 (可脱机后端核心)
 │   │   ├── algorithm.py     # MD5 / Encrypt / Decrypt / MSerial
-│   │   ├── misc.py          # hex / bytes / int 协议格式转换
+│   │   ├── body.py          # pack_body / decode_body / parse_parts
 │   │   ├── packet.py        # PacketData 构建/解析 + 包体加解密
-│   │   ├── session.py       # 淘米认证 (account-co.61.com) -> session
-│   │   ├── ws_client.py     # 标准库最小 WebSocket 客户端 (socket/ssl)
-│   │   └── client.py        # SeerClient：连接/登录/心跳流程
-│   ├── cmdmap.json          # 命令 id -> 命令名
-│   └── requirements.txt     # 说明：无第三方依赖
+│   │   ├── session.py       # 淘米认证 -> session
+│   │   ├── client.py        # SeerClient: 连接/登录/心跳/会话密钥派生
+│   │   ├── ws_client.py     # 标准库最小 WebSocket 客户端
+│   │   ├── tcp_client.py    # 游戏服务器裸 TCP 加密客户端
+│   │   ├── petinfo.py       # PetInfo 各段解析 (依据反编译 *.as)
+│   │   ├── fightinfo.py     # 对战包解析 (2503/2504/2505/2506/2407/...)
+│   │   └── misc.py
+│   └── scripts/             # "脚本"页默认脚本目录 (用户把 .py 放进来即可在页面运行)
 ├── data/                    # 运行时下载/生成的资源 (git 忽略)
-├── refs/                    # 下载的反编译源码/参考帖文 (git 忽略)
+├── refs/                    # 逆向参考资料 (git 忽略)
 ├── analysis/                # 抓包分析工具与产物 (git 忽略)
-├── docs/                    # 文档 (DEVELOPMENT / REPRODUCTION)
-└── cache/ vendor/ webui_logs/  # 运行时缓存/用具/日志 (git 忽略)
+├── docs/                    # 文档 (开发成果/协议复现/PySeer API)
+├── cache/  vendor/  webui_logs/   # 运行时缓存/用具/日志 (git 忽略)
+└── README.md                # 本文档
 ```
-
-> 目录分类：**程序文件**在 `app/`（git 跟踪）；**运行时下载/生成的资源**在 `data/`；
-> **逆向参考资料**在 `refs/`；**分析工具与产物**在 `analysis/`；**文档**在 `docs/`。
-> `data/`、`refs/`、`analysis/`、`cache/`、`vendor/`、`webui_logs/` 均被 `.gitignore` 忽略，
-> 仓库只跟踪 `app/` 源码、`README.md`、`docs/` 与 `.gitignore`。
 
 ---
 
-## 运行
+## 部署
 
-### 0) 环境
+### 环境要求
 
-仅需 **Python ≥ 3.8**，无第三方依赖。
+- **Python ≥ 3.8**，无第三方依赖。
+- （可选）数据自更新需要 `vendor/unitypy`（若缺失，`assets_updater` 会自动安装到 `vendor/`，不污染系统）。
+- 建议在项目根目录执行命令（后端/脚本库会通过 `__file__` 自动定位项目根与 `data/`）。
 
-### 1) 离线自检（不联网）
-
-验证算法、封包、加解密、JSONP 解析是否正确：
+### 1) 启动后端 / WebUI 控制台
 
 ```bash
-python3 app/login_test.py --self-test
+# 项目根目录; PYTHONPATH 指向 vendor/unitypy (用于数据自更新)
+PYTHONPATH=vendor/unitypy nohup python3 -u app/webui.py --port 8680 >/tmp/pyseer_webui.log 2>&1 &
 ```
 
-### 2) 干运行（不联网）
+启动后浏览器打开 **http://127.0.0.1:8680/** 。在「登录」页填米米号 + 密码并登录（默认连
+游戏服务器 `101.43.19.60:1201`）。登录成功后自动派生会话密钥并开启后台监听。
 
-验证登录封包能否正常构建（不访问服务器）：
+常用参数（`python3 app/webui.py --help` 查看全部）：
+
+| 参数 | 说明 |
+|---|---|
+| `--host` | 监听地址（默认 `127.0.0.1`） |
+| `--port` | 监听端口（默认 `8680`；`--port 0` 自动选空闲端口，实际端口写入 `data/webui_addr.json`） |
+| `--no-update` | 启动时不检查/更新本地精灵头像（默认会自动更新） |
+| `--update-force` | 强制重下载并解包精灵头像 |
+
+> 📌 后端会把**实际监听地址**写入 `data/webui_addr.json`，脚本库 `PySeer` 运行时据此自动定位后端。
+
+### 2) 自更新游戏数据（可选）
 
 ```bash
+PYTHONPATH=vendor/unitypy python3 app/assets_updater.py --force
+```
+
+产出到 `data/`：`petbook.json`（精灵名）、`pet_attr.json`（属性）、`skills.json`（技能）、
+`soulmarks.json`（专属特性/魂印）、`head/*.png`（头像）、`effecticon/*.png`（效果图标）。
+每份数据带版本状态文件，命中版本即跳过。
+
+### 3) 登录协议自检 / 干跑（不联网）
+
+```bash
+# 离线自检: 验证算法/封包/加解密/JSONP 解析
+python3 app/login_test.py --self-test
+# 干跑: 不访问服务器, 仅本地构建登录封包
 python3 app/login_test.py --account 1234567890 --password 你的密码 --dry-run
 ```
 
-### 3) 真实登录测试
+---
 
-使用你自己的米米号与密码。**密码 `!` `.` `@` `$` 等特殊字符会被 shell 解释**（例如 bash
-里 `!` 触发历史展开），所以**不要**直接把它们写在命令行里，推荐下列任一种方式：
+## 使用
 
-**方式一：环境变量（推荐）**
+### 1. WebUI 控制台
 
-```bash
-export SEER_ACCOUNT=你的米米号
-export SEER_PASSWORD='p@ss!w.rd'   # 用单引号包裹, 防止 ! 被历史展开
-python3 app/login_test.py
+`webui.py` 的页面分四大块：
+
+- **登录**：填米米号/密码/游戏服IP/端口一键登录（或提供 `session` 跳过淘米认证）。
+- **日志 / 响应表**：SSE 实时推送每个收发封包（含命令名、命令号、包体、十进制数组）；可按"过滤包id"
+  与"收发开关"筛掉噪声包。
+- **精灵/背包**：精灵详情（属性/能力值/专属特性/技能）、背包与仓库拖拽、切换阵容、查询背包精灵(43706)。
+- **脚本**：列出 `app/scripts/` 下的 `.py` 脚本，一键后台运行，`print` 实时输出到"脚本输出"控制台。
+- **对战**：**后台一旦监听到对战行为即自动切到对战页**——图形化显示我方/敌方当前出战精灵（头像/血条/等级）、
+  双方出场队伍、技能按钮（点击发 `2405 USE_SKILL`）、换宠/用药/捕捉/逃跑；并可手动粘贴"带 cmdid 的完整 HEX 包"
+  发起任意对战。战报已**精简**为：对战开始 / 每回合在场精灵"使用技能+剩余HP" / 对战结果。
+
+### 2. 第三方库 `PySeer`
+
+脚本库通过 HTTP 调用已登录的后端，脚本只需 `import PySeer`（自动定位后端，无需硬编码地址）。
+
+#### 快速开始 — 命令级 `Seer`
+
+```python
+from PySeer import Seer
+s = Seer()                                  # 自动定位后端
+s.send(43706)                              # 发包(不等待响应)
+pkt = s.recv(2301, [3266, 0, 0, 0])        # 发包并等该命令 RECV, 返回 Packet
+print(pkt.ints, s.get_value(pkt, 0))       # 取应答第 0 个 int32
+n = s.get_item_count(2600048)              # 物品数量 (发 42399, 取应答第 3 个参数)
+r = s.find_pet(5000)                       # 查某物种在哪
+s.set_bag([5000, 5001, 5002])              # 物理重排背包为指定阵容
 ```
 
-**方式二：密码文件**
+#### 快速开始 — 对局级 `Battle`
 
-```bash
-printf 'p@ss!w.rd\n' > pass.txt   # 首行为密码, 自动去除换行
-python3 app/login_test.py --account 你的米米号 --password-file pass.txt
+```python
+from PySeer import Battle
+battle = Battle("带cmdid的完整HEX包")     # 发送对战包 + 自动进场 (失败抛 SeerError)
+while not battle.finished:
+    my = battle.my or {}
+    if (my.get('hp') or 0) <= 0:                       # 阵亡 -> 死亡切换(不耗回合)后出招
+        battle.change_pet(battle.my_team[1]['id'])
+        battle.use_skill(battle.skills[0])
+    elif (my.get('hp') or 0) < 300:
+        battle.use_item(70001)                         # 用道具(耗一回合)
+    else:
+        battle.use_skill(battle.skills[0])             # 用技能(耗一回合)
+    rnd = battle.round
+    print(rnd.get('first', {}).get('lostHP'))
 ```
 
-**方式三：交互输入（密码不回显）**
+也可用 `battle.run(decide)` 自动驱动整场直到结束包：
 
-```bash
-python3 app/login_test.py --account 你的米米号
-# 之后按提示输入密码, 输入时不显示
+```python
+def decide(b):
+    if b.my and (b.my.get('hp') or 0) <= 0:
+        b.change_pet(b.my_team[1]['id']); b.use_skill(b.skills[0])
+    else:
+        b.use_skill(b.skills[0])
+battle.run(decide)
 ```
 
-**方式四：直接传参（仅当密码不含特殊字符时）**
+#### 主要 API 一览
 
-```bash
-python3 app/login_test.py --account 你的米米号 --password '你的密码'
-```
+| 层次 | 类/函数 | 说明 |
+|---|---|---|
+| 命令级 | `Seer().send(cmd, params)` | 发包（不等待响应） |
+| 命令级 | `Seer().recv(cmd, params, timeout=8)` | 发包并等该命令 RECV，返回 `Packet` |
+| 命令级 | `Seer().get_value(body, index)` | 从包体取第 `index` 个 int32 |
+| 命令级 | `Seer().get_recv_value(cmd, params, index)` | 发包→等 RECV→取应答第 `index` 个值 |
+| 命令级 | `Seer().get_item_count(item_id)` | 获取物品数量（发 42399，取应答第 3 个参数） |
+| 命令级 | `Seer().set_bag(ids)` | 物理重排背包为指定物种 id 列表（发真实命令） |
+| 命令级 | `Seer().find_pet(ids)` | 查找物种在背包/仓库/精英背包的位置 |
+| 对局级 | `Battle(hex)` / `Battle().start(hex)` | 发送 HEX 包进入对战并自动进场 |
+| 对局级 | `Battle().use_skill(id)` / `use_item(...)` / `capture(...)` | 各操作，发包后自动等本回合结算(2505) |
+| 对局级 | `Battle().change_pet(id)` | 换宠（默认自动判断死亡切换/主动切换） |
+| 对局级 | `Battle().escape()` | 逃跑并等对战结束(2506) |
+| 对局级 | `Battle().run(decide)` | 自动驱动整场直到结束包(2506) |
+| 对局级 | `battle.my/other/round/skills/report/...` | 读取当前对战/回合数据（详见 `docs/PySeer.md`） |
+| 公共 | `SeerError` | 库调用异常（未登录/参数错/超时/越界等） |
+| 公共 | `discover_backend()` | 自动定位后端地址 |
 
-输出示例（分步骤）：
-
-```
-=== 赛尔号登录测试 ===
-
-米米号: 1234567890 | 密码: ******
-
-✅  [PASS] 步骤1 获取淘米 session — session=xxxxxxxxxxxxxxxx...
-✅  [PASS] 步骤2 构建登录封包 — packet=169B cmd=1001
-✅  [PASS] 步骤3 连接网关 — ws://xx.xx.xx.xx:xxxx
-✅  [PASS] 步骤4 发送登录封包
-✅  [PASS] 步骤5 等待登录应答 — cmd=1001 result=...
-✅  [PASS] 步骤6 发送心跳/时间校验 — 序列号=0x...
-```
-
-### 保持会话存活（--hold）
-
-默认情况下，脚本验证完登录后会**立即断开**连接（所以不会影响正在线的官方客户端）。
-如果你希望脚本**登录后不退出、持续心跳，让账号处于被脚本占用的在线状态**，加 `--hold`：
-
-```bash
-python3 app/login_test.py --hold                  # 一直保持, 直到 Ctrl+C
-python3 app/login_test.py --hold --hold-seconds 60   # 保持 60 秒后自动退出
-python3 app/login_test.py --hold --hold-interval 5   # 心跳间隔 5 秒 (默认)
-python3 app/login_test.py --hold --verbose           # 打印每次收到的封包
-```
-
-`--hold` 模式下脚本会保持 WebSocket 连接，定期发心跳（cmd 0x3EA），并自动应答服务器的时间同步请求，
-直到你按 Ctrl+C 或到达 `--hold-seconds` 时长。**这通常会把另一端在线的官方客户端挤下线**
-（单账号在线互斥，具体以服务器策略为准）。
-
-> ℹ️ 注意：`--hold` 是"保持会话"，不等于"进入游戏场景"。它让账号处于协议级在线状态并维持连接，
-> 但还没有发送进入全场景/竞技场的后续命令。若需要真正接管游戏内操作，需要继续往下扩展协议。
-
-### 游戏服务器裸 TCP 加密登录（--game-login）
-
-这是**登录器/Flash 客户端**的登录方式。经抓包逆向确认，登录器连的是游戏服务器
-（默认 `101.43.19.60:1201`，**裸 TCP**，不是 WebSocket），并且**所有封包（包括登录）
-都被 seer 算法加密**（密钥 `!crAckmE4nOthIng:-)`）。登录封包为 `cmd=1001`，
-body = `session(16B)` + `"unknown"` + 填充 + `[1,1,1]` + `"flash_taomee"` + 填充。
-
-```bash
-python3 app/login_test.py --game-login            # 用默认服务器 101.43.19.60:1201
-python3 app/login_test.py --game-login --game-host 101.43.19.60 --game-port 1201
-python3 app/login_test.py --game-login --verbose  # 打印每个解密封包
-python3 app/login_test.py --game-login --game-seconds 15   # 读角色数据最多 15 秒
-```
-
-它会：获取淘米 session → 连接游戏服务器 → 发送加密登录 `1001` → 收到并解密服务器的
-**角色数据**（`cmd=1001` 大包，含 `uid` + 昵称），从而验证"登录器方式"的登录链路。
-
-**会话密钥（登录后自动切换）**：命令号 <1000 的封包是明文，>1000 的用 seer 算法加密。
-登录（`cmd=1001`）之后，按参考帖规则自动派生出**会话密钥**，之后所有封包都用它加解密：
-
-```
-seed = LOGIN_IN 响应明文最后4字节 (uint)
-xor  = seed ^ 米米号
-key  = md5(str(xor)).hexdigest()[:10]     # 取 hex 前10位
-```
-
-`SeerClient.login_game()` 登录后会调用 `derive_session_key()` 自动切换，因此能够继续解密
-登录后的玩法封包（如 `ENTER_MAP`=2001、`LEAVE_MAP`=2002、`40001/40002/...` 等）。
-
-**封包结构参考（明文）**：`[长度(4)][版本(1)][命令号(4)][米米号(4)][序列号(4)][包体]`。
-实测示例（命令号 `42399`=MULTI_ITEM_LIST，参数 `1,2600048`）重放得到，与抓包逐字节一致：
-
-```
-00 00 00 19  31  00 00 A5 9F  00 00 00 00  00 00 00 00  00 00 00 01 00 27 AC 70
-└─长度=25─┘  └版┘  └命令号42399┘  └米米号=0┘  └序列号=0┘ └── 包体: int32(1), int32(2600048) ──┘
-```
-
-> 说明：示例中「米米号」「序列号」为 0（裸字段示意）。登录态真实发包时，工具会把 `米米号`
-> 填为当前账号、`序列号` 填为按 `MSerial` 计算的序列号（`...A59F 383934A3 00000184 ...`）。
-
-
-> ⚠️ 这一步会连**真实游戏服务器**。请只用你自己的账号；游戏自动化有账号冻结风险。
+> 📘 `PySeer` 的**完整 API / 参数 / 返回 / 示例 / 注意事项**见专项文档 [`docs/PySeer.md`](./docs/PySeer.md)。
 
 ---
 
-## 协议调试 WebUI（webui.py）
+## 文档索引
 
-一个**纯标准库**（`http.server` + SSE）的调试界面，方便人工调试登录与封包：
-
-```
-python3 app/webui.py --host 127.0.0.1 --port 8680
-# 浏览器打开 http://127.0.0.1:8680/
-```
-> 默认端口 `8680`;若被占用,`--port 0` 会自动选一个空闲端口(打印实际端口),或
-> `python3 app/webui.py --port <新端口>` 手动换。
-
-界面三个功能区：
-
-1. **登录操作**：填米米号/密码/游戏服IP/端口，点"登录"。它会：淘米认证（或调用方提供 session 时跳过）→ 连游戏服务器 → 发登录(1001) → **自动派生会话密钥**。
-2. **日志输出**：`/api/stream` 用 **SSE** **实时**推送所有日志（登录流程/每个收发封包/**命令名**/命令号/包体/会话密钥），页面自动滚动。**去掉了原来的 1200ms 轮询与 seq 去重限制**，改为按事件实时追加。顶部有过滤栏：
-   - **过滤包id**：名单内的包命令号会被**舍弃**（默认 `40002,2192,41228,4047,4475,41080,9134,2604,9019,2101,2004,3405,2601,2002,43321,1002,9908`，可编辑，点"应用过滤"保存；`/api/filter` 读写，**持久化到 `webui_filter.json`**）
-   - **接收send / 接收recv**：两个复选框可分别决定是否显示 send 包 与 recv 包
-   - 改动过滤或勾选后即时生效（无过滤的已存封包会按新规则重新显示/隐藏）
-3. **发包测试**：登录成功后，填"**命令名或命令号** + 包体参数"点"发送"，用当前连接（会话密钥加密）发出一条封包，并读取服务器解密后的应答。命令名来自 `Command.cs` 的字典（`cmdmap.json`，共 2910 条），如 `ENTER_MAP`、`GET_PET_INFO`。命令输入框上方有"**命令（全部）**"下拉，可选全部 2910 条命令（选中即回填命令名，便于发送）；下面文本框也可输入过滤（输入 `ENTER` 会自动补全），发送时按名字解析成命令号。
-
-   **实时监听（最新）**：登录后工具启动**后台监听线程**，实时读取服务器的一切回包；**签发不再阻塞等待应答**——点"发送"只是把包发出去，服务器应答（以及一切 send/recv 封包）随后实时出现在"**服务器响应**"表格里。表格**内容可选中/复制**，列为：`类型`（SEND/RECV）、`命令号`、`包体(hex)`、`十进制数组`；并受**过滤包id**与**接收send/接收recv**复选框约束。因此发完 42399 后，你立刻能在表格里看到自己发出与服务器回应的 42399 及其十进制数组。
-
-   **应答转十进制数组（新增）**：每条收到的封包会按标准包体（4 字节大端 int32）拆成**十进制数组**，显示在"服务器响应"表格的最后一列（如 `[1, 2600048, ...]`）；非 int32 对齐的尾部字节单独标注。
-
-   **包体输入（新增）**：包体默认按"**十进制参数列表**"输入，逗号/空格分隔，发送时自动转成标准包体（每个参数按 **4 字节大端 int32** 依次拼接，与 `Command.cs` 参考包一致）。例：填写 `0 10 725 172` 会打包成 `00 00 00 00 00 00 00 0a 00 00 02 d5 00 00 00 ac`（即 ENTER_MAP 的 `[0][地图号][x][y]`）。输入框下方实时预览打包后的十六进制与分包明细。另支持：
-   - `h:010203` 直接给原始十六进制字节
-   - `b:255` 单个字节
-   - `s:文本` 1 字节长度前缀 + UTF-8 文本
-   - 勾选"**原样HEX**"则把输入当作十六进制直接发送（用于调试原始封包）
-
-   **查询背包精灵（新增）**：点"**查询背包精灵(43706)**"发送 `43706 GET_PET_INFO_BY_ONCE`（空包体），后台监听线程读取应答后，用 `seer/petinfo.py` 的 `parse_front()` 按反编译 `PetInfo.as` 布局解析出 `id/名字/等级/经验/天赋/性格/六维(体力/攻击/防御/特攻/特防/速度)/学习力`。**说明**：目前只能可靠解出**第一背包数量**和**第一只精灵**；要按 `[第一背包数][pet1][pet2]...[第二背包数]...` 切割出所有精灵，需要 `PetSkillInfo`/`PetEffectInfo`/`PetResistanceInfo` 的字节布局（它们位于 `PetInfo` 中段，为可变长技能/特性/抗性）。另支持 `2301 GET_PET_INFO` 单只精灵解析（同样用 `parse_front`）。`seer/petinfo.py` 的字段顺序严格对应源码 `PetInfo` 构造函数，能力值（hp/attack/defence/s_a/s_d/speed/dv/nature/level/exp/ev_*）都在技能段之前。
-
-HTTP 接口：
-
-| 接口 | 方法 | 说明 |
-| --- | --- | --- |
-| `/` | GET | 调试页面 |
-| `/api/login` | POST | `{account,password,host,port,session?}` 发起登录 |
-| `/api/send` | POST | `{cmd,body,encode,count,timeout}` 发包并读应答（`cmd` 支持命令名或命令号；`encode="pack"`(默认)把 `body` 当作参数列表打包，`"hex"` 原样十六进制） |
-| `/api/cmdmap` | GET | Command.cs 命令名字典（id→name，2910 条），供前端补全 |
-| `/api/body-preview` | POST | `{spec}` 把参数列表打包成标准包体，返回 `{hex,length,parts}`（前端实时预览） |
-| `/api/status` | GET | 当前状态 |
-| `/api/log` | GET | 全部日志 |
-| `/api/stream` | GET | SSE 实时日志流 |
-| `/api/filter` | GET/POST | 读取/保存过滤包id名单（`{ids:[...]}`，名单内的包舍弃） |
-| `/api/disconnect` | POST | 断开当前连接 |
-
-> `session` 字段可省略；提供时可跳过淘米认证（便于对 mock 服务器调试）。
-
-### 分析登录后的封包（--log-file）
-
-当前实现只覆盖了"网关认证"层（登录 1001 + 心跳）。要**真正顶掉官方客户端 / 进入游戏**，
-需要网关之后的"进游戏"封包序列——这部分不在公开参考里，需要抓真实客户端的报文来分析。
-本工具可以把你登录后**收到/发出的每个封包**完整记录到文件，方便排查缺口：
-
-```bash
-python3 app/login_test.py --hold --log-file packets.txt --verbose
-```
-
-`packets.txt` 会记录每一帧的 `时间 方向 cmd 包体 完整hex`，例如：
-
-```
-12:00:01 SEND cmd=1001 body=0123456789abcdef... full=000000a931000003e9...
-12:00:02 RECV cmd=1001 body=00000000 full=0000001531000003E9...0000271200000000
-12:00:05 SEND cmd=1002 body= full=0000001131000003ea...
-```
-
-把这份日志贴给我，我就能据此判断登录后服务端还要求哪些后续命令，并继续实现。
-
-### 参数
-
-| 参数 | 说明 |
-| --- | --- |
-| `--account` | 米米号（账号）；也可用环境变量 `SEER_ACCOUNT` |
-| `--password` | 帐号明文密码；含特殊字符时建议改用环境变量/文件/交互输入 |
-| `--password-file` | 从文件读取密码（取首行，自动去除换行） |
-| `--auth-url` | 覆盖淘米认证接口（默认 `https://account-co.61.com/...`） |
-| `--gateway` | 覆盖网关入口 URL（默认 `https://seerh5login.61.com/online_gate`） |
-| `--connect-url` | 直接指定 WebSocket 地址，跳过网关解析 |
-| `--log-file` | 把每个收发封包（时间/方向/cmd/完整hex）写入文件，供分析 |
-| `--hold` | 登录成功后保持连接并持续心跳（不立即断开） |
-| `--hold-seconds` | 保持连接的秒数，0=直到 Ctrl+C |
-| `--hold-interval` | 心跳间隔（秒），默认 5 |
-| `--timeout` | 网络超时（秒，默认 15） |
-| `--ack-timeout` | 等待登录应答超时（秒，默认 12） |
-| `--dry-run` | 不联网，仅本地构建封包 |
-| `--self-test` | 仅运行算法/封包离线自检 |
-| `--verbose` | 打印完整错误堆栈 |
-
-**凭证来源优先级**：命令行参数 > 环境变量 `SEER_ACCOUNT`/`SEER_PASSWORD` > `--password-file` >
-交互输入（`getpass`，密码不回显，也不会出现在进程参数里）。
+| 文档 | 内容 |
+|---|---|
+| [`docs/DEVELOPMENT.md`](./docs/DEVELOPMENT.md) | 开发成果整理：自更新数据管线、精灵详情功能、协议逆向结论、`PySeer` 脚本库、待办 |
+| [`docs/REPRODUCTION.md`](./docs/REPRODUCTION.md) | 给 AI / 二次开发者的**协议技术复现**速查（登录/加解密/封包/精灵/对战解析） |
+| [`docs/PySeer.md`](./docs/PySeer.md) | **第三方库 `PySeer` 的完整 API / 用法** |
 
 ---
 
-## 说明与注意事项
+## 合规与免责
 
-1. **协议可能随版本变化**：赛尔号是 Flash/H5 客户端，登录与网关参数、密钥、封包体
-   都可能随版本更新。若真实登录失败，请重新抓包比对 `refs/` 里的资料并更新
-   `seer/client.py` 中的封包体、`seer/algorithm.py` 中的密钥、`seer/session.py`
-   中的认证参数。
-2. **序列号十分重要**：服务器会校验每个封包的 `result`（序列号）字段。本项目按
-   seerNew 的 `MSerial` 计算，若服务器行为有变需同步调整。
-3. **明文密码仅用于本地**：密码只在本地计算 MD5 后发送，不会以明文落盘；但仍建议
-   仅在受控环境运行，勿在他人机器上使用。
-4. **合规**：请遵守淘米/赛尔号服务条款，仅测试自己的账号。
+1. 本工具仅用于对**你自己拥有**的账号做登录协议测试与学习；请勿用于批量登录、盗号、凭证窃取或违反服务条款。
+2. 明文密码仅在本地计算 MD5 后发送，不会以明文落盘；仍请在受控环境运行，勿在他人机器上使用。
+3. 协议/密钥可能随版本更新：若真实登录失败，参考 `refs/` 与 `docs/REPRODUCTION.md` 对齐最新参数。
+4. 游戏自动化有账号冻结风险，请自行评估并遵守淘米/赛尔号服务条款。

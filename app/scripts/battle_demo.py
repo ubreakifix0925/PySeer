@@ -12,7 +12,7 @@
   从游戏抓包或已记录的封包得到). 下面是占位, 直接运行会因命令号无效而失败.
 """
 
-from seerlib import Battle, SeerError
+from PySeer import Battle, SeerError
 
 # 带 cmdid 的完整 HEX 包(作为对战进入输入). 示例结构 [len4][ver0x31][cmd4][uid4][res4][body].
 # 实际请替换为你抓到的对战触发包(如挑战 Boss / 邀战), 下面的 0x00 只是长度错误的占位.

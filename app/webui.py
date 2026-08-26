@@ -52,7 +52,7 @@ _LOG_DIR = os.path.join(_PROJ, "webui_logs")
 _CRED_FILE = os.path.join(_DATA_DIR, "webui_credentials.json")
 _FILTER_FILE = os.path.join(_DATA_DIR, "webui_filter.json")
 _CMDMAP_FILE = os.path.join(_SRC_DIR, "cmdmap.json")
-# 后端实际监听地址写到这里, 供 seerlib 脚本运行时自动定位 (见 seerlib.discover_backend)
+# 后端实际监听地址写到这里, 供 PySeer 脚本运行时自动定位 (见 PySeer.discover_backend)
 _ADDR_FILE = os.path.join(_DATA_DIR, "webui_addr.json")
 _HEAD_DIR = os.path.join(_DATA_DIR, "head")  # 精灵头像(按物种id)目录
 _EFFECT_ICON_DIR = os.path.join(_DATA_DIR, "effecticon")  # 魂印/效果图标目录
@@ -719,7 +719,7 @@ def save_creds(account, password):
 
 
 def write_addr_file(host, port):
-    """把后端实际监听地址写入 webui_addr.json, 供 seerlib 脚本运行时自动定位.
+    """把后端实际监听地址写入 webui_addr.json, 供 PySeer 脚本运行时自动定位.
 
     ``--port 0`` 会自动选空闲端口, 因此实际端口到启动后才确定; 这里把最终地址
     持久化下来, 脚本无需硬编码 ``http://127.0.0.1:8680``.
@@ -835,7 +835,7 @@ def list_scripts():
 
 
 def _script_env():
-    """构造脚本子进程环境: 把源码目录放 PYTHONPATH, 使脚本可 import seerlib/seer."""
+    """构造脚本子进程环境: 把源码目录放 PYTHONPATH, 使脚本可 import PySeer/seer."""
     env = dict(os.environ)
     env["PYTHONPATH"] = _SRC_DIR + os.pathsep + (env.get("PYTHONPATH") or "")
     return env
@@ -1661,7 +1661,7 @@ class Handler(BaseHTTPRequestHandler):
             if cli is None:
                 return self._send_json({"ok": False, "error": "尚未登录, 无法发包"}, 400)
             # 发起对战即视为"新一场对战开始": 清掉上一场遗留的结束标记与最后回合数据.
-            # 否则脚本端(seerlib.Battle)在等待本场 2503 期间, 会把它误判成"上一场结束包"
+            # 否则脚本端(PySeer.Battle)在等待本场 2503 期间, 会把它误判成"上一场结束包"
             # (二次运行会因此抛"对战未能正常进入(收到了结束包)")。
             with _LOCK:
                 _BATTLE["finished"] = False
@@ -3384,7 +3384,7 @@ def main():
     log("tip", "填写米米号/密码后点『登录』; 登录过程与每个收发封包会实时输出到日志。")
     print("登录后可在页面发包; 日志实时流。Ctrl+C 退出。")
 
-    # 把实际监听地址写入 webui_addr.json, 供 seerlib 脚本运行时自动定位后端
+    # 把实际监听地址写入 webui_addr.json, 供 PySeer 脚本运行时自动定位后端
     write_addr_file(args.host, actual)
 
     def _on_sigterm(signum, frame):

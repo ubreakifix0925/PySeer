@@ -1,6 +1,6 @@
-# seerlib — 赛尔号 Python 脚本库（完整说明）
+# PySeer — 赛尔号 Python 脚本库（完整说明）
 
-> `seerlib.py` 是供脚本使用的**第三方库**：只需标准库（`urllib`），对接 **seer-login-test 后端（`webui.py`）** 的 HTTP 接口，
+> `PySeer.py` 是供脚本使用的**第三方库**：只需标准库（`urllib`），对接 **PySeer 后端（`webui.py`）** 的 HTTP 接口，
 > 让脚本驱动已登录的游戏账号发/收包、查/改背包、以及**自动按回合驱动对战**。
 > 相关文档：[README](../README.md)、[DEVELOPMENT](./DEVELOPMENT.md)、[REPRODUCTION](./REPRODUCTION.md)。
 
@@ -22,14 +22,14 @@
 
 ## 1. 前置条件与运行
 
-`seerlib` 本身不含连接逻辑，它通过 HTTP 调用后端。因此需要：
+`PySeer` 本身不含连接逻辑，它通过 HTTP 调用后端。因此需要：
 
 1. **后端已启动并登录**：在项目根目录运行
    ```bash
    PYTHONPATH=vendor/unitypy nohup python3 -u app/webui.py --port 8680 >/tmp/webui8680.log 2>&1 &
    ```
    并在 WebUI（`http://127.0.0.1:8680/`）登录一个你拥有的游戏账号。
-2. **脚本能 import seerlib**：把项目根目录或 `app/` 放进 `PYTHONPATH`：
+2. **脚本能 import PySeer**：把项目根目录或 `app/` 放进 `PYTHONPATH`：
    ```bash
    PYTHONPATH=app python3 你的脚本.py
    ```
@@ -42,10 +42,10 @@
 
 ## 2. 后端地址自动发现
 
-`seerlib` 自动定位后端，脚本**不必硬编码地址**：
+`PySeer` 自动定位后端，脚本**不必硬编码地址**：
 
 ```python
-from seerlib import Seer
+from PySeer import Seer
 s = Seer()          # 交给 discover_backend() 自动找
 ```
 
@@ -67,10 +67,10 @@ s = Seer()          # 交给 discover_backend() 自动找
 ## 3. 基本类型（`Packet` / `SeerError`）
 
 ### `SeerError`
-`seerlib` 里的异常统一用 `SeerError` 抛出：未登录、参数错误、等待响应超时、取值越界、后端返回错误等。
+`PySeer` 里的异常统一用 `SeerError` 抛出：未登录、参数错误、等待响应超时、取值越界、后端返回错误等。
 
 ```python
-from seerlib import SeerError
+from PySeer import SeerError
 try:
     s.recv(2405)
 except SeerError as e:
@@ -116,7 +116,7 @@ print(pkt.body, pkt.ints[:5], pkt.raw.hex(), pkt[0])
 ## 5. `Seer`：命令级发/收/取、背包操作
 
 ```python
-from seerlib import Seer
+from PySeer import Seer
 s = Seer()          # 自动定位后端
 ```
 
@@ -221,7 +221,7 @@ r = s.find_pet(5000)
 - `entry_timeout`：进入对战/单次等待超时。
 
 ```python
-from seerlib import Battle
+from PySeer import Battle
 battle = Battle("带cmdid的完整HEX包")     # 发送对战包 + 自动进场; 失败抛 SeerError
 while not battle.finished:
     my, other = battle.my, battle.other
@@ -368,7 +368,7 @@ battle.run(decide)
 
 ### 示例一：查背包 + 取值 + 换背包
 ```python
-from seerlib import Seer
+from PySeer import Seer
 s = Seer()
 # 刷新背包
 s.send(43706)
@@ -383,7 +383,7 @@ s.set_bag([5000, 5001, 5002])
 
 ### 示例二：自动对战（`run`）
 ```python
-from seerlib import Battle
+from PySeer import Battle
 
 BATTLE_HEX = "00000015310000A0A9383934A3000002B700001A48"   # 换成你的真实触发包
 
@@ -410,7 +410,7 @@ print("对战结束:", battle.finished, "回合数可见 report", battle.report[
 
 ### 示例三：底层按回合读数据
 ```python
-from seerlib import Battle
+from PySeer import Battle
 b = Battle(BATTLE_HEX)
 while not b.finished:
     b.use_skill(b.skills[0])
@@ -448,4 +448,4 @@ while not b.finished:
 | `DEFAULT_BASE` | 兜底后端地址 `http://127.0.0.1:8680` |
 | `Battle.ENTRY_SETTLE` | 进场稳定性窗口（秒，默认 0.8） |
 
-> 自检：`PYTHONPATH=app python3 -m app.seerlib`（需后端已登录；会刷背包并打印 43706 包体）。
+> 自检：`PYTHONPATH=app python3 -m app.PySeer`（需后端已登录；会刷背包并打印 43706 包体）。

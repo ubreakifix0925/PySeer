@@ -1,6 +1,6 @@
 # 赛尔号（Seer）脚本与数据工具 — 开发成果整理
 
-> 本文档汇总基于 **seer-login-test 后端**（`assets_updater.py` 自更新数据管线 + `webui.py` 协议调试台）完成的一系列成果：自更新游戏数据、精灵详情界面功能、协议逆向结论，以及供脚本使用的第三方库 `seerlib.py`。
+> 本文档汇总基于 **PySeer 后端**（`assets_updater.py` 自更新数据管线 + `webui.py` 协议调试台）完成的一系列成果：自更新游戏数据、精灵详情界面功能、协议逆向结论，以及供脚本使用的第三方库 `PySeer.py`。
 > 基础登录/WebUI 使用说明见 [README.md](../README.md)。
 
 ---
@@ -16,7 +16,7 @@
 petbook.json / pet_attr.json / skills.json / soulmarks.json / data/effecticon/*.png
         │  由 webui.py 启动加载, 供界面回填
         ▼
-WebUI(http://127.0.0.1:8680)  ── 后台已登录的 SeerClient  ──▶ seerlib.py (脚本库)
+WebUI(http://127.0.0.1:8680)  ── 后台已登录的 SeerClient  ──▶ PySeer.py (脚本库)
         │                                                   send/recv/get_value
         └── 精灵详情(属性/能力值/专属特性/技能) + 拖拽换位 + 弹窗
 ```
@@ -116,7 +116,7 @@ spd support transform type vip is_fly is_ride
 后端 `/api/pets/move`：`kind='storage'`→发 **2304**(PET_RELEASE) 取仓库到背包（位置码 1→第一/2→第二）；`kind='bag'`→发 **41462**(换位) `[fromSort,catchTime,toSort,0]`（目标空位 catchTime=0）。
 
 ### 脚本页（第三个页签“脚本”）
-- **左侧**：展示默认脚本目录（`webui.py` 同目录下的 `scripts/`，`SCRIPTS_DIR`）里的所有 `.py` 脚本，点击选中后点“运行选中脚本”即可后台启动（`subprocess` 子进程，`PYTHONPATH` 已含项目根目录，可 `import seerlib`）；运行中可点“停止脚本”。
+- **左侧**：展示默认脚本目录（`webui.py` 同目录下的 `scripts/`，`SCRIPTS_DIR`）里的所有 `.py` 脚本，点击选中后点“运行选中脚本”即可后台启动（`subprocess` 子进程，`PYTHONPATH` 已含项目根目录，可 `import PySeer`）；运行中可点“停止脚本”。
 - **脚本输出控制台**（新增）：右半区顶部「脚本输出 (实时)」一栏，脚本运行时其 stdout/stderr（print 等）**实时**逐行显示在这里（前端单独渲染 `level='script'` 的日志，不混进封包日志）；每次运行前自动清空，自带“清空”按钮。
 - **右侧**：自上而下为「脚本输出 (实时)」+「② 日志输出」(实时)；「③ 发包测试」则移到**左半脚本列表下方**。登录页仅保留“① 登录操作”。
 - **自动跳转**：登录成功后（状态 `ready`）自动切换到“脚本”页。
@@ -138,14 +138,14 @@ spd support transform type vip is_fly is_ride
 
 ---
 
-## 5. 脚本库 `seerlib.py`（供赛尔号脚本用）
+## 5. 脚本库 `PySeer.py`（供赛尔号脚本用）
 
-> 📘 本部分的**完整 API / 用法 / 示例**另见专项文档 [docs/seerlib.md](./seerlib.md)。
+> 📘 本部分的**完整 API / 用法 / 示例**另见专项文档 [docs/PySeer.md](./PySeer.md)。
 
 后端启动并登录后，脚本用本库即可让后端发/收包并取值（自包含，仅 stdlib `urllib`）。
 
 ```python
-from seerlib import Seer
+from PySeer import Seer
 s = Seer()          # 运行时自动指向已登录后端 (无需在代码里硬编码地址)
 s.send(43706)                             # ① 发送函数: 发 SEND 包(id + 参数列表)
 pkt = s.recv(2301, [3266, 0, 0, 0])       # ② 接收函数: 发 SEND + 等 RECV, 返回完整包体(Packet)
@@ -173,7 +173,7 @@ print(pkt.ints, pkt.body, v)
 
 - 参数列表打包对齐后端 `pack_body`：数字→int32 大端；`s:文本`/`b:字节`/`h:hex`/`bytes` 均支持；`None` 自动跳过。
 - 未登录/参数错/超时/越界一律抛 `SeerError`。
-- `pack_body`/`decode_body` 见 `seer/body.py`；`Packet`/`SeerError`/`Seer` 均在 `seerlib.py`。
+- `pack_body`/`decode_body` 见 `seer/body.py`；`Packet`/`SeerError`/`Seer` 均在 `PySeer.py`。
 
 ### 后端配套
 - on_frame 记录每个命令最近 RECV：`_RECV_LATEST`/`_RECV_SEQ`（脚本库用于判断“新响应”）。
@@ -181,14 +181,14 @@ print(pkt.ints, pkt.body, v)
 
 ### 对战体（`Battle`）—— 脚本驱动整场对战
 
-`seerlib` 新增 **`Battle`（对战体）** 类，用于**脚本按回合推进一场对战**。它以
+`PySeer` 新增 **`Battle`（对战体）** 类，用于**脚本按回合推进一场对战**。它以
 **带 `cmdid` 的完整 HEX 包**作为对战输入（只须这一个包，无需事先知道命令号语义），
 随后进入回合循环：每回合可读取**当前回合数据**，也可执行**各种操作**（发包/用技能/
 换宠/用道具/逃跑…），甚至用任意复杂的 `if/else/while` 判断结构来驱动决策。
 收到**结束包（2506 FIGHT_OVER）** 后 `finished` 置 `True`，循环自动终止。
 
 ```python
-from seerlib import Battle
+from PySeer import Battle
 battle = Battle("带cmdid的完整HEX包")   # 发送对战包 + 自动进场; 无法进入时抛 SeerError
 while not battle.finished:
     my, other = battle.my, battle.other  # 双方当前出战精灵
@@ -253,7 +253,7 @@ while not battle.finished:
 seer-login-test/
 ├── app/                      # 程序文件 (运行必需, git track)
 │   ├── webui.py              # 协议调试台 WebUI (http://127.0.0.1:8680): 精灵详情/专属特性/技能/拖拽换位
-│   ├── seerlib.py            # 脚本第三方库: Seer.send/recv/get_value
+│   ├── PySeer.py            # 脚本第三方库: Seer.send/recv/get_value
 │   ├── assets_updater.py     # 自更新数据管线: 下载+解析 petbook/monsters/skilltypes/moves/skill_effect/effecticon/effectag
 │   ├── login_test.py         # 登录协议自检/测试入口
 │   ├── mock_server.py        # 模拟网关 (不联网自检用)
@@ -315,10 +315,10 @@ PYTHONPATH=vendor/unitypy nohup python3 -u app/webui.py --port 8680 >/tmp/webui8
 PYTHONPATH=vendor/unitypy python3 app/assets_updater.py --force
 
 # 脚本库自检(需后端已登录; 会刷背包并打印 43706 包体)
-PYTHONPATH=vendor/unitypy python3 -m app.seerlib
+PYTHONPATH=vendor/unitypy python3 -m app.PySeer
 ```
 
-> 说明：`app/` 里 `webui.py`/`seerlib.py`/`assets_updater.py` 都通过 `os.path.dirname(__file__)`
+> 说明：`app/` 里 `webui.py`/`PySeer.py`/`assets_updater.py` 都通过 `os.path.dirname(__file__)`
 > 推导出 `app/` 目录，再取上一级为项目根、`data/` 为运行时数据目录；因此**从项目根或 `app/` 目录运行均可**，
 > 只要 `PYTHONPATH` 含 `vendor/unitypy`。
 
@@ -328,6 +328,6 @@ PYTHONPATH=vendor/unitypy python3 -m app.seerlib
 
 - 背包↔背包移动命令（仓库→背包用 2304 已确定；背包↔背包用 41462 目标空位 catchTime=0 为推断，需实测确认）。
 - 更立体的“技能/专属特性”富文本（`analyze` 中的颜色/图标标记）渲染。
-- 在 `seerlib.py` 基础上封装更高层 API：读背包（`set_bag`/`find_pet`）与**战斗**（`Battle` 对战体，
+- 在 `PySeer.py` 基础上封装更高层 API：读背包（`set_bag`/`find_pet`）与**战斗**（`Battle` 对战体，
   见上）已有；后续可再封装“自动练级/刷BOSS”等复合策略（需真实对战触发 HEX 包）。
 - `refs/monsters.json`/`refs/monsters.txt` 已基本被自解析取代，仅作参照。
