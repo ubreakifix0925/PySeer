@@ -206,7 +206,27 @@ class Seer:
         self.timeout = timeout
 
     # ---------- 底层 HTTP ----------
-    def _post(self, path: str, data: dict) -> dict:
+    def _post(self, path: str, data: dict, *, _retry: bool = True) -> dict:
+        """POST 到后端, 并对"游戏连接掉线"做**透明重连重试**.
+
+        若请求因后端游戏连接断开(被动/主动重连中)而失败, 会**阻塞等待**后端恢复上线后再重试同一次请求,
+        从而让脚本无需写任何被动断线检测——后端掉线期间脚本自动暂停, 恢复后从断点继续.
+        对 "/api/disconnect" 与 "/api/reconnect" 不重试(以免错乱); 真实错误(游戏在线时的失败)直接抛出.
+        """
+        try:
+            return self._post_raw(path, data)
+        except SeerError:
+            if not _retry or path in ("/api/disconnect", "/api/reconnect"):
+                raise
+            try:
+                # 游戏连接确实掉了 -> 等后端自愈(被动90s/主动重登)后重试一次
+                if not self.is_connected() and self._await_backend_recover(timeout=240):
+                    return self._post(path, data, _retry=False)
+            except Exception:
+                pass
+            raise
+
+    def _post_raw(self, path: str, data: dict) -> dict:
         if self.account is not None:
             data.setdefault("account", self.account)   # 附加请求标识(若指定)
         req = urllib.request.Request(
@@ -229,6 +249,26 @@ class Seer:
             raise SeerError(f"HTTP {e.code}: {body[:200]}") from e
         except (urllib.error.URLError, ConnectionError) as e:
             raise SeerError(f"连接失败: {getattr(e, 'reason', e)}") from e
+
+    def _await_backend_recover(self, timeout: float = 240.0) -> bool:
+        """后端游戏连接掉线且**正在重连**(被动自愈/主动重登)时, 阻塞等待其恢复上线.
+
+        返回 True 表示连接已恢复(可重试); 返回 False 表示超时或后端根本不在重连(idle/error 等).
+        """
+        import time as _t
+        end = _t.time() + timeout
+        while _t.time() < end:
+            try:
+                st = self._get_json("/api/status")
+            except Exception:
+                _t.sleep(1.0)
+                continue
+            if st.get("connected"):
+                return True
+            if st.get("status") not in ("disconnected", "logging_in"):
+                return False            # idle/error -> 不在重连过程, 不该等
+            _t.sleep(1.0)
+        return False
 
     # ---------- 参数列表 -> 包体 spec (对齐 seer.body.pack_body) ----------
     @staticmethod
@@ -307,15 +347,28 @@ class Seer:
         return get_value(pkt, 2)
 
     # ---------- 换背包 (物种 id -> 物理重排 12 格) ----------
-    def _get_json(self, path: str) -> dict:
-        """GET 请求 -> JSON dict (后端 /api/bag、/api/storage 等)."""
+    def _get_json(self, path: str, *, _retry: bool = True) -> dict:
+        """GET 请求 -> JSON dict (后端 /api/bag、/api/storage 等).
+
+        与 ``_post`` 一样对"游戏连接掉线"做透明重连重试; 对 "/api/status" 不重试(供状态读取).
+        """
         if self.account is not None:
             import urllib.parse as _up
             sep = "&" if "?" in path else "?"
             path = f"{path}{sep}account={_up.quote(str(self.account))}"
-        req = urllib.request.Request(self.base + path, method="GET")
-        with urllib.request.urlopen(req, timeout=self.timeout) as r:
-            return json.loads(r.read().decode("utf-8"))
+        try:
+            req = urllib.request.Request(self.base + path, method="GET")
+            with urllib.request.urlopen(req, timeout=self.timeout) as r:
+                return json.loads(r.read().decode("utf-8"))
+        except Exception:
+            if not _retry or path.startswith("/api/status"):
+                raise
+            try:
+                if not self.is_connected() and self._await_backend_recover(timeout=240):
+                    return self._get_json(path, _retry=False)
+            except Exception:
+                pass
+            raise
 
     def _wait_bag(self, timeout: float = 10.0):
         """发送 43706 后轮询 /api/bag, 直到后台按 43706 应答解析出背包数据 (fetched)."""
@@ -537,6 +590,141 @@ class Seer:
         for _ct, pid in exe:
             add(pid, "精英背包")
         return {str(k): v for k, v in locs.items()}
+
+    def find_pet_catchtime(self, ids):
+        """查找指定**物种 id** 的精灵, 返回所持有的 **catchTime 列表**(同物种可能多只).
+
+        数据来源与 ``find_pet`` 完全一致: 背包(/api/bag, 前6出战/后6待命, 由 43706 刷新)、
+        仓库(/api/storage, 2303)、以及**精英背包**(/api/exe, 2361 GET_LOVE_PET_LIST)。
+        区别: ``find_pet`` 只返回"位置", 本函数把每个精灵的 **catchTime** 也带出来——
+        供按 catchTime 定位的场景(如提交远征阵容 42127、按 catchTime 换宠等)使用。
+
+        **返回(按输入决定)**:
+        - 传**单个** id(int/str) -> 直接返回该物种的 ``[catchTime, ...]`` 列表(可能有空)。
+        - 传**列表** ``[id1, id2]`` -> 返回 ``{str(物种id): [catchTime, ...]}``。
+
+        :param ids: 单个物种 id, 或 物种 id 列表(int/str/混合).
+        :return: 单个 id -> ``list[int]``; 列表 -> ``{str(id): list[int]}``。
+                 列表已去重(同一 catchTime 只留一次), 顺序为 背包(出战/待命) -> 仓库 -> 精英背包。
+        """
+        multi = isinstance(ids, (list, tuple))
+        if not multi:
+            ids = [ids]
+        ids = [int(x) for x in ids]
+        if not ids:
+            raise SeerError("ids 不能为空")
+
+        # 刷新并读取三类来源 (与 find_pet 相同)
+        try:
+            self.send(43706)
+        except Exception:
+            pass
+        bag = self._wait_bag()
+        storage = self._ensure_storage()
+        exe = self._ensure_exe()
+
+        res = {sid: [] for sid in ids}
+
+        def add(sid, ct):
+            if ct and sid in res:
+                res[sid].append(int(ct))
+
+        for p in bag.get("first", []):
+            add(p.get("id"), p.get("catchTime"))
+        for p in bag.get("second", []):
+            add(p.get("id"), p.get("catchTime"))
+        for ct, pid in storage:
+            add(pid, ct)
+        for ct, pid in exe:
+            add(pid, ct)
+
+        # 去重保序: 同一 catchTime 只留一次
+        for sid in ids:
+            res[sid] = list(dict.fromkeys(res[sid]))
+        if multi:
+            return {str(sid): res[sid] for sid in ids}
+        return res[ids[0]]
+
+    # ---------- 断线检测 / 断线重连 (对接后端 /api/disconnect, /api/reconnect) ----------
+    def is_connected(self) -> bool:
+        """当前游戏连接是否在线(后端 /api/status 的 ``connected``).
+
+        True = 后端已登录且游戏 socket 开启; False = 掉线/未登录.
+        """
+        j = self._get_json("/api/status")
+        return bool(j.get("connected"))
+
+    def drop_connection(self) -> dict:
+        """强制断开当前连接(后端 /api/disconnect).
+
+        用途: 战斗中主力阵亡时**立刻断线**以中止对局——赶在"投降/全员战败(2506)"之前, 让主力
+        不被判死; 紧接着可调 ``reconnect()`` 重登后重打同一关.
+        """
+        j = self._post("/api/disconnect", {})
+        if not j.get("ok"):
+            raise SeerError(j.get("error", "断开失败"))
+        return j
+
+    def reconnect(self, timeout: float = 30.0) -> dict:
+        """[主动] 断线重连: 若当前在线先断开(中止对局, 避免主力死亡被提交), 再让后端重新登录.
+
+        成功后**轮询 /api/status 直到 ``status==ready`` 且 ``connected``**, 才返回; 超时抛 SeerError.
+        返回后端的最终状态 dict. 供"主力阵亡 -> 立刻断线 -> 重连 -> 重打同一关"这类**主动中断**使用.
+
+        注意: **被动掉线**的检测与"隔 90s 再自动重连"由**后端**完成(见 webui 的
+        ``_schedule_passive_reconnect``), 脚本不需要也不应在这里等待; 脚本只需在需要继续时
+        ``wait_until_connected()`` 等后端自愈即可.
+        """
+        import time as _t
+        # 主动: 若已在线上, 先断(中止当前对局, 避免主力死亡被提交)
+        try:
+            if self.is_connected():
+                self._post("/api/disconnect", {})
+        except Exception:
+            pass
+        j = self._post("/api/reconnect", {})
+        if not j.get("ok"):
+            raise SeerError(j.get("error", "重连失败") or "后端拒绝重连")
+        # 轮询等待重登完成
+        end = _t.time() + timeout
+        status = ""
+        while _t.time() < end:
+            try:
+                st = self._get_json("/api/status")
+            except Exception:
+                _t.sleep(1.0)
+                continue
+            status = st.get("status", "")
+            if status == "ready" and st.get("connected"):
+                return st
+            if status == "error":
+                raise SeerError(f"重连失败(后端状态=error): {st.get('detail')}")
+            _t.sleep(0.8)
+        raise SeerError(f"重连超时({timeout}s): 状态停在 {status or '?'}")
+
+    def wait_until_connected(self, timeout: float = 120.0) -> dict:
+        """阻塞直到后端重新在线(被动掉线自愈后恢复). 返回最终状态 dict.
+
+        配合后端"被动掉线自动重连"使用: 掉线后后端会隔 ``PASSIVE_RECONNECT_WAIT``(默认90s)自动重登,
+        脚本只需调用本方法等待它自愈回来, 即可**继续之前的工作**, 无需脚本再实现 90s/重连逻辑.
+        超时抛 SeerError.
+        """
+        import time as _t
+        end = _t.time() + timeout
+        last = {}
+        while _t.time() < end:
+            try:
+                st = self._get_json("/api/status")
+            except Exception:
+                _t.sleep(1.0)
+                continue
+            last = st
+            if st.get("connected"):
+                return st
+            if st.get("status") == "error":
+                raise SeerError(f"后端状态=error, 无法等待就绪: {st.get('detail')}")
+            _t.sleep(1.0)
+        raise SeerError(f"等待后端重连超时({timeout}s), 状态: {last.get('status')}")
 
 
 # ---------- 对战体 (Battle) ----------

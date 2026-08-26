@@ -31,10 +31,14 @@ from seer.petinfo import format_pet, load_pet_names, merge_pet_names, parse_fron
 _LOCK = threading.Lock()
 _STATE = {
     "client": None,          # 当前已登录的 SeerClient 实例
-    "status": "idle",        # idle | logging_in | ready | error
+    "status": "idle",        # idle | logging_in | ready | error | disconnected
     "detail": "",
     "account": "",
     "conn": "",
+    "host": "",              # 最近一次登录的游戏服务器 host (供断线重连复用)
+    "port": 0,               # 最近一次登录的游戏服务器 port
+    "connected": False,      # 游戏 socket 是否在线 (掉线检测后置 False)
+    "disconnect_kind": "",   # 最近一次掉线类型: '' | 'server'(服务器造成) | 'active'(主动中断)
 }
 _LOG = []                    # 结构化日志 (供 /api/log 返回)
 _PENDING = []                # SSE 增量条目的固化字符串
@@ -42,6 +46,14 @@ _COND = threading.Condition()  # 通知 SSE 有新日志
 _RECV_LATEST = {}            # {cmd: 最近一条 RECV 包体(hex)} 供脚本库取值
 _RECV_SEQ = {}               # {cmd: 该 cmd 的 RECV 序号} 供判断"新响应"
 _LOCK_RECV = threading.Lock()  # 保护 _RECV_LATEST/_RECV_SEQ
+
+# ---- 被动掉线自愈 (后端层面) ----
+# 服务器/网络造成的被动掉线: 后端隔这么多秒后**自动重连**, 让脚本无需处理(只管继续之前的工作).
+# 主动中断(如"主力阵亡立刻断线")不在此列: 那是脚本主动行为, 立即重连, 不等待.
+PASSIVE_RECONNECT_WAIT = 90     # 被动掉线后自动重连前的等待秒数
+_passive_reconnect_lock = threading.Lock()
+_passive_reconnect_pending = False   # 是否已有一个被动重连在看守(防重复)
+_passive_reconnect_at = 0.0          # 最近一次被动掉线的时刻(用于计算剩余等待)
 
 _LOG_MAX = 5000
 # 源码目录 (本项目程序文件所在 app/) 与项目根目录 (其上一级)
@@ -810,6 +822,94 @@ def set_status(status, detail="", account="", conn=""):
     log("status", f"[{status}] {detail}")
 
 
+def _is_online(client):
+    """client 是否在线: 有 client 且其游戏 TCP 连接处于开启状态."""
+    if client is None:
+        return False
+    tcp = getattr(client, "tcp", None)
+    return bool(tcp and tcp.is_open())
+
+
+def _relogin(account=None, host=None, port=None) -> bool:
+    """用最近一次登录的 account + 记住的密码 + host/port 重新 run_login.
+
+    主动(/api/reconnect)与被动(掉线自愈)重连共用. 成功启动重连线程返回 True.
+    """
+    with _LOCK:
+        account = account or _STATE.get("account")
+        host = host or _STATE.get("host") or DEFAULT_GAME_SERVER[0]
+        port = int(_STATE.get("port") or DEFAULT_GAME_SERVER[1])
+    if not account:
+        return False
+    pwd = None
+    for c in load_creds():
+        if c.get("account") == account:
+            pwd = c.get("password")
+            break
+    if not pwd:
+        return False
+    threading.Thread(target=run_login, args=(account, pwd, host, port, None), daemon=True).start()
+    return True
+
+
+def _schedule_passive_reconnect():
+    """被动掉线自愈: 隔 ``PASSIVE_RECONNECT_WAIT`` 秒后**自动重连**, 供脚本无感继续.
+
+    只在仍处 disconnected 且未被人工重连时执行(若期间已被重连则跳过). 用锁防重复.
+    """
+    import time as _t
+    global _passive_reconnect_pending, _passive_reconnect_at
+    with _passive_reconnect_lock:
+        if _passive_reconnect_pending:
+            return
+        _passive_reconnect_pending = True
+    _passive_reconnect_at = _t.time()
+
+    def _work():
+        # 先观察一小段(避免"瞬断"后服务器自己恢复), 到点后仍未连上才自动重连
+        try:
+            _t.sleep(PASSIVE_RECONNECT_WAIT)
+            with _LOCK:
+                already_ready = _STATE.get("status") == "ready" and _STATE.get("connected")
+            if already_ready:
+                log("info", f"[被动重连] 等待期间连接已恢复, 跳过自动重连")
+                return
+            if _relogin():
+                log("info", f"[被动重连] 掉线已 {PASSIVE_RECONNECT_WAIT}s, 自动重连中 ...")
+        finally:
+            global _passive_reconnect_pending
+            with _passive_reconnect_lock:
+                _passive_reconnect_pending = False
+
+    threading.Thread(target=_work, daemon=True, name="seer-passive-reconnect").start()
+
+
+def _mark_offline(owner, reason="连接已断开", kind="server"):
+    """掉线检测: 把当前连接标记为"已断开".
+
+    只当 ``_STATE["client"]`` 仍是被检测的这个 client 时才置为断开(避免一个旧的 listener
+    在新连接建立后误把新连接标记为掉线). 断开后清空 client 让后续发包干净地报"未登录",
+    但**保留 account/host/port/credentials**, 供重连复用.
+
+    ``kind`` 记录掉线类型:
+      - ``'server'`` (服务器/网络造成的**被动**掉线) -> 调 ``_schedule_passive_reconnect()``,
+        隔 ``PASSIVE_RECONNECT_WAIT`` 秒后**自动重连**(后端自愈, 脚本无感);
+      - ``'active'`` (我方主动中断, 如主力阵亡立刻断线) -> 不在此等待, 由调用方立即重连.
+    """
+    with _LOCK:
+        cur = _STATE.get("client")
+        if owner is not None and cur is not owner:
+            return                      # 已有新连接取代本 client, 不算掉线
+        _STATE["status"] = "disconnected"
+        _STATE["detail"] = reason
+        _STATE["connected"] = False
+        _STATE["disconnect_kind"] = kind
+        _STATE["client"] = None
+    log("warn", f"[掉线检测] {reason}  (kind={kind})")
+    if kind == "server":
+        _schedule_passive_reconnect()   # 被动掉线: 后端自愈(隔 90s 自动重连)
+
+
 def _start_listener(client):
     """登录后开启后台线程, 持续读取所有封包并交给 on_frame 记录 (实时监听).
 
@@ -820,9 +920,11 @@ def _start_listener(client):
 
     def _loop():
         log("info", "后台监听已开启, 实时接收所有约束之外的封包...")
+        offline_reason = None
         while True:
             tcp = getattr(client, "tcp", None)
             if tcp is None or not tcp.is_open():
+                offline_reason = "游戏连接已断开(tcp未开启)"
                 break
             try:
                 r = client.recv_game_packet(timeout=0.5)   # 触发 on_frame
@@ -834,10 +936,13 @@ def _start_listener(client):
             except WebSocketTimeout:
                 continue
             except WebSocketClosed:
+                offline_reason = "游戏连接被对端关闭(掉线)"
                 break
             except Exception as e:
                 log("error", f"监听异常: {e}")
+                offline_reason = f"监听异常: {e}"
                 break
+        _mark_offline(client, offline_reason or "连接已断开", kind="server")   # 掉线检测(被动)
 
     threading.Thread(target=_loop, daemon=True, name="seer-listen").start()
 
@@ -1045,7 +1150,18 @@ def run_login(account, password, host, port, session=None):
             on_packet=None,   # 封包日志统一由 on_frame 记录, 避免重复
         )
         sk = getattr(global_client, "session_key", None)
+        with _LOCK:
+            _STATE["host"] = host
+            _STATE["port"] = port
+            _STATE["connected"] = True
         set_status("ready", f"已连接 {conn}; 会话密钥={sk}", account=account, conn=conn)
+        # 新连接 = 新的会话: 清掉上一场(或被断掉的)对战状态, 避免 Battle(hex) 误把残留对战当成进行中
+        with _LOCK:
+            _BATTLE.update({"active": False, "finished": False, "mode": 0, "my": None, "other": None,
+                            "myTeam": [], "otherTeam": [], "mySkills": [], "mySkillPP": {},
+                            "otherSkillPP": {}, "myId": None, "lastCmd": None, "lastSkill": None,
+                            "round": 0, "report": [], "_ready_sent_mode": None})
+            _BATTLE["version"] += 1
         log("ok", f"登录成功! 连接={conn}  收到 {len(responses)} 个封包  会话密钥={sk}")
         # 登录后开启后台监听线程: 实时读取所有封包 (on_frame 会记录到日志与响应表格)
         _start_listener(global_client)
@@ -1098,9 +1214,22 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/status":
             with _LOCK:
                 s = dict(_STATE)
-            client_present = s["client"] is not None
+                client = s.get("client")
             s.pop("client", None)
-            s["client_present"] = client_present
+            s["client_present"] = client is not None
+            # 在线判定: 有 client 且其游戏 TCP 连接开启
+            s["connected"] = _is_online(client)
+            # 若状态仍标 ready 但 socket 其实已断(异常路径未触发监听回调), 让状态回落到 disconnected
+            if s["status"] == "ready" and not s["connected"]:
+                s["status"] = "disconnected"
+            # 被动掉线自愈信息: pending + 剩余等待秒数(供脚本/前端观察)
+            import time as _now
+            with _passive_reconnect_lock:
+                pending = _passive_reconnect_pending
+                at = _passive_reconnect_at
+            s["passive_reconnect_pending"] = pending
+            s["passive_reconnect_wait"] = PASSIVE_RECONNECT_WAIT
+            s["passive_reconnect_in"] = int(max(0, PASSIVE_RECONNECT_WAIT - (_now.time() - at))) if pending else 0
             self._send(200, "application/json", json.dumps(s).encode("utf-8"))
         elif path == "/api/log":
             with _COND:
@@ -1289,17 +1418,29 @@ class Handler(BaseHTTPRequestHandler):
         elif path == "/api/disconnect":
             with _LOCK:
                 cli = _ctx_client()
-                _STATE["client"] = None
-                _STATE["conn"] = ""
-                _STATE["detail"] = "已断开"
-                _STATE["status"] = "idle"
             if cli:
                 try:
                     cli.close()
                 except Exception:
                     pass
+            # 清空并标记掉线(保留 account/host/port 便于 /api/reconnect 复用); 主动中断 -> kind=active
+            _mark_offline(cli, "已主动断开(可立即重连)", kind="active")
             log("info", "已断开当前连接")
             return self._send_json({"ok": True})
+
+        elif path == "/api/reconnect":
+            # 断线重连(主动): 用最近一次登录的 account + 记住的密码 + host/port 重新 run_login.
+            # 供"战斗中主力阵亡 -> 断线 -> 重连"策略使用(掉线后主力不判死, 可重打同一关).
+            # 注意: **被动**掉线由后端 _schedule_passive_reconnect 自愈, 无需脚本触发本接口.
+            with _LOCK:
+                cur_status = _STATE.get("status")
+            if cur_status == "logging_in":
+                return self._send_json({"ok": False, "error": "正在登录中, 请稍后再重连"}, 400)
+            if not _relogin():
+                return self._send_json({"ok": False,
+                                        "error": "当前无账号或缺少可用的登录凭据, 无法主动重连"}, 400)
+            log("info", "[重连] 主动重连: 正在重新登录 ...")
+            return self._send_json({"ok": True, "msg": "正在重连"})
 
 
         elif path == "/api/credentials/delete":

@@ -203,6 +203,50 @@ r = s.find_pet(5000)
 
 > `find_pet` 是**只读查询**（含精英背包），不会改动数据。
 
+### 查找精灵的 catchTime：`find_pet_catchtime(ids)`
+数据来源与 `find_pet` 完全一致（背包/仓库/精英背包），但把每只精灵的 **catchTime** 也带出来。
+`find_pet` 只返回“位置”，而本函数返回该物种所有持有精灵的 **catchTime 列表**——适用于按 catchTime
+定位的场景（如提交远征阵容 `42127`、按 catchTime 换宠等）。
+
+```python
+cts = s.find_pet_catchtime(5000)
+# -> [1298723456, 99887766]           # 单个 id: 直接返回 catchTime 列表(同物种可多只)
+cts = s.find_pet_catchtime([5000, 3512])
+# -> {"5000": [...], "3512": [...]}    # 传入列表: 返回 {str(id): [catchTime,...]}
+```
+
+- **单个 id(int/str) -> 直接返回 `[catchTime, ...]` 列表**；传入列表 -> 返回 `{str(物种id): [catchTime, ...]}`。
+- 某物种在三类来源均未持有 => 对应列表为空。
+- 列表已**去重**（同一 catchTime 只留一次），顺序为 背包(出战/待命) -> 仓库 -> 精英背包。
+- 只读查询；与 `find_pet` 一样依赖后端的背包/仓库/精英背包解析。
+
+### 断线检测 / 断线重连（对脚本**透明**）
+后端（webui）与本库共同做到"掉线自动暂停/恢复"，脚本一般**无需写任何断线检测**：
+- **【被动】服务器/网络掉线**：后端监听检测到后，隔 `PASSIVE_RECONNECT_WAIT`(90s) **自动重连**；
+  期间正在进行的 `send`/`recv`/`get_recv_value`/`Battle.*` 等请求会**自动阻塞等待**，后端恢复后
+  **从断点继续**（库内对这类"连不上"的错误做透明重试）。脚本代码不用动。
+- **【主动】我方中断**（如"主力阵亡 -> 立刻断线"避免判死）：脚本调 `drop_connection()` + `reconnect()`，
+  后端**立即**重连。
+
+```python
+# 平时直接发命令即可; 被动掉线期间某条命令会被自动暂停, 等后端自愈后重新执行
+pkt = s.recv(42126, [])        # 若此刻被动掉线, 会自动等 ~90s+重连 后成功返回
+
+# 主动断线重连示例:
+if s.is_connected():
+    s.drop_connection()            # 我方主动断开(中止对局; 赶在 2506 提交前断线, 主力不判死)
+s.reconnect(timeout=40)            # 立刻重新登录(若在线先断, 再重登)
+```
+
+- `is_connected() -> bool`：读 `/api/status` 的 `connected`。
+- `drop_connection() -> dict`：`POST /api/disconnect`，我方主动断开（保留账号/凭据供重连）。
+- `reconnect(timeout=30) -> dict`：**主动**重连——若在线先 `disconnect`（中止对局），再
+  `POST /api/reconnect` 立刻重登，轮询 `/api/status` 至 `ready+connected`；超时/`error` 抛 `SeerError`。
+- `wait_until_connected(timeout=120) -> dict`：可选——显式阻塞直到后端上线（配合后端被动自愈）；
+  一般场景不需要（`send`/`recv` 已透明处理）。
+- `/api/status` 暴露 `connected`、`disconnect_kind`（`server`/`active`）、
+  `passive_reconnect_pending/wait/in`。
+
 ---
 
 ## 6. `Battle`：对战体（自动按回合驱动）
