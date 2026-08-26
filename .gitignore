@@ -14,8 +14,6 @@
 !app/**
 !app/seer/
 !app/seer/**
-!app/scripts/
-!app/scripts/**
 !app/cmdmap.json
 !app/requirements.txt
 
