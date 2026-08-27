@@ -1977,116 +1977,269 @@ PAGE = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <title>赛尔号协议调试台</title>
+<script>try{var _t=localStorage.getItem('pyseer_theme')||((window.matchMedia&&window.matchMedia('(prefers-color-scheme: light)').matches)?'light':'dark');document.documentElement.setAttribute('data-theme',_t);}catch(e){document.documentElement.setAttribute('data-theme','dark');}</script>
 <style>
- *{box-sizing:border-box}
- body{font-family:Menlo,Consolas,monospace;margin:0;background:#0e1117;color:#d8dee9}
- header{padding:12px 16px;background:#161b22;border-bottom:1px solid #30363d;display:flex;align-items:center}
- header h1{font-size:16px;margin:0;color:#58a6ff}
- .status{margin-left:auto;padding:3px 10px;border-radius:12px;font-size:12px;background:#21262d}
- .st-idle{color:#9aa5b1} .st-logging_in{color:#d29922} .st-ready{color:#3fb950} .st-error{color:#f85149}
- main{display:flex;gap:12px;padding:12px;flex-wrap:wrap}
- .card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px;min-width:280px}
- .card h2{font-size:13px;margin:0 0 8px;color:#8b949e}
- label{font-size:12px;color:#8b949e;display:block;margin:6px 0 2px}
- input[type=text],input[type=password],input[type=number],textarea{width:100%;padding:6px 8px;background:#0d1117;border:1px solid #30363d;color:#d8dee9;border-radius:6px;font:12px/1.4 Menlo,monospace}
- button{margin:8px 6px 0 0;padding:6px 12px;background:#238636;border:0;color:#fff;border-radius:6px;cursor:pointer;font-size:12px}
- button.off{background:#6e7681} button:disabled{opacity:.5;cursor:not-allowed}
- #log{width:100%;min-height:180px;max-height:56vh;overflow:auto;background:#0d1117;padding:8px;border:1px solid #30363d;border-radius:6px;font:12px/1.5 Menlo,monospace;white-space:pre-wrap}
- .lvl-info{color:#9aa5b1}.lvl-ok{color:#3fb950}.lvl-packet{color:#58a6ff}.lvl-error{color:#f85149}.lvl-tip{color:#d29922}.lvl-status{color:#e3b341}.lvl-battle{color:#d2a8ff}
- #resp{width:100%;min-height:120px;background:#0d1117;padding:8px;border:1px solid #30363d;border-radius:6px;font:12px Menlo,monospace;color:#a5d6a7}
- .rowflex{display:flex;gap:6px}.rowflex>*{flex:1}
- .filterbar{display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin:0 0 8px}
- .filterbar label{display:inline;margin:0;white-space:nowrap}
- .filterbar input[type=text]{width:auto;flex:1;min-width:200px}
- .filterbar input[type=checkbox]{width:auto;vertical-align:middle;margin-right:3px}
- .filterbar button{margin:0}
- .tabs{display:flex;gap:4px;padding:10px 16px 0;background:#161b22;border-bottom:1px solid #30363d}
- .tabs .tab{padding:6px 18px;margin:0;background:#21262d;border:1px solid #30363d;border-bottom:0;border-radius:8px 8px 0 0;color:#8b949e}
- .tabs .tab.active{background:#0e1117;color:#58a6ff;border-color:#58a6ff}
- .tabs .tab.live::before{content:'';display:inline-block;width:7px;height:7px;border-radius:50%;background:#3fb950;margin-right:6px;box-shadow:0 0 6px #3fb950;animation:blinkdot 1.1s infinite;vertical-align:middle}
- @keyframes blinkdot{50%{opacity:.25}}
- .tab-panel{display:none}
- .tab-panel.active{display:block}
-.script-item{display:block;width:100%;text-align:left;padding:6px 8px;border:0;border-bottom:1px solid #21262d;background:transparent;color:#d8dee9;font:12px Menlo,monospace;cursor:pointer}
-.script-item:hover{background:#1c2533}
-.script-item.sel{background:#1f2937;color:#58a6ff}
+/* ============ 赛尔号协议调试台 · UI 主题 (仅样式, 不影响功能) ============ */
+:root{
+  --bg:#0a0f1c; --panel:#101726; --card:#121a2c; --card-2:#141d31;
+  --elev:#1b2440; --elev-2:#24304f; --inset:#0a0f1c; --inset-2:#0d1322;
+  --line:#2a344d; --line-2:#3b4c68;
+  --text:#e6edf3; --muted:#94a1b5; --muted-2:#6b7a93;
+  --accent:#5b9dff; --accent-deep:#3f7fdb; --accent-soft:#122f56;
+  --green:#3ddc8f; --green-deep:#22a556;
+  --amber:#f2c14e; --red:#f7696b; --purple:#d3b4ff; --cyan:#7cc4ff; --btn-fg:#06131f;
+  --mono:"SFMono-Regular","JetBrains Mono","Menlo","Consolas","DejaVu Sans Mono",monospace;
+  --sans:-apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",Roboto,"Helvetica Neue",Arial,sans-serif;
+  --radius:10px; --radius-sm:7px;
+  --shadow:0 6px 20px rgba(0,0,0,.35); --shadow-sm:0 2px 8px rgba(0,0,0,.28);
+}
+*{box-sizing:border-box}
+html,body{margin:0}
+body{font-family:var(--sans);background:var(--bg);color:var(--text);
+  background-image:radial-gradient(1100px 520px at 15% -10%,#16233c 0,rgba(22,35,60,0) 55%),
+                   radial-gradient(900px 480px at 100% 0,rgba(91,157,255,.08) 0,rgba(91,157,255,0) 60%);
+  background-attachment:fixed;min-height:100vh;font-size:14px;line-height:1.5}
+::-webkit-scrollbar{width:10px;height:10px}
+::-webkit-scrollbar-track{background:var(--inset)}
+::-webkit-scrollbar-thumb{background:var(--line);border-radius:6px;border:2px solid var(--inset)}
+::-webkit-scrollbar-thumb:hover{background:var(--line-2)}
+::selection{background:rgba(91,157,255,.32);color:#fff}
+
+/* ---- 顶部 ---- */
+header{position:sticky;top:0;z-index:50;display:flex;align-items:center;gap:12px;
+  padding:12px 20px;background:linear-gradient(180deg,#141b2d,#101726);border-bottom:1px solid var(--line);
+  box-shadow:0 1px 0 rgba(255,255,255,.02),0 4px 14px rgba(0,0,0,.3)}
+header .brand{display:flex;align-items:center;gap:11px}
+header .logo{width:28px;height:28px;border-radius:8px;display:grid;place-items:center;
+  background:linear-gradient(135deg,var(--accent),var(--green));color:var(--btn-fg);font-weight:800;font-size:15px;
+  box-shadow:0 0 14px rgba(91,157,255,.4);flex:0 0 auto}
+header h1{font-size:16px;margin:0;color:var(--text);font-weight:700;letter-spacing:.3px;line-height:1.2}
+header .sub{font-size:11px;color:var(--muted-2);margin-top:2px;letter-spacing:.2px}
+.status{margin-left:10px;display:inline-flex;align-items:center;gap:7px;padding:5px 12px;
+  border-radius:999px;font-size:12px;font-weight:600;background:var(--elev);border:1px solid var(--line);color:var(--muted)}
+.status::before{content:'';width:8px;height:8px;border-radius:50%;background:currentColor;box-shadow:0 0 8px currentColor}
+.st-idle{color:#9ab0c8}.st-logging_in{color:var(--amber)}.st-ready{color:var(--green)}.st-error{color:var(--red)}
+
+/* ---- 标签页 ---- */
+.tabs{display:flex;gap:6px;padding:14px 20px 0;background:var(--panel);border-bottom:1px solid var(--line)}
+.tabs .tab{position:relative;margin:0;padding:9px 20px 10px;border:0;background:transparent;color:var(--muted);
+  font:600 13px/1 var(--sans);cursor:pointer;border-radius:9px 9px 0 0;transition:color .15s,background .15s}
+.tabs .tab:hover{color:var(--text);background:rgba(91,157,255,.06)}
+.tabs .tab.active{color:var(--accent)}
+.tabs .tab.active::after{content:'';position:absolute;left:12px;right:12px;bottom:0;height:2px;
+  background:linear-gradient(90deg,var(--accent),var(--green));border-radius:2px;box-shadow:0 0 8px var(--accent)}
+.tabs .tab.live::before{content:'';display:inline-block;width:7px;height:7px;border-radius:50%;
+  background:var(--green);margin-right:7px;box-shadow:0 0 6px var(--green);animation:blinkdot 1.1s infinite;vertical-align:middle}
+@keyframes blinkdot{50%{opacity:.25}}
+.tab-panel{display:none}
+.tab-panel.active{display:block}
+
+/* ---- 卡片 ---- */
+main{display:flex;gap:14px;padding:18px;flex-wrap:wrap}
+.card{background:var(--card);border:1px solid var(--line);border-radius:var(--radius);
+  padding:14px;min-width:280px;box-shadow:var(--shadow-sm)}
+.card h2{font-size:13px;margin:0 0 12px;color:var(--text);font-weight:600;letter-spacing:.2px;
+  padding-left:9px;border-left:3px solid var(--accent);line-height:1.2}
+.card h2 sup{color:var(--muted-2)}
+label{font-size:12px;color:var(--muted);display:block;margin:10px 0 4px;font-weight:500}
+label sup{color:var(--red)}
+
+/* ---- 表单控件 ---- */
+input[type=text],input[type=password],input[type=number],select,textarea{
+  width:100%;padding:8px 10px;background:var(--inset);border:1px solid var(--line);color:var(--text);
+  border-radius:var(--radius-sm);font:13px/1.4 var(--mono);transition:border-color .15s,box-shadow .15s}
+input:focus,select:focus,textarea:focus{outline:none;border-color:var(--accent);box-shadow:0 0 0 3px rgba(91,157,255,.18)}
+input::placeholder,textarea::placeholder{color:var(--muted-2)}
+input[type=checkbox]{accent-color:var(--accent);width:15px;height:15px}
+input[type=checkbox]:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+
+/* ---- 按钮 ---- */
+button{margin:8px 6px 0 0;padding:8px 14px;background:linear-gradient(180deg,var(--green),var(--green-deep));
+  border:1px solid rgba(0,0,0,.15);color:var(--btn-fg);border-radius:var(--radius-sm);cursor:pointer;
+  font:600 13px/1 var(--sans);transition:transform .06s,filter .15s,box-shadow .15s,background .15s;
+  box-shadow:0 2px 6px rgba(25,150,90,.25)}
+button:hover{filter:brightness(1.06)}
+button:active{transform:translateY(1px)}
+button:disabled{opacity:.45;cursor:not-allowed;filter:none;transform:none;box-shadow:none}
+button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+button.off{background:var(--elev);color:var(--text);border:1px solid var(--line);box-shadow:none}
+button.off:hover{background:var(--elev-2);border-color:var(--line-2)}
+
+/* ---- 日志 / 终端 ---- */
+#log{width:100%;min-height:180px;max-height:56vh;overflow:auto;background:var(--inset);padding:9px 10px;
+  border:1px solid var(--line);border-radius:var(--radius-sm);font:12.5px/1.6 var(--mono);white-space:pre-wrap}
+.lvl-info{color:var(--muted)}.lvl-ok{color:var(--green)}.lvl-packet{color:var(--cyan)}
+.lvl-error{color:var(--red)}.lvl-tip{color:var(--amber)}.lvl-status{color:var(--amber)}
+.lvl-battle{color:var(--purple)}
+#resp{width:100%;min-height:120px;background:var(--inset);padding:9px 10px;border:1px solid var(--line);
+  border-radius:var(--radius-sm);font:12.5px var(--mono);color:var(--green)}
+
+.rowflex{display:flex;gap:10px}.rowflex>*{flex:1}
+.filterbar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:0 0 10px}
+.filterbar label{display:inline;margin:0;white-space:nowrap}
+.filterbar input[type=text]{width:auto;flex:1;min-width:200px}
+.filterbar input[type=checkbox]{vertical-align:middle;margin-right:4px}
+.filterbar button{margin:0}
+
+/* ---- 脚本列表 ---- */
+.script-item{display:block;width:100%;text-align:left;padding:8px 12px;border:0;border-bottom:1px solid var(--line);
+  background:transparent;color:var(--text);font:12.5px var(--mono);cursor:pointer;transition:background .12s}
+.script-item:hover{background:var(--elev)}
+.script-item.sel{background:linear-gradient(90deg,rgba(91,157,255,.16),rgba(91,157,255,.04));color:var(--accent)}
+
 /* ---- 对战页 ---- */
 .fight-side{display:flex;gap:12px;align-items:center}
-.fight-card{flex:1;background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:8px;text-align:center}
-.fight-card .fc-img{width:96px;height:96px;margin:0 auto;background:#161b22;border:1px solid #30363d;border-radius:8px;display:flex;align-items:center;justify-content:center;overflow:hidden;font-size:22px;color:#8b949e}
+.fight-card{flex:1;background:var(--inset);border:1px solid var(--line);border-radius:var(--radius);
+  padding:10px;text-align:center;box-shadow:inset 0 1px 0 rgba(255,255,255,.02)}
+.fight-card .fc-img{width:92px;height:92px;margin:0 auto;background:var(--card-2);border:1px solid var(--line);
+  border-radius:12px;display:flex;align-items:center;justify-content:center;overflow:hidden;font-size:22px;color:var(--muted)}
 .fight-card .fc-img img{width:100%;height:100%;object-fit:contain}
-.fc-name{font-size:14px;margin-top:6px;color:#d8dee9;font-weight:bold}
-.fc-lv{font-size:11px;color:#8b949e;margin:2px 0}
-.hpbar{height:12px;background:#21262d;border:1px solid #30363d;border-radius:6px;overflow:hidden;margin:4px 0}
-.hpbar .hp{height:100%;background:linear-gradient(90deg,#3fb950,#2ea043);transition:width .3s}
-.hpbar .hp.low{background:linear-gradient(90deg,#f85149,#da3633)}
-.hptxt{font-size:11px;color:#9aa5b1}
-.fc-page{font-size:11px;color:#8b949e;margin-top:4px}
+.fc-name{font-size:14px;margin-top:8px;color:var(--text);font-weight:700}
+.fc-lv{font-size:12px;color:var(--muted);margin:2px 0}
+.hpbar{height:12px;background:var(--elev);border:1px solid var(--line);border-radius:999px;overflow:hidden;margin:6px 0}
+.hpbar .hp{height:100%;background:linear-gradient(90deg,var(--green),var(--green-deep));transition:width .3s;border-radius:999px}
+.hpbar .hp.low{background:linear-gradient(90deg,var(--red),#c9445a)}
+.hptxt{font-size:11px;color:var(--muted);font-variant-numeric:tabular-nums}
+.fc-page{font-size:11px;color:var(--muted-2);margin-top:4px}
 .battle-team{display:flex;flex-wrap:wrap;gap:8px}
-.pt-chip{width:76px;background:#0d1117;border:1px solid #30363d;border-radius:8px;padding:4px;text-align:center;font:11px Menlo,monospace}
+.pt-chip{width:76px;background:var(--inset);border:1px solid var(--line);border-radius:9px;padding:4px;
+  text-align:center;font:11px var(--mono);transition:border-color .15s}
+.pt-chip:hover{border-color:var(--line-2)}
 .pt-chip img{width:56px;height:56px;object-fit:contain;margin:0 auto;display:block}
-.pt-chip .pn{color:#d8dee9;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.pt-chip .ph{color:#9aa5b1;font-size:10px}
-.skill-btn{flex:1 1 0;min-width:0;margin:0;background:#238636;border:0;color:#fff;border-radius:6px;cursor:pointer;padding:6px 4px;text-align:center;display:flex;flex-direction:column;gap:2px;align-items:center;white-space:nowrap;overflow:hidden;min-width:64px}
-.skill-btn .sb-name{font-size:12px;color:#fff;text-overflow:ellipsis;overflow:hidden;max-width:100%}
-.skill-btn .sb-sub{font-size:10px;color:#c8e6c9;line-height:1.1}
-.skill-btn .sb-pp{font-size:10px;color:#a5d6a7}
-.skill-btn[disabled]{opacity:.45;cursor:not-allowed}
-.ops-btn{min-width:96px;padding:8px 12px;margin:0;background:#6e7681;border:0;color:#fff;border-radius:6px;cursor:pointer;font-size:12px}
- .bagwrap{display:flex;gap:12px;padding:12px}
- .avrow{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px;margin:0 0 12px}
- .av-btn{display:block;min-width:0;margin:0;padding:6px;background:#21262d;border:1px solid #30363d;border-radius:8px;text-align:center;cursor:pointer;color:#d8dee9;overflow:hidden;font:12px Menlo,monospace;line-height:1.2;touch-action:none;-webkit-tap-highlight-color:transparent}
- .av-btn.sel{border-color:#58a6ff;background:#0d2a45}
- .av-img{width:100%;aspect-ratio:1;background:#0d1117;border:1px solid #30363d;border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:11px;color:#8b949e}
- .av-empty{width:100%;aspect-ratio:1;background:transparent;border:1px dashed #30363d;border-radius:6px;display:flex;align-items:center;justify-content:center;font-size:11px;color:#4b5563}
- .av-txt{font-size:11px;margin-top:4px;color:#d8dee9;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
- .detail-grid{display:grid;grid-template-columns:auto 1fr;gap:4px 12px;font-size:12px}
- .detail-grid .k{color:#8b949e}
- .detail-grid .v{color:#d8dee9}
- .detail-sec{margin-top:8px}
- .detail-sec h3{font-size:12px;color:#58a6ff;margin:8px 0 4px}
- .abgrid{display:grid;grid-template-columns:repeat(2,1fr);gap:6px 18px}
- .abcell{display:flex;align-items:center;gap:6px;font-size:12px}
- .abcell .k{color:#8b949e}
- .abcell .v{color:#d8dee9}
- .abcell .ev{color:#f1e05a}
- .marks-row{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;align-items:center;justify-items:center}
- .mark-icon{width:46px;height:46px;background:#0d1117;border:1px solid #30363d;border-radius:6px;display:flex;flex-direction:column;align-items:center;justify-content:center;font-size:10px;color:#8b949e}
- .mark-icon .lbl{font-size:9px;color:#8b949e}
- .skillgrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
- .sk{width:100%;height:74px;background:#0d1117;border:1px solid #30363d;border-radius:6px;display:flex;flex-direction:column;align-items:center;justify-content:center;font-size:11px;color:#8b949e;min-width:0;overflow:hidden}
- .sk .pp{font-size:10px;color:#6e7681}
- .sk.sk5{grid-column:span 2}
- .sk-click{cursor:pointer;transition:border-color .15s}
- .sk-click:hover{border-color:#58a6ff;background:#111826}
- .sk-nm{color:#d8dee9;font-size:12px;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
- .sk-sub{color:#8b949e;font-size:10px;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
- .sk-attr{margin-right:4px}
- .sk-pow{color:#e3b341}
- .soulmarks{display:none}
- .smark-wrap{width:100%}
- .smark-btn{width:100%;height:74px;background:#0d1117;border:1px solid #30363d;border-radius:6px;display:flex;align-items:center;gap:10px;padding:0 12px;cursor:pointer;color:#d8dee9;transition:border-color .15s}
- .smark-btn:hover{border-color:#58a6ff;background:#111826}
- .smark-img{width:44px;height:44px;object-fit:contain;background:#0d1117;border:1px solid #21262d;border-radius:6px;flex:0 0 auto;image-rendering:pixelated}
- .smark-mid{display:flex;flex-direction:column;align-items:flex-start;gap:4px;min-width:0}
- .smark-title{font-size:15px;color:#d8dee9;line-height:1}
- .smark-tags{display:flex;flex-wrap:wrap}
- .smark-btn-disabled{width:100%;height:74px;background:#0d1117;border:1px dashed #30363d;border-radius:6px;display:flex;align-items:center;justify-content:center;color:#6e7681;font-size:12px}
- .soulmark-tag{display:inline-block;background:#12263b;color:#58a6ff;border:1px solid #1f3a5a;border-radius:4px;font-size:10px;padding:1px 6px;margin-right:4px}
- .smark-modal-icon{width:56px;height:56px;margin:0 auto 10px}
- .smark-modal-icon img{width:56px;height:56px;object-fit:contain;image-rendering:pixelated}
- .smark-nav-btn{background:#21262d;border:1px solid #30363d;color:#d8dee9;border-radius:6px;padding:4px 12px;font-size:12px;cursor:pointer}
- .smark-nav-btn:hover:not(:disabled){border-color:#58a6ff;color:#58a6ff}
- .smark-nav-btn:disabled{opacity:.4;cursor:default}
- #war-list{overflow-y:auto;max-height:calc(100vh - 300px);min-height:240px}
- #war-info{margin-top:8px;border-top:1px solid #30363d;padding-top:8px;font-size:12px;color:#d8dee9}
- .warfilt{background:#21262d;border:1px solid #30363d;color:#8b949e;margin:0;padding:4px 12px;font-size:12px;border-radius:6px}
- .warfilt.active{background:#0d2a45;border-color:#58a6ff;color:#58a6ff}
+.pt-chip .pn{color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:11px}
+.pt-chip .ph{color:var(--muted);font-size:10px}
+.skill-btn{flex:1 1 0;min-width:64px;margin:0;background:linear-gradient(180deg,var(--green),var(--green-deep));
+  border:1px solid rgba(0,0,0,.15);color:var(--btn-fg);border-radius:9px;cursor:pointer;padding:8px 6px;text-align:center;
+  display:flex;flex-direction:column;gap:2px;align-items:center;white-space:nowrap;overflow:hidden;
+  font-family:var(--sans);box-shadow:0 2px 6px rgba(25,150,90,.2)}
+.skill-btn:hover{filter:brightness(1.07)}
+.skill-btn .sb-name{font-size:12px;color:var(--btn-fg);font-weight:700;text-overflow:ellipsis;overflow:hidden;max-width:100%}
+.skill-btn .sb-sub{font-size:10px;color:var(--btn-fg);opacity:.82;line-height:1.1;font-weight:500}
+.skill-btn .sb-pp{font-size:10px;color:var(--btn-fg);opacity:.72}
+.skill-btn[disabled]{opacity:.45;cursor:not-allowed;filter:none}
+.ops-btn{min-width:96px;padding:9px 14px;margin:0;background:var(--elev);border:1px solid var(--line);
+  color:var(--text);border-radius:9px;cursor:pointer;font:600 13px var(--sans);transition:background .15s,border-color .15s}
+.ops-btn:hover{background:var(--elev-2);border-color:var(--line-2)}
+.ops-btn:disabled{opacity:.45;cursor:not-allowed}
+
+/* ---- 背包 ---- */
+.bagwrap{display:flex;gap:14px;padding:18px;flex-wrap:wrap}
+.avrow{display:grid;grid-template-columns:repeat(auto-fill,88px);gap:10px;margin:0 0 14px;justify-content:start}
+/* 背包（第一/第二背包）固定 3 列且均分填满面板宽度（不随页面变化）；与仓库保持相同 88px 图标尺寸 */
+#bag-first,#bag-second{grid-template-columns:repeat(3,1fr)}
+.av-btn{display:block;min-width:0;margin:0;padding:6px;background:var(--elev);border:1px solid var(--line);
+  border-radius:9px;text-align:center;cursor:pointer;color:var(--text);overflow:hidden;font:12px var(--sans);
+  line-height:1.2;touch-action:none;-webkit-tap-highlight-color:transparent;transition:border-color .15s,transform .06s}
+.av-btn:hover{border-color:var(--line-2)}
+.av-btn:active{transform:translateY(1px)}
+.av-btn.sel{border-color:var(--accent);background:var(--accent-soft);box-shadow:0 0 0 2px rgba(91,157,255,.25)}
+.av-img{width:100%;aspect-ratio:1;background:var(--inset);border:1px solid var(--line);border-radius:7px;
+  display:flex;align-items:center;justify-content:center;font-size:11px;color:var(--muted)}
+.av-empty{width:100%;aspect-ratio:1;background:transparent;border:1px dashed var(--line-2);border-radius:7px;
+  display:flex;align-items:center;justify-content:center;font-size:11px;color:var(--muted-2)}
+.av-txt{font-size:11px;margin-top:5px;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-family:var(--sans)}
+
+.detail-grid{display:grid;grid-template-columns:auto 1fr;gap:5px 14px;font-size:12.5px}
+.detail-grid .k{color:var(--muted)}
+.detail-grid .v{color:var(--text)}
+.detail-sec{margin-top:10px}
+.detail-sec h3{font-size:12px;color:var(--accent);margin:10px 0 6px;font-weight:600;letter-spacing:.2px}
+.abgrid{display:grid;grid-template-columns:repeat(2,1fr);gap:7px 20px}
+.abcell{display:flex;align-items:center;gap:6px;font-size:12.5px}
+.abcell .k{color:var(--muted)}
+.abcell .v{color:var(--text);font-variant-numeric:tabular-nums}
+.abcell .ev{color:#f5d554;font-weight:600;margin-left:auto}
+
+.marks-row{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:8px;align-items:center;justify-items:center}
+.mark-icon{width:46px;height:46px;background:var(--inset);border:1px solid var(--line);border-radius:7px;
+  display:flex;flex-direction:column;align-items:center;justify-content:center;font-size:10px;color:var(--muted)}
+.mark-icon .lbl{font-size:9px;color:var(--muted-2)}
+
+.skillgrid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+.sk{width:100%;height:74px;background:var(--inset);border:1px solid var(--line);border-radius:8px;
+  display:flex;flex-direction:column;align-items:center;justify-content:center;font-size:11px;color:var(--muted);
+  min-width:0;overflow:hidden;transition:border-color .15s,background .15s}
+.sk .pp{font-size:10px;color:var(--muted-2);margin-top:2px}
+.sk.sk5{grid-column:span 2}
+.sk-click{cursor:pointer}
+.sk-click:hover{border-color:var(--accent);background:var(--accent-soft)}
+.sk-nm{color:var(--text);font-size:12px;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sk-sub{color:var(--muted);font-size:10px;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sk-attr{margin-right:4px}
+.sk-pow{color:var(--amber)}
+
+.soulmarks{display:none}
+.smark-wrap{width:100%}
+.smark-btn{width:100%;height:74px;background:var(--inset);border:1px solid var(--line);border-radius:8px;
+  display:flex;align-items:center;gap:10px;padding:0 12px;cursor:pointer;color:var(--text);transition:border-color .15s,background .15s}
+.smark-btn:hover{border-color:var(--accent);background:var(--accent-soft)}
+.smark-img{width:44px;height:44px;object-fit:contain;background:var(--inset);border:1px solid var(--line);
+  border-radius:7px;flex:0 0 auto;image-rendering:pixelated}
+.smark-mid{display:flex;flex-direction:column;align-items:flex-start;gap:4px;min-width:0}
+.smark-title{font-size:15px;color:var(--text);line-height:1}
+.smark-tags{display:flex;flex-wrap:wrap}
+.smark-btn-disabled{width:100%;height:74px;background:var(--inset);border:1px dashed var(--line-2);border-radius:8px;
+  display:flex;align-items:center;justify-content:center;color:var(--muted-2);font-size:12px}
+.soulmark-tag{display:inline-block;background:#123054;color:var(--accent);border:1px solid #1f3d63;
+  border-radius:4px;font-size:10px;padding:2px 7px;margin-right:4px}
+.smark-modal-icon{width:56px;height:56px;margin:0 auto 10px}
+.smark-modal-icon img{width:56px;height:56px;object-fit:contain;image-rendering:pixelated}
+.smark-nav-btn{background:var(--elev);border:1px solid var(--line);color:var(--text);border-radius:7px;
+  padding:5px 14px;font-size:12px;cursor:pointer;transition:background .15s,border-color .15s}
+.smark-nav-btn:hover:not(:disabled){border-color:var(--accent);color:var(--accent);background:var(--elev-2)}
+.smark-nav-btn:disabled{opacity:.4;cursor:default}
+
+#war-list{overflow-y:auto;max-height:calc(100vh - 300px);min-height:240px}
+#war-info{margin-top:12px;border-top:1px solid var(--line);padding-top:10px;font-size:12.5px;color:var(--text)}
+.warfilt{background:var(--elev);border:1px solid var(--line);color:var(--muted);margin:0;padding:6px 14px;
+  font-size:12px;border-radius:999px;font-weight:600;transition:background .15s,border-color .15s,color .15s}
+.warfilt.active{background:var(--accent-soft);border-color:var(--accent);color:var(--accent)}
+
+/* ---- 主题切换按钮 (白天/夜间) ---- */
+.theme-btn{margin:0 0 0 auto;width:36px;height:36px;padding:0;border-radius:999px;
+  border:1px solid var(--line);background:var(--elev);color:var(--text);display:inline-flex;
+  align-items:center;justify-content:center;cursor:pointer;transition:background .15s,border-color .15s,color .15s,transform .06s}
+.theme-btn:hover{background:var(--elev-2);border-color:var(--line-2)}
+.theme-btn:active{transform:translateY(1px)}
+.theme-btn svg{width:18px;height:18px}
+.theme-btn .ic-moon{display:none}
+[data-theme="light"] .theme-btn .ic-sun{display:none}
+[data-theme="light"] .theme-btn .ic-moon{display:inline}
+
+/* ---- 浅色(白天)主题 ---- */
+:root[data-theme="light"]{
+  --bg:#eef2f9; --panel:#ffffff; --card:#ffffff; --card-2:#eef2f8;
+  --elev:#e9eef6; --elev-2:#dbe3f0; --inset:#f6f8fc; --inset-2:#eef2f8;
+  --line:#d5dde9; --line-2:#b6c1d6;
+  --text:#1f2a3d; --muted:#536179; --muted-2:#8792a7;
+  --accent:#2f6fe4; --accent-deep:#2456b8; --accent-soft:#e2ebfb;
+  --green:#1a9e5f; --green-deep:#147c4a;
+  --amber:#b7791f; --red:#d14343; --purple:#7c53e0; --cyan:#0e7aa6; --btn-fg:#ffffff;
+}
+[data-theme="light"] body{background-image:radial-gradient(1100px 520px at 15% -10%,#e7edf8 0,rgba(231,237,248,0) 55%),
+  radial-gradient(900px 480px at 100% 0,rgba(47,111,228,.06) 0,rgba(47,111,228,0) 60%)}
+[data-theme="light"] header{background:linear-gradient(180deg,#ffffff,#f3f6fb);border-bottom:1px solid var(--line);
+  box-shadow:0 1px 0 rgba(0,0,0,.03),0 4px 12px rgba(0,0,0,.06)}
+[data-theme="light"] .st-idle{color:#98a2b3}
+[data-theme="light"] .soulmark-tag{background:#e2ebfb;border-color:#b8cfe8;color:#2456b8}
+[data-theme="light"] .abcell .ev{color:#a8790a}
+[data-theme="light"] ::-webkit-scrollbar-thumb{background:#c6cfdd;border-color:var(--inset)}
+[data-theme="light"] ::-webkit-scrollbar-thumb:hover{background:#aab6c9}
 </style>
 </head>
 <body>
 <header>
-  <h1>赛尔号协议调试台</h1>
+  <div class="brand">
+    <div class="logo">S</div>
+    <div>
+      <h1>赛尔号协议调试台</h1>
+      <div class="sub">PySeer · 协议调试与对战控制台</div>
+    </div>
+  </div>
+  <button id="cbTheme" class="theme-btn" type="button" title="切换白天/夜间模式" aria-label="切换主题">
+    <svg class="ic-sun" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="4"/><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M4.93 19.07l1.41-1.41M17.66 6.34l1.41-1.41"/></svg>
+    <svg class="ic-moon" viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/></svg>
+  </button>
   <div class="status" id="status">idle</div>
 </header>
 <div class="tabs">
@@ -2099,10 +2252,10 @@ PAGE = r"""<!DOCTYPE html>
 <main>
   <div class="card" style="flex:1.2;max-width:560px">
     <h2>① 登录操作</h2>
-    <label>米米号(账号)<sup style="color:#f85149">*</sup> <span style="color:#8b949e">可下拉选择已保存的</span></label>
+    <label>米米号(账号)<sup style="color:var(--red)">*</sup> <span style="color:var(--muted)">可下拉选择已保存的</span></label>
     <input id="account" type="text" list="credList" placeholder="输入 或 选择已保存的米米号" autofocus>
     <datalist id="credList"></datalist>
-    <label>密码<sup style="color:#f85149">*</sup></label><input id="password" type="password">
+    <label>密码<sup style="color:var(--red)">*</sup></label><input id="password" type="password">
     <div class="rowflex">
       <div><label>游戏服IP</label><input id="host" type="text" value="101.43.19.60"></div>
       <div><label>端口</label><input id="port" type="number" value="1201"></div>
@@ -2115,9 +2268,9 @@ PAGE = r"""<!DOCTYPE html>
 
 <div id="tab-bag" class="tab-panel">
   <div class="bagwrap">
-    <div class="card" style="flex:1;min-width:320px">
-      <h2>出战背包（第一背包）</h2><div id="bag-first" class="avrow"><div style="color:#8b949e">等待...（登录后自动 43706 查询）</div></div>
-      <h2>待命背包（第二背包）</h2><div id="bag-second" class="avrow"><div style="color:#8b949e">等待...</div></div>
+    <div class="card" style="flex:0 0 auto;width:314px">
+      <h2>出战背包（第一背包）</h2><div id="bag-first" class="avrow"><div style="color:var(--muted)">等待...（登录后自动 43706 查询）</div></div>
+      <h2>待命背包（第二背包）</h2><div id="bag-second" class="avrow"><div style="color:var(--muted)">等待...</div></div>
       <button id="teamBtn" class="off" title="查看并切换到其它阵容">切换阵容</button>
       <button id="wareBtn" class="off" title="打开/关闭精灵仓库">精灵仓库</button>
       <div id="bag-status" style="display:none"></div>
@@ -2125,7 +2278,7 @@ PAGE = r"""<!DOCTYPE html>
     <div class="card" style="flex:1.5;min-width:360px">
       <div id="bag-detail-card">
         <h2 id="bag-title">精灵详情</h2>
-        <div id="bag-detail"><div style="color:#8b949e">选中一只精灵查看信息</div></div>
+        <div id="bag-detail"><div style="color:var(--muted)">选中一只精灵查看信息</div></div>
         <button id="storeBtn" class="off" disabled title="将选中精灵放入仓库">入库</button>
       </div>
       <div id="warehouse-view" style="display:none">
@@ -2133,10 +2286,10 @@ PAGE = r"""<!DOCTYPE html>
         <div style="display:flex;gap:8px;align-items:center;margin:0 0 8px;flex-wrap:wrap">
           <button id="warTypeNormal" class="warfilt active">普通仓库</button>
           <button id="warTypeExe" class="warfilt">精英仓库</button>
-          <input id="warSearch" type="text" spellcheck="false" placeholder="按id搜索仓库精灵" style="flex:1;min-width:120px;padding:6px 8px;background:#0d1117;border:1px solid #30363d;color:#d8dee9;border-radius:6px;font:12px Menlo,monospace">
+          <input id="warSearch" type="text" spellcheck="false" placeholder="按id搜索仓库精灵" style="flex:1;min-width:120px;padding:6px 8px;background:var(--inset);border:1px solid var(--line);color:var(--text);border-radius:6px;font:12px Menlo,monospace">
           <button id="warClose" class="off" style="display:none;margin:0;padding:2px 10px;font-size:12px" title="关闭搜索">×</button>
         </div>
-        <div id="war-list" class="avrow"><div style="color:#8b949e">点击“精灵仓库”后拉取...</div></div>
+        <div id="war-list" class="avrow"><div style="color:var(--muted)">点击“精灵仓库”后拉取...</div></div>
         <div id="war-info"></div>
       </div>
     </div>
@@ -2144,16 +2297,16 @@ PAGE = r"""<!DOCTYPE html>
 </div>
 
 <div id="teamModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:999">
-  <div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:440px;max-height:72vh;overflow:auto;background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px">
-    <h3 style="margin:0 0 8px;color:#58a6ff">阵容列表 <span id="teamNote" style="font-size:11px;color:#8b949e"></span></h3>
+  <div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:440px;max-height:72vh;overflow:auto;background:var(--card);border:1px solid var(--line);border-radius:8px;padding:16px">
+    <h3 style="margin:0 0 8px;color:var(--accent)">阵容列表 <span id="teamNote" style="font-size:11px;color:var(--muted)"></span></h3>
     <div id="teamList"></div>
   </div>
 </div>
 
 <div id="skillModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:1000">
-  <div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:420px;max-height:76vh;overflow:auto;background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px">
-    <h3 style="margin:0 0 10px;color:#58a6ff" id="skillModalTitle">技能详情</h3>
-    <div id="skillModalBody" style="font-size:12px;color:#d8dee9"></div>
+  <div style="position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:420px;max-height:76vh;overflow:auto;background:var(--card);border:1px solid var(--line);border-radius:8px;padding:16px">
+    <h3 style="margin:0 0 10px;color:var(--accent)" id="skillModalTitle">技能详情</h3>
+    <div id="skillModalBody" style="font-size:12px;color:var(--text)"></div>
   </div>
 </div>
 
@@ -2163,31 +2316,31 @@ PAGE = r"""<!DOCTYPE html>
     <div style="flex:1;min-width:320px;display:flex;flex-direction:column;gap:12px">
       <div class="card">
         <h2>脚本 <button id="scriptRefreshBtn" class="off" style="float:right;margin:0;padding:2px 10px;font-size:12px">刷新</button></h2>
-        <div id="scriptDir" style="font-size:11px;color:#8b949e;margin:0 0 8px;word-break:break-all">—</div>
-        <div id="scriptList" style="max-height:30vh;overflow:auto;border:1px solid #30363d;border-radius:6px;background:#0d1117">
-          <div style="color:#8b949e;padding:8px">等待加载...</div>
+        <div id="scriptDir" style="font-size:11px;color:var(--muted);margin:0 0 8px;word-break:break-all">—</div>
+        <div id="scriptList" style="max-height:30vh;overflow:auto;border:1px solid var(--line);border-radius:6px;background:var(--inset)">
+          <div style="color:var(--muted);padding:8px">等待加载...</div>
         </div>
         <button id="scriptRunBtn" disabled>运行选中脚本</button>
         <button id="scriptStopBtn" class="off" style="display:none">停止脚本</button>
-        <div id="scriptStatus" style="font-size:12px;color:#8b949e;margin-top:6px">—</div>
+        <div id="scriptStatus" style="font-size:12px;color:var(--muted);margin-top:6px">—</div>
       </div>
       <div class="card">
         <h2>③ 发包测试</h2>
-        <label>命令（全部）<sup style="color:#888">选一个跳到下面</sup></label>
+        <label>命令（全部）<sup style="color:var(--muted-2)">选一个跳到下面</sup></label>
         <select id="cmdRef"><option value="">— 从全部 2910 条命令中选择 —</option></select>
         <label>命令号 / 名字（可输入过滤）</label><input id="cmd" type="text" list="cmdList" placeholder="如 40001 或 ENTER_MAP" value="40001">
         <datalist id="cmdList"></datalist>
-        <label>包体参数（十进制，逗号/空格分隔）<sup style="color:#888">自动转标准包体</sup></label>
+        <label>包体参数（十进制，逗号/空格分隔）<sup style="color:var(--muted-2)">自动转标准包体</sup></label>
         <input id="body" type="text" placeholder="十进制参数, 逗号/空格分隔; 可留空(空包体)。如 0 10 725 172  → 000000000000000A000002D5000000A0" value="">
         <div class="rowflex" style="align-items:center;gap:8px">
           <label style="margin:0"><input id="rawHex" type="checkbox"> 原样HEX</label>
-          <div style="margin-left:auto"><label style="margin:0">预览</label><code id="bodyPrev" style="display:inline-block;margin-left:6px;padding:2px 6px;background:#0d1117;border:1px solid #30363d;border-radius:4px;color:#79c0ff;font:11px Menlo,monospace;word-break:break-all">—</code></div>
+          <div style="margin-left:auto"><label style="margin:0">预览</label><code id="bodyPrev" style="display:inline-block;margin-left:6px;padding:2px 6px;background:var(--inset);border:1px solid var(--line);border-radius:4px;color:var(--cyan);font:11px Menlo,monospace;word-break:break-all">—</code></div>
         </div>
         <button id="sendBtn" disabled>发送</button>
         <button id="petbagBtn" class="off" disabled title="发送命令 43706 GET_PET_INFO_BY_ONCE, 查询背包内所有精灵(含能力值)">查询背包精灵(43706)</button>
         <div style="margin-top:8px"><label>服务器响应（实时，内容可选中复制；受过滤包id/收发复选框约束）</label>
-          <div id="sendStatus" style="font-size:12px;color:#8b949e;margin:2px 0 6px">—</div>
-          <div id="pktWrap" style="max-height:240px;overflow:auto;border:1px solid #30363d;border-radius:6px;background:#0d1117">
+          <div id="sendStatus" style="font-size:12px;color:var(--muted);margin:2px 0 6px">—</div>
+          <div id="pktWrap" style="max-height:240px;overflow:auto;border:1px solid var(--line);border-radius:6px;background:var(--inset)">
             <table id="pktTable" style="width:100%;table-layout:fixed;border-collapse:collapse;font:12px Menlo,monospace;user-select:text;cursor:text">
               <colgroup>
                 <col style="width:60px">
@@ -2196,11 +2349,11 @@ PAGE = r"""<!DOCTYPE html>
                 <col>
               </colgroup>
               <thead>
-                <tr style="text-align:left;background:#161b22">
-                  <th style="padding:4px 8px;border:1px solid #30363d">类型</th>
-                  <th style="padding:4px 8px;border:1px solid #30363d">命令号</th>
-                  <th style="padding:4px 8px;border:1px solid #30363d">包体(hex)</th>
-                  <th style="padding:4px 8px;border:1px solid #30363d">十进制数组</th>
+                <tr style="text-align:left;background:var(--card)">
+                  <th style="padding:4px 8px;border:1px solid var(--line)">类型</th>
+                  <th style="padding:4px 8px;border:1px solid var(--line)">命令号</th>
+                  <th style="padding:4px 8px;border:1px solid var(--line)">包体(hex)</th>
+                  <th style="padding:4px 8px;border:1px solid var(--line)">十进制数组</th>
                 </tr>
               </thead>
               <tbody id="pktBody"></tbody>
@@ -2213,7 +2366,7 @@ PAGE = r"""<!DOCTYPE html>
     <div style="flex:1.6;min-width:420px;display:flex;flex-direction:column;gap:12px">
       <div class="card">
         <h2>脚本输出 (实时) <button id="scriptClearBtn" class="off" style="float:right;margin:0;padding:2px 10px;font-size:12px">清空</button></h2>
-        <div id="scriptOutput" style="max-height:34vh;overflow:auto;background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:8px;font:12px/1.5 Menlo,monospace;white-space:pre-wrap;color:#a5d6a7">（尚未运行脚本; 运行后 print 输出会实时显示在这里）</div>
+        <div id="scriptOutput" style="max-height:34vh;overflow:auto;background:var(--inset);border:1px solid var(--line);border-radius:6px;padding:8px;font:12px/1.5 Menlo,monospace;white-space:pre-wrap;color:var(--green)">（尚未运行脚本; 运行后 print 输出会实时显示在这里）</div>
       </div>
       <div class="card">
         <h2>② 日志输出 (实时) <button id="clearLogBtn" class="off" style="float:right;margin:0;padding:2px 10px;font-size:12px">清空输出</button></h2>
@@ -2234,13 +2387,13 @@ PAGE = r"""<!DOCTYPE html>
   <!-- 发起对战: 输入带cmdid的完整HEX包 (任意命令号) -->
   <div style="padding:12px">
     <div class="card">
-      <h2>发起对战 (输入带 cmdid 的完整 HEX 包 <sup style="color:#888">支持任意对战命令号, 不限于 41129</sup>)</h2>
+      <h2>发起对战 (输入带 cmdid 的完整 HEX 包 <sup style="color:var(--muted-2)">支持任意对战命令号, 不限于 41129</sup>)</h2>
       <div class="rowflex" style="align-items:center;gap:8px">
         <input id="battleHex" type="text" spellcheck="false" placeholder="粘贴完整十六进制包, 如 00000015310000A0A9383934A300000255000030A0">
         <button id="battleHexBtn" disabled>发送</button>
         <button id="battleClearBtn" class="off">清空对战状态</button>
       </div>
-      <div id="battleHexInfo" style="font-size:12px;color:#8b949e;margin-top:4px">—</div>
+      <div id="battleHexInfo" style="font-size:12px;color:var(--muted);margin-top:4px">—</div>
     </div>
   </div>
   <!-- 对战信息区: 我方/敌方 各占一列, 头像+血条 + 各自出场队伍 -->
@@ -2248,32 +2401,32 @@ PAGE = r"""<!DOCTYPE html>
     <div style="display:flex;gap:12px;flex-wrap:wrap">
       <div class="card" style="flex:1;min-width:300px">
         <h2>我方</h2>
-        <div id="battleMy" class="fight-side"><div style="color:#8b949e">等待对战包(2503/2504)...</div></div>
+        <div id="battleMy" class="fight-side"><div style="color:var(--muted)">等待对战包(2503/2504)...</div></div>
         <h2 style="margin-top:10px">我方出场队伍</h2>
-        <div id="battleMyTeam" class="battle-team"><div style="color:#8b949e">—</div></div>
+        <div id="battleMyTeam" class="battle-team"><div style="color:var(--muted)">—</div></div>
       </div>
       <div class="card" style="flex:1;min-width:300px">
         <h2>敌方</h2>
-        <div id="battleOther" class="fight-side"><div style="color:#8b949e">等待对战包...</div></div>
+        <div id="battleOther" class="fight-side"><div style="color:var(--muted)">等待对战包...</div></div>
         <h2 style="margin-top:10px">敌方出场队伍</h2>
-        <div id="battleOtherTeam" class="battle-team"><div style="color:#8b949e">—</div></div>
+        <div id="battleOtherTeam" class="battle-team"><div style="color:var(--muted)">—</div></div>
       </div>
     </div>
     <!-- 操作区: 单列, 位于对战信息区下方 -->
     <div class="card" style="margin-top:12px">
       <h2>操作区</h2>
-      <div style="font-size:12px;color:#8b949e;margin:4px 0 6px">技能 (点击发 2405 USE_SKILL)</div>
-      <div id="battleSkills" style="display:flex;flex-wrap:wrap;gap:8px;margin:4px 0 8px"><div style="color:#8b949e">—</div></div>
+      <div style="font-size:12px;color:var(--muted);margin:4px 0 6px">技能 (点击发 2405 USE_SKILL)</div>
+      <div id="battleSkills" style="display:flex;flex-wrap:wrap;gap:8px;margin:4px 0 8px"><div style="color:var(--muted)">—</div></div>
       <div id="battleOps" style="display:flex;flex-wrap:wrap;gap:8px"></div>
-      <div id="battleActionStatus" style="font-size:12px;color:#8b949e;margin-top:6px">—</div>
-      <div id="battleChangePetPicker" style="display:none;margin-top:8px;border:1px solid #30363d;background:#0d1117;border-radius:8px;padding:8px"></div>
+      <div id="battleActionStatus" style="font-size:12px;color:var(--muted);margin-top:6px">—</div>
+      <div id="battleChangePetPicker" style="display:none;margin-top:8px;border:1px solid var(--line);background:var(--inset);border-radius:8px;padding:8px"></div>
     </div>
   </div>
   <!-- 战报记录 -->
   <div style="padding:0 12px 12px">
     <div class="card">
       <h2>战报记录 <button id="battleReportCopyBtn" class="off" style="float:right;margin:0 6px 0 0;padding:2px 10px;font-size:12px">复制</button><button id="battleReportClearBtn" class="off" style="float:right;margin:0;padding:2px 10px;font-size:12px">清空</button></h2>
-      <div id="battleReport" style="max-height:32vh;overflow:auto;background:#0d1117;border:1px solid #30363d;border-radius:6px;padding:8px;font:12px/1.5 Menlo,monospace;white-space:pre-wrap;color:#9ecbff">（对战中逐回合记录: 技能/换宠/HP变化/道具/捕捉/结束）</div>
+      <div id="battleReport" style="max-height:32vh;overflow:auto;background:var(--inset);border:1px solid var(--line);border-radius:6px;padding:8px;font:12px/1.5 Menlo,monospace;white-space:pre-wrap;color:var(--cyan)">（对战中逐回合记录: 技能/换宠/HP变化/道具/捕捉/结束）</div>
     </div>
   </div>
 </div><!-- /tab-battle -->
@@ -2282,6 +2435,18 @@ PAGE = r"""<!DOCTYPE html>
 const logEl=document.getElementById('log');
 const statusEl=document.getElementById('status');
 function setStatus(s){statusEl.textContent=s;statusEl.className='status st-'+s;}
+
+// ---- 主题切换 (白天/夜间) ----
+let _theme = document.documentElement.getAttribute('data-theme') || 'dark';
+function applyTheme(t){
+  _theme = t;
+  document.documentElement.setAttribute('data-theme', t);
+  try{ localStorage.setItem('pyseer_theme', t); }catch(e){}
+}
+document.getElementById('cbTheme').addEventListener('click',()=>{
+  applyTheme(_theme==='light' ? 'dark' : 'light');
+});
+
 
 // ---- 过滤/接收开关 (前端显示层) ----
 let idFilter = new Set();
@@ -2428,8 +2593,8 @@ document.getElementById('loginBtn').onclick=async()=>{
   const pwdEl=document.getElementById('password');
   const acc=accEl.value.trim(), pwd=pwdEl.value;
   accEl.style.border=''; pwdEl.style.border='';
-  if(!acc){accEl.focus();accEl.style.border='1px solid #f85149';setStatus('error');appendLog({t:now(),level:'error',msg:'请先填写米米号(账号)'});return;}
-  if(!pwd){pwdEl.focus();pwdEl.style.border='1px solid #f85149';setStatus('error');appendLog({t:now(),level:'error',msg:'请先填写密码'});return;}
+  if(!acc){accEl.focus();accEl.style.border='1px solid var(--red)';setStatus('error');appendLog({t:now(),level:'error',msg:'请先填写米米号(账号)'});return;}
+  if(!pwd){pwdEl.focus();pwdEl.style.border='1px solid var(--red)';setStatus('error');appendLog({t:now(),level:'error',msg:'请先填写密码'});return;}
   btn.disabled=true;
   try{
     const body={account:acc,password:pwd,
@@ -2456,23 +2621,23 @@ document.getElementById('sendBtn').onclick=async()=>{
     if(j.ok){
       const n=(window.__CM||{})[j.sent.cmd]||'';
       st.textContent=`已发送 cmd=${j.sent.cmd} ${n}　(不阻塞等待应答, 实时显示在下方表格)`;
-      st.style.color='#3fb950';
-    }else{ st.textContent='发送失败: '+(j.error||''); st.style.color='#f85149'; }
-  }catch(e){ st.textContent='发送出错: '+e; st.style.color='#f85149'; }
+      st.style.color='var(--green)';
+    }else{ st.textContent='发送失败: '+(j.error||''); st.style.color='var(--red)'; }
+  }catch(e){ st.textContent='发送出错: '+e; st.style.color='var(--red)'; }
 };
 // 查询背包精灵: 发送命令 43706 GET_PET_INFO_BY_ONCE (空包体), 由后台监听线程读取应答
 document.getElementById('petbagBtn').onclick=async()=>{
   const st=document.getElementById('sendStatus');
-  st.textContent='正在发送 43706 GET_PET_INFO_BY_ONCE 查询背包精灵...'; st.style.color='#d29922';
+  st.textContent='正在发送 43706 GET_PET_INFO_BY_ONCE 查询背包精灵...'; st.style.color='var(--amber)';
   const body={cmd:'43706',body:'',encode:'pack'};
   try{
     const r=await fetch('/api/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     const j=await r.json();
     if(j.ok){
       st.textContent='已发送 43706 GET_PET_INFO_BY_ONCE (查询背包一切精灵), 应答实时显示在下方表格 (RECV)';
-      st.style.color='#3fb950';
-    }else{ st.textContent='发送失败: '+(j.error||''); st.style.color='#f85149'; }
-  }catch(e){ st.textContent='发送出错: '+e; st.style.color='#f85149'; }
+      st.style.color='var(--green)';
+    }else{ st.textContent='发送失败: '+(j.error||''); st.style.color='var(--red)'; }
+  }catch(e){ st.textContent='发送出错: '+e; st.style.color='var(--red)'; }
 };
 // ---- 服务器响应表格 (实时, 可选中复制) ----
 const pktBodyEl=document.getElementById('pktBody');
@@ -2482,10 +2647,10 @@ function renderTableRow(r){
   const tr=document.createElement('tr');
   // 类型列: SEND / RECV 单行显示; 其余列单行 + 超出省略号, 但 title 保存完整内容便于复制
   const mkCell=(val,color)=>{ const cd=document.createElement('td'); cd.textContent=val; cd.title=val;
-    cd.style.padding='3px 8px'; cd.style.border='1px solid #21262d'; cd.style.color=color || '#d8dee9';
+    cd.style.padding='3px 8px'; cd.style.border='1px solid var(--elev)'; cd.style.color=color || 'var(--text)';
     cd.style.whiteSpace='nowrap'; cd.style.overflow='hidden'; cd.style.textOverflow='ellipsis';
     return cd; };
-  const c1=mkCell(r.dir, r.dir==='SEND'?'#79c0ff':'#3fb950');
+  const c1=mkCell(r.dir, r.dir==='SEND'?'var(--cyan)':'var(--green)');
   const c2=mkCell(r.cmd);
   const c3=mkCell(r.body);
   const c4=mkCell((r.ints&&r.ints.length)?`[${r.ints.join(', ')}]`:(r.body?'(非int32)':'[]'));
@@ -2526,9 +2691,9 @@ async function updateBodyPreview(){
     if(j.ok){
       const parts=j.parts||[];
       prevEl.textContent=j.length?`${j.hex}  (${j.length}B; ${parts.map(p=>p[0]+'='+p[2]+'B').join(', ')}| 分包: ${parts.map(p=>p[0]).join(', ')})`:'(空包体)';
-      prevEl.style.color='#79c0ff';
-    }else{ prevEl.textContent='错误: '+(j.error||''); prevEl.style.color='#f85149'; }
-  }catch(e){ prevEl.textContent='错误: '+e; prevEl.style.color='#f85149'; }
+      prevEl.style.color='var(--cyan)';
+    }else{ prevEl.textContent='错误: '+(j.error||''); prevEl.style.color='var(--red)'; }
+  }catch(e){ prevEl.textContent='错误: '+e; prevEl.style.color='var(--red)'; }
 }
 updateBodyPreview();
 // 命令名自动补全 + 应答显示命令名
@@ -2583,7 +2748,7 @@ async function loadScripts(){
     const box=document.getElementById('scriptList');
     box.innerHTML='';
     if(!scriptsList.length){
-      const d=document.createElement('div'); d.style.cssText='color:#8b949e;padding:8px';
+      const d=document.createElement('div'); d.style.cssText='color:var(--muted);padding:8px';
       d.textContent='（该目录暂无脚本, 把 .py 脚本放进上面所示的目录即可）'; box.appendChild(d);
     }
     scriptsList.forEach(nm=>{
@@ -2594,7 +2759,7 @@ async function loadScripts(){
         b.classList.add('sel');
         scriptRunBtn.disabled=false;
         scriptRunBtn.dataset.name=nm;
-        scriptStatusEl.textContent='已选择: '+nm; scriptStatusEl.style.color='#8b949e';
+        scriptStatusEl.textContent='已选择: '+nm; scriptStatusEl.style.color='var(--muted)';
       };
       box.appendChild(b);
     });
@@ -2606,13 +2771,13 @@ scriptRunBtn.onclick=async()=>{
   const nm=scriptRunBtn.dataset.name;
   if(!nm){ appendLog({t:now(),level:'tip',msg:'请先选择要运行的脚本'}); return; }
   scriptOutEl.innerHTML='';   // 每个脚本运行前清空输出控制台, 只显示本次运行
-  scriptStatusEl.textContent='正在启动 '+nm+' ...'; scriptStatusEl.style.color='#d29922';
+  scriptStatusEl.textContent='正在启动 '+nm+' ...'; scriptStatusEl.style.color='var(--amber)';
   try{
     const r=await fetch('/api/scripts/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:nm})});
     const j=await r.json();
-    if(j.ok){ scriptStatusEl.textContent='已启动 '+nm; scriptStatusEl.style.color='#3fb950'; scriptStopBtn.style.display='inline-block'; }
-    else{ scriptStatusEl.textContent='启动失败: '+(j.error||''); scriptStatusEl.style.color='#f85149'; scriptStopBtn.style.display='none'; }
-  }catch(e){ scriptStatusEl.textContent='启动出错: '+e; scriptStatusEl.style.color='#f85149'; }
+    if(j.ok){ scriptStatusEl.textContent='已启动 '+nm; scriptStatusEl.style.color='var(--green)'; scriptStopBtn.style.display='inline-block'; }
+    else{ scriptStatusEl.textContent='启动失败: '+(j.error||''); scriptStatusEl.style.color='var(--red)'; scriptStopBtn.style.display='none'; }
+  }catch(e){ scriptStatusEl.textContent='启动出错: '+e; scriptStatusEl.style.color='var(--red)'; }
 };
 scriptStopBtn.onclick=async()=>{
   try{ await fetch('/api/scripts/stop',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}); }catch(e){}
@@ -2644,7 +2809,7 @@ async function refreshBattle(){
 function hpPct(hp,max){ if(hp==null||max==null||!max) return 0; return Math.max(0,Math.min(100,Math.round(hp*100/max))); }
 function renderFighterBox(el, p){
   el.innerHTML='';
-  if(!p){ el.innerHTML='<div style="color:#8b949e">—</div>'; return; }
+  if(!p){ el.innerHTML='<div style="color:var(--muted)">—</div>'; return; }
   const pid=p.id||p.petID;
   const card=document.createElement('div'); card.className='fight-card';
   const img=document.createElement('div'); img.className='fc-img';
@@ -2668,7 +2833,7 @@ function renderFighterBox(el, p){
 }
 function renderTeamBox(el, team){
   el.innerHTML='';
-  if(!team||!team.length){ el.innerHTML='<div style="color:#8b949e">—</div>'; return; }
+  if(!team||!team.length){ el.innerHTML='<div style="color:var(--muted)">—</div>'; return; }
   for(const p of team){
     const d=document.createElement('div'); d.className='pt-chip';
     const im=document.createElement('img'); im.src=p.avatar||('/head/'+(p.id)+'.png'); im.onerror=()=>{im.style.display='none';};
@@ -2753,7 +2918,7 @@ function renderBattleState(j){
     // 从上到下(时间正序): 首条在最上, 新增追加到最下; 不强制滚动,
     // 仅当用户本就停在底部时才跟随新内容滚动(正常日志行为)
     const nearBottom=(rep.scrollTop+rep.clientHeight)>=(rep.scrollHeight-40);
-    rep.innerHTML=entries.length? '' : '<div style="color:#8b949e">（暂无战报记录）</div>';
+    rep.innerHTML=entries.length? '' : '<div style="color:var(--muted)">（暂无战报记录）</div>';
     entries.forEach(e=>{
       const d=document.createElement('div');
       d.textContent=e.t+'  '+e.msg;
@@ -2767,7 +2932,7 @@ let _SKILL_DATA={};    // sid -> 技能完整数据 (power/pp 等)
 let _SKILL_PP={};      // sid -> 当前可用 PP (优先用服务器下发的 mySkillPP, 无则按 maxpp)
 function renderSkillButtons(skills, ppMap){
   const sk=document.getElementById('battleSkills'); sk.innerHTML='';
-  if(!skills.length){ sk.innerHTML='<div style="color:#8b949e">—</div>'; return; }
+  if(!skills.length){ sk.innerHTML='<div style="color:var(--muted)">—</div>'; return; }
   // 记录服务器下发的当前 PP（dict: sid字符串->当前pp），供本函数与本地同步使用
   if(ppMap){ for(const k in ppMap){ _SKILL_PP[k]=ppMap[k]; } }
   // 五号位(第5个索引=4)技能移到最左侧; 其余按序
@@ -2839,14 +3004,14 @@ async function openChangePetPicker(state, force){
   const alive=team.filter(p=>p.catchTime!==cur && _petHp(p) > 0);
   const cands=(alive.length?alive:team.filter(p=>p.catchTime!==cur));
   if(!cands.length){ appendLog({t:now(),level:'warn',msg:'换宠: 没有可换的出战精灵'}); if(force){ 
-      const st=document.getElementById('battleActionStatus'); if(st){ st.textContent='⚠️ 我方精灵阵亡, 但没有可上场的替补!'; st.style.color='#f85149'; }
+      const st=document.getElementById('battleActionStatus'); if(st){ st.textContent='⚠️ 我方精灵阵亡, 但没有可上场的替补!'; st.style.color='var(--red)'; }
     } return; }
   const st=document.getElementById('battleActionStatus');
   // 渲染可点击的候选列表
   picker.style.display='block';
   picker.innerHTML='';
   const head=document.createElement('div');
-  head.style.cssText='color:#58a6ff;font:12px Menlo,monospace;margin-bottom:6px';
+  head.style.cssText='color:var(--accent);font:12px Menlo,monospace;margin-bottom:6px';
   head.textContent=force ? '⚠️ 我方精灵阵亡, 请选择场上精灵:' : '选择换上场的精灵:';
   picker.appendChild(head);
   for(const p of cands){
@@ -2863,34 +3028,34 @@ async function openChangePetPicker(state, force){
   // 强制换宠时不提供"取消"; 普通换宠才显示
   if(!force){
     const cancel=document.createElement('button'); cancel.type='button';
-    cancel.style.cssText='flex:1 1 100%;background:#21262d;border:1px solid #30363d;border-radius:8px;color:#f85149;padding:6px;cursor:pointer;font:12px Menlo,monospace';
+    cancel.style.cssText='flex:1 1 100%;background:var(--elev);border:1px solid var(--line);border-radius:8px;color:var(--red);padding:6px;cursor:pointer;font:12px Menlo,monospace';
     cancel.textContent='取消';
     cancel.onclick=()=>{ picker.style.display='none'; picker.innerHTML=''; };
     picker.appendChild(cancel);
   }
-  if(st){ st.textContent= force ? '⚠️ 强制换宠: 请选择上场精灵' : '请选择要换上场的精灵'; st.style.color='#d29922'; }
+  if(st){ st.textContent= force ? '⚠️ 强制换宠: 请选择上场精灵' : '请选择要换上场的精灵'; st.style.color='var(--amber)'; }
 }
 async function doChangePet(catchTime, chosen, st){
   try{ await fetch('/api/battle/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({msg:('> 点击换宠 → '+(chosen&&(chosen.name||('id='+chosen.id)))+' (catch='+catchTime+')')})}); }catch(e){}
-  if(st){ st.textContent='换宠请求 catch='+catchTime+'...'; st.style.color='#d29922'; }
+  if(st){ st.textContent='换宠请求 catch='+catchTime+'...'; st.style.color='var(--amber)'; }
   try{
     const r=await fetch('/api/battle/change-pet',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({catchTime:catchTime})});
     const j=await r.json();
     if(j.ok){
-      if(st){ st.textContent='✔ 已发送 2407 换宠 catch='+catchTime; st.style.color='#3fb950'; }
+      if(st){ st.textContent='✔ 已发送 2407 换宠 catch='+catchTime; st.style.color='var(--green)'; }
       try{ await fetch('/api/battle/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({msg:'  服务器已受理换宠 catch='+catchTime})}); }catch(e){}
       appendLog({t:now(),level:'ok',msg:'[对战] 已发送 2407 换宠 catch='+catchTime+' body='+(j.sent.body||'')});
     }else{
-      if(st){ st.textContent='✘ 换宠失败: '+(j.error||''); st.style.color='#f85149'; }
+      if(st){ st.textContent='✘ 换宠失败: '+(j.error||''); st.style.color='var(--red)'; }
       appendLog({t:now(),level:'error',msg:'换宠失败: '+(j.error||'')});
     }
   }catch(e){
-    if(st){ st.textContent='✘ 换宠出错: '+e; st.style.color='#f85149'; }
+    if(st){ st.textContent='✘ 换宠出错: '+e; st.style.color='var(--red)'; }
     appendLog({t:now(),level:'error',msg:'换宠出错: '+e});
   }
 }
 async function sendBattleCmd(cmd, params){
-  const st=document.getElementById('battleActionStatus'); if(st){ st.textContent='发送中 cmd='+cmd+'...'; st.style.color='#d29922'; }
+  const st=document.getElementById('battleActionStatus'); if(st){ st.textContent='发送中 cmd='+cmd+'...'; st.style.color='var(--amber)'; }
   const label = (cmd===2405 && params && params.length) ? ('技能'+(_SKILL_NAMES[params[0]]||params[0])) : (window.__CM[cmd]||cmd);
   // 先把"点击"记进战报, 让战报立即有变化
   try{ await fetch('/api/battle/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({msg:'> 点击发送 '+label+' (cmd='+cmd+')'})}); }catch(e){}
@@ -2899,7 +3064,7 @@ async function sendBattleCmd(cmd, params){
     const r=await fetch('/api/battle/send',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({cmd:cmd, body:body})});
     const j=await r.json();
     if(j.ok){
-      if(st){ st.textContent='✔ 已发送 cmd='+cmd+' '+label; st.style.color='#3fb950'; }
+      if(st){ st.textContent='✔ 已发送 cmd='+cmd+' '+label; st.style.color='var(--green)'; }
       try{ await fetch('/api/battle/action',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({msg:'  服务器已受理发送 cmd='+cmd+' '+label})}); }catch(e){}
       appendLog({t:now(),level:'ok',msg:'[对战] 已发送 cmd='+cmd+' '+label+' body='+(j.sent.body||'')});
       // 技能 PP 由服务器 2505 的 AttackValue.skillList 权威同步 (renderBattleState 每次轮询会刷新);
@@ -2910,11 +3075,11 @@ async function sendBattleCmd(cmd, params){
         if(skc && (window.__lastBattleSkills||[]).length) renderSkillButtons(window.__lastBattleSkills);
       }
     }else{
-      if(st){ st.textContent='✘ 发送失败: '+(j.error||''); st.style.color='#f85149'; }
+      if(st){ st.textContent='✘ 发送失败: '+(j.error||''); st.style.color='var(--red)'; }
       appendLog({t:now(),level:'error',msg:'对战发包失败: '+(j.error||'')});
     }
   }catch(e){
-    if(st){ st.textContent='✘ 发送出错: '+e; st.style.color='#f85149'; }
+    if(st){ st.textContent='✘ 发送出错: '+e; st.style.color='var(--red)'; }
     appendLog({t:now(),level:'error',msg:'对战发包出错: '+e});
   }
 }
@@ -2977,8 +3142,8 @@ function sortIndexOf(slot){ return slot.bag==='second' ? (slot.index+7) : (slot.
 function startDrag(slot){
   dragState.active=true; dragState.src=slot;
   const copy=document.createElement('div');
-  copy.style.cssText='position:fixed;z-index:1000;pointer-events:none;width:72px;padding:4px;background:#21262d;border:1px solid #58a6ff;border-radius:8px;text-align:center;color:#d8dee9;font:11px Menlo,monospace;box-shadow:0 4px 12px rgba(0,0,0,.5);font-size:10px';
-  const ic=document.createElement('div'); ic.style.cssText='width:100%;aspect-ratio:1;background:#0d1117;border:1px solid #30363d;border-radius:6px;display:flex;align-items:center;justify-content:center;color:#8b949e;overflow:hidden';
+  copy.style.cssText='position:fixed;z-index:1000;pointer-events:none;width:72px;padding:4px;background:var(--elev);border:1px solid var(--accent);border-radius:8px;text-align:center;color:var(--text);font:11px Menlo,monospace;box-shadow:0 4px 12px rgba(0,0,0,.5);font-size:10px';
+  const ic=document.createElement('div'); ic.style.cssText='width:100%;aspect-ratio:1;background:var(--inset);border:1px solid var(--line);border-radius:6px;display:flex;align-items:center;justify-content:center;color:var(--muted);overflow:hidden';
   if(slot.pet.avatar){
     const im=document.createElement('img'); im.src=slot.pet.avatar; im.alt='';
     im.style.width='100%'; im.style.height='100%'; im.style.objectFit='contain';
@@ -3137,7 +3302,7 @@ let warehouseMode=false, warData=[], warSearch='', warType='normal', exeData=[],
 // 星级养成信息展示
 function renderCultInfo(pet){
   const el=document.getElementById('war-info'); if(!el) return;
-  let h = '<div style="color:#8b949e;margin-bottom:4px">养成信息</div>'+
+  let h = '<div style="color:var(--muted);margin-bottom:4px">养成信息</div>'+
     '<div class="detail-grid">'+
     `<div><span class="k">属性</span><span class="v">${pet.attr?pet.attr:'?'}</span></div>`+
     `<div><span class="k">等级</span><span class="v">${pet.level!=null?pet.level:'?'}</span></div>`+
@@ -3220,7 +3385,7 @@ function renderWarView(){
   let arr=src.slice().filter(p=>!(p.catchTime && bagCt.has(p.catchTime))).sort((a,b)=>(b.id||0)-(a.id||0));
   const q=warSearch.trim();
   if(q){ const qi=parseInt(q,10); if(Number.isFinite(qi)) arr=arr.filter(p=>p.id===qi); }
-  if(!arr.length){ list.innerHTML='<div style="color:#8b949e">（仓库为空或无匹配）</div>'; return; }
+  if(!arr.length){ list.innerHTML='<div style="color:var(--muted)">（仓库为空或无匹配）</div>'; return; }
   arr.forEach(p=>{
     const b=document.createElement('button'); b.type='button'; b.className='av-btn'+(warSel===String(p.catchTime)?' sel':'');
     const img=document.createElement('div'); img.className='av-img'; img.style.position='relative';
@@ -3356,12 +3521,12 @@ function renderSoulmarkPage(arr, page){
   const icon=s.iconId?`<div class="smark-modal-icon"><img src="/effecticon/${s.iconId}.png" onerror="this.remove()"></div>`:'';
   const nav=arr.length>1?`<div style="display:flex;justify-content:space-between;align-items:center;margin-top:12px">`+
     `<button class="smark-nav-btn" onclick="smPage(${page-1})" ${page<=0?'disabled':''}>上一版</button>`+
-    `<span style="color:#8b949e">${page+1} / ${arr.length}</span>`+
+    `<span style="color:var(--muted)">${page+1} / ${arr.length}</span>`+
     `<button class="smark-nav-btn" onclick="smPage(${page+1})" ${page>=arr.length-1?'disabled':''}>下一版</button></div>`:'';
   document.getElementById('skillModalTitle').textContent='专属特性';
   document.getElementById('skillModalBody').innerHTML=
     icon+(tags?`<div style="text-align:center;margin-bottom:10px">${tags}</div>`:'')+
-    `<div style="white-space:pre-line;line-height:1.7;color:#d8dee9;font-size:12px">${escapeHtml(desc)}</div>`+nav;
+    `<div style="white-space:pre-line;line-height:1.7;color:var(--text);font-size:12px">${escapeHtml(desc)}</div>`+nav;
   skillModalEl.style.display='block';
 }
 let _curPetEffects=[];   // 最近渲染详情精灵的 effects (用于匹配当前专属特性阶段)
@@ -3374,19 +3539,19 @@ function openSoulmark(sid){
   if(_curSouls.length) renderSoulmarkPage(_curSouls, 0);
 }
 function closeSkill(){ skillModalEl.style.display='none'; }
-function row(k,v){ if(v==null||v==='') return ''; return `<div style="display:flex;justify-content:space-between;border-bottom:1px solid #21262d;padding:4px 0"><span style="color:#8b949e">${k}</span><span style="color:#d8dee9">${v}</span></div>`; }
+function row(k,v){ if(v==null||v==='') return ''; return `<div style="display:flex;justify-content:space-between;border-bottom:1px solid var(--elev);padding:4px 0"><span style="color:var(--muted)">${k}</span><span style="color:var(--text)">${v}</span></div>`; }
 function openSkill(id){
   const d=_skillCache[id]; if(!d) return;
   const must=d.mustHit?'是':'否';
   const effs=(d.effects&&d.effects.length)?d.effects.map(e=>
-    `<div style="margin-top:6px;padding:6px;background:#0d1117;border:1px solid #30363d;border-radius:6px">`+
-      `<div style="color:#8b949e">效果#<span style="color:#58a6ff">${e.id}</span>`+(e.tag?` · <span style="color:#58a6ff">${e.tag}</span>`:'')+`</div>`+
-      (e.args&&e.args.length?`<div style="color:#8b949e">参数: ${e.args.join(', ')}</div>`:'')+
-      (e.desc?`<div style="color:#d8dee9;margin-top:2px">${e.desc}</div>`:'')+
-    `</div>`).join('') : '<div style="color:#8b949e">无附加效果</div>';
+    `<div style="margin-top:6px;padding:6px;background:var(--inset);border:1px solid var(--line);border-radius:6px">`+
+      `<div style="color:var(--muted)">效果#<span style="color:var(--accent)">${e.id}</span>`+(e.tag?` · <span style="color:var(--accent)">${e.tag}</span>`:'')+`</div>`+
+      (e.args&&e.args.length?`<div style="color:var(--muted)">参数: ${e.args.join(', ')}</div>`:'')+
+      (e.desc?`<div style="color:var(--text);margin-top:2px">${e.desc}</div>`:'')+
+    `</div>`).join('') : '<div style="color:var(--muted)">无附加效果</div>';
   document.getElementById('skillModalTitle').textContent='技能详情 - '+d.name;
   document.getElementById('skillModalBody').innerHTML=
-    `<div style="font-size:14px;color:#d8dee9;margin-bottom:8px">${d.name} <span style="font-size:11px;color:#8b949e">(技能id ${id})</span></div>`+
+    `<div style="font-size:14px;color:var(--text);margin-bottom:8px">${d.name} <span style="font-size:11px;color:var(--muted)">(技能id ${id})</span></div>`+
     row('属性', d.typeName)+row('威力', d.power)+row('PP值', d.pp)+
     row('命中率', (d.accuracy!=null?d.accuracy+'%':'?'))+
     row('暴击率', (d.crit?d.crit+'%':'无'))+
@@ -3401,11 +3566,11 @@ async function renderDetail(){
   const title=document.getElementById('bag-title');
   const det=document.getElementById('bag-detail');
   const storeBtn=document.getElementById('storeBtn');
-  if(!p){ if(title)title.textContent='精灵详情'; if(det)det.innerHTML='<div style="color:#8b949e">请选中一只精灵</div>'; if(storeBtn) storeBtn.disabled=true; return; }
+  if(!p){ if(title)title.textContent='精灵详情'; if(det)det.innerHTML='<div style="color:var(--muted)">请选中一只精灵</div>'; if(storeBtn) storeBtn.disabled=true; return; }
   if(storeBtn) storeBtn.disabled=false;
   if(title) title.textContent='精灵详情 - '+(p.name||('id='+p.id));
   // 顶部: 名字+等级(仅当前等级)
-  let h='<div style="font-size:14px;color:#d8dee9;margin-bottom:6px">'+ (p.name||('id='+p.id)) +'　<span style="color:#8b949e">等级</span> <span style="color:#d8dee9">'+(p.level!=null?p.level:'?')+'</span></div>';
+  let h='<div style="font-size:14px;color:var(--text);margin-bottom:6px">'+ (p.name||('id='+p.id)) +'　<span style="color:var(--muted)">等级</span> <span style="color:var(--text)">'+(p.level!=null?p.level:'?')+'</span></div>';
   // 属性 + 养成: 天赋(去掉(dv)) + 性格
   h+='<div class="detail-grid">'+
      (p.attr?`<div><span class="k">属性</span><span class="v">${p.attr}</span></div>`:'') +
@@ -3484,8 +3649,8 @@ async function openTeams(){
     const n=team.pet_detail.filter(x=>x[0]).length;
     const cur=team.id===got.curUsedId;
     const row=document.createElement('div');
-    row.style.cssText='display:flex;align-items:center;gap:8px;padding:8px;margin:0 0 6px;background:'+(cur?'#0d2a45':'#21262d')+';border:1px solid '+(cur?'#58a6ff':'#30363d')+';border-radius:6px;cursor:pointer';
-    row.innerHTML=`<div style="flex:1"><div style="color:${cur?'#58a6ff':'#d8dee9'}">${team.nick||('阵容'+team.id)}${cur?' (使用中)':''}</div><div style="font-size:11px;color:#8b949e">精灵 ${n} 只 · id=${team.id}</div></div>`;
+    row.style.cssText='display:flex;align-items:center;gap:8px;padding:8px;margin:0 0 6px;background:'+(cur?'var(--accent-soft)':'var(--elev)')+';border:1px solid '+(cur?'var(--accent)':'var(--line)')+';border-radius:6px;cursor:pointer';
+    row.innerHTML=`<div style="flex:1"><div style="color:${cur?'var(--accent)':'var(--text)'}">${team.nick||('阵容'+team.id)}${cur?' (使用中)':''}</div><div style="font-size:11px;color:var(--muted)">精灵 ${n} 只 · id=${team.id}</div></div>`;
     row.onclick=async()=>{
       if(cur){ return; }
       row.style.opacity='.5';
