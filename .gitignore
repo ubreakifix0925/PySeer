@@ -30,6 +30,20 @@ app/multi.py
 !docs/
 !docs/**
 
+# ---- 功能性游戏数据基线 (让 git clone 后即可离线显示精灵名/属性/技能/魂印) ----
+# 这些是 assets_updater 从游戏包解析出的**功能数据**(JSON, 跨平台); 头像/图标(data/head,
+# data/effecticon)与运行时文件(data/webui_*)仍忽略, 由启动时下载生成. vendor/(UnityPy)含
+# 平台相关编译产物(.so), 不做 git 提交, 由 assets_updater 按当前平台自动 pip 安装到 vendor/.
+!data/
+!data/petbook.json
+!data/pet_attr.json
+!data/skills.json
+!data/soulmarks.json
+!data/.petbook_state.json
+!data/.pet_attr_state.json
+!data/.skills_state.json
+!data/.soulmarks_state.json
+
 # ---- 仍要忽略的运行产物/字节码 (即便目录保留) ----
 *.pyc
 **/__pycache__/

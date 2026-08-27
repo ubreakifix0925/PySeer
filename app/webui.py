@@ -40,8 +40,7 @@ _STATE = {
     "connected": False,      # 游戏 socket 是否在线 (掉线检测后置 False)
     "disconnect_kind": "",   # 最近一次掉线类型: '' | 'server'(服务器造成) | 'active'(主动中断)
 }
-_LOG = []                    # 结构化日志 (供 /api/log 返回)
-_PENDING = []                # SSE 增量条目的固化字符串
+_LOG = []                    # 结构化日志 (供 /api/log 返回); 有上限 _LOG_MAX, 超限从头部裁剪
 _COND = threading.Condition()  # 通知 SSE 有新日志
 _RECV_LATEST = {}            # {cmd: 最近一条 RECV 包体(hex)} 供脚本库取值
 _RECV_SEQ = {}               # {cmd: 该 cmd 的 RECV 序号} 供判断"新响应"
@@ -792,7 +791,6 @@ def save_logs(reason="shutdown"):
     with _COND:
         entries = list(_LOG)
         _LOG.clear()
-        _PENDING.clear()
     ts = time.strftime("%Y%m%d_%H%M%S")
     os.makedirs(_LOG_DIR, exist_ok=True)
     path = os.path.join(_LOG_DIR, f"seer_debug_{ts}.log")
@@ -825,7 +823,6 @@ def log(level, message, **extra):
         _LOG.append(entry)
         if len(_LOG) > _LOG_MAX:
             _LOG.pop(0)
-        _PENDING.append(json.dumps(entry, ensure_ascii=False))
         _COND.notify_all()
 
 
@@ -852,11 +849,16 @@ def _relogin(account=None, host=None, port=None) -> bool:
     """用最近一次登录的 account + 记住的密码 + host/port 重新 run_login.
 
     主动(/api/reconnect)与被动(掉线自愈)重连共用. 成功启动重连线程返回 True.
+    与 /api/login 一致: 若已在登录中则不再起新线程(防止 run_login 并发竞态).
     """
     with _LOCK:
+        if _STATE["status"] == "logging_in":
+            return False                 # 已有一次登录/重连在进行
         account = account or _STATE.get("account")
         host = host or _STATE.get("host") or DEFAULT_GAME_SERVER[0]
         port = int(_STATE.get("port") or DEFAULT_GAME_SERVER[1])
+        _STATE["status"] = "logging_in"
+        _STATE["detail"] = "正在重连..."
     if not account:
         return False
     pwd = None
@@ -1380,21 +1382,23 @@ class Handler(BaseHTTPRequestHandler):
         for ln in recent:
             self.wfile.write(f"data: {json.dumps(ln, ensure_ascii=False)}\n\n".encode("utf-8"))
         self.wfile.flush()
-        idx = len(_PENDING)
+        # 用 _LOG 的单调 seq 判"新", 不缓存 _PENDING (避免无限增长; _LOG 有 _LOG_MAX 上限)
+        last_seq = recent[-1].get("seq", 0) if recent else 0
         try:
             while True:
                 with _COND:
-                    while len(_PENDING) <= idx:
+                    while True:
+                        new = [e for e in _LOG if e.get("seq", 0) > last_seq]
+                        if new:
+                            last_seq = new[-1]["seq"]
+                            break
                         _COND.wait(timeout=20)
-                        if len(_PENDING) <= idx:
+                        if not [e for e in _LOG if e.get("seq", 0) > last_seq]:
                             # 心跳, 防止代理断连
                             self.wfile.write(b": ping\n\n")
                             self.wfile.flush()
-                            continue
-                    new = _PENDING[idx:]
-                    idx = len(_PENDING)
                 for ln in new:
-                    self.wfile.write(f"data: {ln}\n\n".encode("utf-8"))
+                    self.wfile.write(f"data: {json.dumps(ln, ensure_ascii=False)}\n\n".encode("utf-8"))
                 self.wfile.flush()
         except (BrokenPipeError, ConnectionResetError):
             pass
@@ -1430,6 +1434,15 @@ class Handler(BaseHTTPRequestHandler):
             host = str(data.get("host") or DEFAULT_GAME_SERVER[0])
             port = int(data.get("port") or DEFAULT_GAME_SERVER[1])
             session = data.get("session") or None
+            # 防止重复/并发登录: 若已有一次登录在进行, 直接拒绝(避免 run_login 并发竞态).
+            with _LOCK:
+                if _STATE["status"] == "logging_in":
+                    return self._send_json({"ok": False, "error": "正在登录中，请等待完成后重试"}, 400)
+                _STATE["status"] = "logging_in"
+                _STATE["detail"] = "正在连接..."
+                _STATE["account"] = account
+                _STATE["host"] = host
+                _STATE["port"] = port
             threading.Thread(target=run_login, args=(account, password, host, port, session), daemon=True).start()
             return self._send_json({"ok": True})
 
@@ -1745,8 +1758,17 @@ class Handler(BaseHTTPRequestHandler):
                 else:
                     from_sort = int(data.get("fromSort"))
                     to_sort = int(data.get("toSort"))
-                    cli.send_game_packet(41462, pack_body(f"{from_sort},{catch},{to_sort},0").hex())
-                    log("info", f"背包精灵 id={catch} 移至位置 {to_sort} (41462 [{from_sort},{catch},{to_sort},0])...")
+                    # 背包 -> 另一背包空位: 用"先入库、再取出到目标包"的 2304 两步(与 warehouse-swap /
+                    # storage->bag 相同的**已确认**机制), 而不是未实测的 41462 目标 catchTime=0(在实测中不生效)。
+                    # 来源/目标包由 from/to_sort 推导: sort 1..6=第一背包, 7..12=第二背包.
+                    src_bag = "second" if from_sort > 6 else "first"
+                    dst_bag = "second" if to_sort > 6 else "first"
+                    put_pos = 3 if src_bag == "second" else 0   # 背包精灵退仓库: 0=第一, 3=第二
+                    get_pos = 2 if dst_bag == "second" else 1   # 仓库精灵进背包: 1=第一, 2=第二
+                    cli.send_game_packet(2304, pack_body(f"{catch},{put_pos}").hex())
+                    cli.send_game_packet(2304, pack_body(f"{catch},{get_pos}").hex())
+                    log("info", f"背包精灵 id={catch} 由 {src_bag} -> 仓库 -> {dst_bag} "
+                                f"(2304 [{catch},{put_pos}] 再 [{catch},{get_pos}])...")
                 try:
                     cli.send_game_packet(43706, "")
                 except Exception:

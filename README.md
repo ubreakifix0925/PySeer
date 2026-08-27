@@ -42,7 +42,8 @@ cd PySeer
 | Windows（PowerShell / cmd） | `python -u app\webui.py --port 8680` |
 | Windows（Git Bash / WSL） | `python3 -u app/webui.py --port 8680` |
 
-- 启动时会自动检查并保持游戏数据（精灵名/属性/技能/魂印/头像）为最新，需联网；缺 `UnityPy` 会自动装到 `vendor/`。
+- **仓库已内置一份数据基线**（`data/petbook.json`、`pet_attr.json`、`skills.json`、`soulmarks.json`），`git clone` 后**离线即可显示**精灵名/属性/技能/魂印。
+- 启动时会自动检查并保持数据为最新（需联网；缺 `UnityPy` 会自动按**当前平台**装到 `vendor/`——`UnityPy` 含平台相关编译产物，故不入 git 仓库，仅在刷新数据时按需自动安装）。头像/图标（`data/head`、`data/effecticon`）也在启动时按需下载。
 - `python` 起不来时，Windows 换 `py -u app\webui.py --port 8680`。
 - 换端口 `--port <端口>`；被占用会自动选空闲端口并打印实际地址；局域网访问加 `--host 0.0.0.0`。
 
@@ -83,6 +84,43 @@ while not battle.finished:
 ```
 
 常用 API：`send` / `recv` / `get_value` / `get_recv_value` / `get_item_count` / `set_bag` / `find_pet` / `Battle`（`use_skill` / `use_item` / `capture` / `change_pet` / `escape` / `run`）。完整说明见 [`docs/PySeer.md`](./docs/PySeer.md)。
+
+## 更新本项目
+
+### 更新代码（工具本身）
+
+- **git 克隆方式**：在项目目录执行
+  ```bash
+  git pull
+  ```
+  因为 `data/`（游戏数据）、`vendor/`（UnityPy）、`cache/`（下载缓存）都被 git 忽略，
+  `git pull` 只会更新程序文件（`app/`、`docs/`、`README.md` 等），**不会动你本地的游戏数据/依赖**。
+  若提示本地有改动冲突，先 `git stash` 或丢弃 `app/` 里的本地改动再 `git pull`。
+
+- **zip 方式（无 Git）**：重新下载 zip，只替换 `app/`、`docs/`、`README.md`、`start.sh`、`deploy.sh`；
+  `data/`、`vendor/`、`cache/` 原样保留（避免重下游戏数据与 UnityPy）。
+
+### 更新游戏数据（精灵名/属性/技能/魂印/头像）
+
+游戏资源**随时更新**，工具**启动时会自动检查并按版本增量刷新**数据。想立即全量刷新：
+
+```bash
+python3 -u app/assets_updater.py --force     # Linux / macOS（Windows 用 python / py）
+# 或
+./start.sh --update
+```
+
+### 更新后重启
+
+```bash
+# Linux / macOS
+python3 -u app/webui.py --port 8680
+# Windows
+python -u app\webui.py --port 8680
+```
+
+> 若 `git pull` 后启动报错或数据异常，多半是本地 `data/`/`vendor/`/`cache/` 与新版本不匹配——
+> 删除这三个目录后重跑一次 `python3 app/assets_updater.py --force`（它们都会自动重新生成/重下），再启动即可。
 
 ## 目录结构
 
