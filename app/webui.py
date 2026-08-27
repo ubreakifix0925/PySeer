@@ -712,6 +712,24 @@ _SOULMARKS_FILE = os.path.join(_DATA_DIR, "soulmarks.json")
 _SOULMARKS = _read_json_map(_SOULMARKS_FILE)   # {str 物种id: [魂印数据...]}
 
 
+def _reload_data_maps():
+    """重新读取 data/ 下的精灵数据(更新后调用).
+
+    ``_PETATTR/_SKILLS/_SOULMARKS/_PETBOOK`` 在模块加载时读入; 而 ``ensure_pet_avatars``
+    是在 main() 里(模块加载之后)才生成这些 json 的。全新克隆首次启动时, 模块加载时这些文件还不存在,
+    若不重读, 界面会一直显示"无属性/无技能/无魂印"。此函数在启动更新后重新读一遍, 让首次部署即生效。
+    """
+    global _PETATTR, _SKILLS, _SOULMARKS
+    try:
+        set_pet_names(_read_json_map(_PETBOOK_FILE))
+        merge_pet_names(_read_json_map(_PETNAMES_FILE))
+        _PETATTR = _read_json_map(_PETATTR_FILE)
+        _SKILLS = _read_json_map(_SKILLS_FILE)
+        _SOULMARKS = _read_json_map(_SOULMARKS_FILE)
+    except Exception as e:
+        log("error", f"重读精灵数据失败: {e}")
+
+
 def soulmark_of(sid):
     """精灵物种 id -> 魂印(专属特性)列表. 查不到返回 []."""
     if sid is None:
@@ -3534,6 +3552,8 @@ def main():
         except Exception as e:   # 任何异常都不阻断服务启动
             print(f"[头像更新] 未执行更新: {e}")
             log("warn", f"头像更新未执行: {e}")
+    # 启动更新(或已是最新)后重读精灵数据, 让全新克隆首次部署即能看到属性/技能/魂印等
+    _reload_data_maps()
     try:
         srv = ThreadingHTTPServer((args.host, args.port), Handler)
     except OSError as e:

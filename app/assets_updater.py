@@ -116,6 +116,30 @@ def log(msg):
     print(f"[头像更新] {msg}", flush=True)
 
 
+def _ensure_data_dirs():
+    """确保运行时数据目录存在。
+
+    全新 ``git clone`` 时 ``data/`` 等目录本就不随仓库带来(仓库只带 app/ + 文档 + 脚本),
+    若直接写 ``data/*.json`` 或头像/图标会因父目录不存在而抛 ``FileNotFoundError``,
+    导致 pet_attr / skills / soulmarks 等无法生成。这里先建好目录(幂等)。
+    """
+    for d in (_DATA_DIR, HEAD_DIR, EFFECT_ICON_DIR):
+        try:
+            d.mkdir(parents=True, exist_ok=True)
+        except Exception:
+            pass
+
+
+def _write_json_file(path, obj):
+    """写 JSON 到 path, 先确保父目录存在(全新克隆无 data/, 否则写文件抛 FileNotFoundError)."""
+    p = Path(path)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    p.write_text(json.dumps(obj, ensure_ascii=False, indent=2), "utf-8")
+
+
 def _path_is_int_name(p):
     return bool(p.suffix.lower() == ".png" and p.stem.isdigit())
 
@@ -644,6 +668,7 @@ def ensure_petbook(force=False):
     返回结果里带 cache_path (ConfigPackage bundle 的本地缓存路径),
     便于调用方从中再取 monsters.bytes 等其它资源.
     """
+    _ensure_data_dirs()
     try:
         cfg_version = _http_get(
             f"{CONFIG_BASE}PackageManifest_{CONFIG_PKG}.version").decode().strip()
@@ -674,13 +699,9 @@ def ensure_petbook(force=False):
         if not names:
             return {"ok": False, "skipped": True, "version": cfg_version,
                     "error": "从 petbook.bytes 解析不到名字", "cache_path": None}
-        PETBOOK_FILE.write_text(
-            json.dumps({str(k): v for k, v in names.items()}, ensure_ascii=False, indent=2),
-            "utf-8")
-        PETBOOK_STATE.write_text(
-            json.dumps({"version": cfg_version,
-                        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")},
-                       ensure_ascii=False, indent=2), "utf-8")
+        _write_json_file(PETBOOK_FILE, {str(k): v for k, v in names.items()})
+        _write_json_file(PETBOOK_STATE, {"version": cfg_version,
+                                        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S")})
         log(f"petbook 已更新: {len(names)} 个精灵名 -> {PETBOOK_FILE}")
         return {"ok": True, "skipped": False, "version": cfg_version,
                 "error": None, "cache_path": str(cache_path)}
@@ -947,6 +968,7 @@ def regenerate_skills(moves_pb, effects_pb, type_names=None):
     以及 effects(每个效果: id/args/desc 描述)。数据完全来自游戏资源本身, 可自更新.
     失败时返回 {"ok": False, "error": ...}, 不影响其它更新.
     """
+    _ensure_data_dirs()
     try:
         moves = parse_moves(moves_pb) if moves_pb else {}
         effects = parse_skill_effects(effects_pb) if effects_pb else {}
@@ -988,8 +1010,7 @@ def regenerate_skills(moves_pb, effects_pb, type_names=None):
         }
     if not out:
         return {"ok": False, "error": "技能数据为空"}
-    SKILLS_FILE.write_text(
-        json.dumps(out, ensure_ascii=False, indent=2), "utf-8")
+    _write_json_file(SKILLS_FILE, out)
     log(f"skills 已生成: {len(out)} 个技能 -> {SKILLS_FILE}")
     return {"ok": True, "count": len(out)}
 
@@ -1109,6 +1130,7 @@ def regenerate_soulmarks(icon_pb, tag_pb=None):
     魂印(专属特性) = effectIcon 中 pet_id 包含该精灵的条目; 每条含 tags(标签名列表),
     desc(tips), analyze, effect_id, args。失败时返回 {"ok": False, ...}。
     """
+    _ensure_data_dirs()
     try:
         icons = parse_effect_icons(icon_pb) if icon_pb else {}
         tags = parse_effect_tags(tag_pb) if tag_pb else {}
@@ -1130,8 +1152,7 @@ def regenerate_soulmarks(icon_pb, tag_pb=None):
             out.setdefault(str(p), []).append(entry)
     if not out:
         return {"ok": False, "error": "魂印数据为空"}
-    SOULMARKS_FILE.write_text(
-        json.dumps(out, ensure_ascii=False, indent=2), "utf-8")
+    _write_json_file(SOULMARKS_FILE, out)
     log(f"soulmarks 已生成: {len(out)} 个精灵带魂印 -> {SOULMARKS_FILE}")
     return {"ok": True, "count": len(out)}
 
@@ -1143,6 +1164,7 @@ def regenerate_pet_attr_from_bytes(pb, attr_names=None):
     type 经 attr_names(默认用内置 PET_ATTR_NAMES, 可由 skilltypes.bytes 自解析结果覆盖)
     转为中文。数据完全来源于游戏资源本身, 可随版本自更新.
     """
+    _ensure_data_dirs()
     if not pb:
         return {"ok": False, "error": "monsters.bytes 为空"}
     try:
@@ -1162,7 +1184,7 @@ def regenerate_pet_attr_from_bytes(pb, attr_names=None):
         attr[str(sid)] = names.get(str(ty), "(%s)" % ty)
     if not attr:
         return {"ok": False, "error": "从 monsters.bytes 未解析到属性"}
-    PET_ATTR_FILE.write_text(json.dumps(attr, ensure_ascii=False, indent=2), "utf-8")
+    _write_json_file(PET_ATTR_FILE, attr)
     log(f"pet_attr 已从 monsters.bytes 生成: {len(attr)} 个精灵属性 -> {PET_ATTR_FILE}")
     return {"ok": True, "count": len(attr)}
 
@@ -1174,6 +1196,7 @@ def regenerate_pet_attr(monsters_json_path=MONSTERS_JSON):
     规则: real_id==0 的基表记录其 id 即物种编号, type 即属性类型编号 (属性在 type 参数上),
     type 经 PET_ATTR_NAMES 转为中文 (如水/火/龙/水 龙)。失败不影响其它更新。
     """
+    _ensure_data_dirs()
     try:
         data = json.loads(Path(monsters_json_path).read_text("utf-8"))
     except (OSError, ValueError) as e:
@@ -1199,7 +1222,7 @@ def regenerate_pet_attr(monsters_json_path=MONSTERS_JSON):
         attr[str(sid)] = PET_ATTR_NAMES.get(str(ty), "(%s)" % ty)
     if not attr:
         return {"ok": False, "error": "未解析到属性"}
-    PET_ATTR_FILE.write_text(json.dumps(attr, ensure_ascii=False, indent=2), "utf-8")
+    _write_json_file(PET_ATTR_FILE, attr)
     log(f"pet_attr 已生成: {len(attr)} 个精灵属性 -> {PET_ATTR_FILE}")
     return {"ok": True, "count": len(attr)}
 
@@ -1207,6 +1230,7 @@ def regenerate_pet_attr(monsters_json_path=MONSTERS_JSON):
 # ---------------- 主流程 ----------------
 def ensure_pet_avatars(force=False):
     """启动时调用: 检查并更新全部精灵头像 + 图鉴名字(各自随版本独立刷新)."""
+    _ensure_data_dirs()   # 全新克隆没有 data/, 先建好, 避免写 json/图标失败
     try:
         remote_version = get_remote_version()
     except UpdaterError as e:
@@ -1248,11 +1272,11 @@ def ensure_pet_avatars(force=False):
                 mb = _get_asset_bytes(cache_path, MONSTERS_ASSET)
                 rr = regenerate_pet_attr_from_bytes(mb, attr_names=attr_names)
                 if rr.get("ok"):
-                    PET_ATTR_STATE.write_text(json.dumps({
+                    _write_json_file(PET_ATTR_STATE, {
                         "version": cfg_version,
                         "source": "monsters.bytes+skilltypes.bytes",
                         "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                    }, ensure_ascii=False, indent=2), "utf-8")
+                    })
                     log(f"pet_attr 已同步 monsters.bytes (版本 {cfg_version})")
                 else:
                     log(f"从 monsters.bytes 生成 pet_attr 失败, 回退 monsters.json: {rr.get('error')}")
@@ -1269,11 +1293,11 @@ def ensure_pet_avatars(force=False):
                     seb = _get_asset_bytes(cache_path, SKILL_EFFECT_ASSET)
                     sr = regenerate_skills(mvb, seb, type_names=attr_names)
                     if sr.get("ok"):
-                        SKILLS_STATE.write_text(json.dumps({
+                        _write_json_file(SKILLS_STATE, {
                             "version": cfg_version,
                             "source": "moves.bytes+skill_effect.bytes",
                             "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                        }, ensure_ascii=False, indent=2), "utf-8")
+                        })
                         log(f"skills 已同步 (版本 {cfg_version})")
                     else:
                         log(f"skills 生成失败: {sr.get('error')}")
@@ -1291,11 +1315,11 @@ def ensure_pet_avatars(force=False):
                     etb = _get_asset_bytes(cache_path, EFFECT_TAG_ASSET)
                     smr = regenerate_soulmarks(eib, etb)
                     if smr.get("ok"):
-                        SOULMARKS_STATE.write_text(json.dumps({
+                        _write_json_file(SOULMARKS_STATE, {
                             "version": cfg_version,
                             "source": "effecticon.bytes+effectag.bytes",
                             "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                        }, ensure_ascii=False, indent=2), "utf-8")
+                        })
                         log(f"soulmarks 已同步 (版本 {cfg_version})")
                     else:
                         log(f"soulmarks 生成失败: {smr.get('error')}")

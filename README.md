@@ -11,47 +11,50 @@
 | WebUI 控制台 | `app/webui.py` | 登录、实时封包日志、精灵详情/背包/脚本、图形化对战 |
 | 第三方库 | `app/PySeer.py` | `Seer`（命令级）+ `Battle`（对战体），供脚本调用后端 |
 
-## 快速开始
+## 快速开始（跨平台）
 
-前置：Python 3.8+。
+前置：**Python 3.8+**、Git（推荐）。
 
-### 未下载项目
+### 1. 准备环境
 
-**Linux / macOS**
+| 系统 | 安装 Python + Git |
+|---|---|
+| Windows | 装 Python 时勾选 **Add Python to PATH**；再装 [Git for Windows](https://git-scm.com/) |
+| macOS | `brew install python git`（或官网 pkg） |
+| Debian / Ubuntu | `sudo apt-get update && sudo apt-get install -y python3 python3-pip git` |
+
+装好后确认：`python3 --version`（Windows 可用 `python --version` / `py --version`）。
+
+### 2. 拉取代码（一次性）
 
 ```bash
-bash <(curl -fsSL https://raw.githubusercontent.com/ubreakifix0925/PySeer/main/deploy.sh)
-```
-
-**Windows（PowerShell，需 Git）**
-
-```powershell
 git clone https://github.com/ubreakifix0925/PySeer.git
 cd PySeer
-python app\webui.py --port 8680
 ```
 
-### 已下载项目
+（没有 Git 就从 GitHub 页面下载 zip 解压后进入该目录。）
 
-**Linux / macOS**
+### 3. 启动控制台（在项目根目录）
 
-```bash
-./start.sh
-```
+| 系统 | 命令 |
+|---|---|
+| Linux / macOS | `python3 -u app/webui.py --port 8680` |
+| Windows（PowerShell / cmd） | `python -u app\webui.py --port 8680` |
+| Windows（Git Bash / WSL） | `python3 -u app/webui.py --port 8680` |
 
-**Windows（PowerShell）**
+- 启动时会自动检查并保持游戏数据（精灵名/属性/技能/魂印/头像）为最新，需联网；缺 `UnityPy` 会自动装到 `vendor/`。
+- `python` 起不来时，Windows 换 `py -u app\webui.py --port 8680`。
+- 换端口 `--port <端口>`；被占用会自动选空闲端口并打印实际地址；局域网访问加 `--host 0.0.0.0`。
 
-```powershell
-python app\webui.py --port 8680
-```
+### 4. 打开控制台
 
-**Windows（Git Bash / WSL）**
+浏览器访问 **http://127.0.0.1:8680/** ，填米米号/密码登录，即可看到实时封包日志、精灵详情/背包管理、脚本运行与图形化对战。
 
-```bash
-bash start.sh
-```
+---
 
-启动后打开 `http://127.0.0.1:8680/` 并登录。
+> 可选：`--no-update` 可跳过启动时的数据刷新（更快，但游戏数据若已更新会偏旧）。
+> 习惯 Bash 的可用一行脚本：本地启动 `./start.sh`；未下载项目时一键“装依赖+下载+启动”
+> `bash <(curl -fsSL https://raw.githubusercontent.com/ubreakifix0925/PySeer/main/deploy.sh)`。
 
 ## 使用
 
