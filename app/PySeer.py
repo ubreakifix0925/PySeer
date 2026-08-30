@@ -32,6 +32,7 @@
     在发包后都会自动等待本回合结算(2505), 因此无需手动等回合; 只有**死亡切换** change_pet 不消耗
     回合, 换上新精灵后可在同一回合内再执行一次操作. 期间可读取当前回合数据(round/my/other 等),
     并用任意复杂的 if/else/循环判断结构驱动决策; 收到结束包(2506)后 finished 置 True, 循环自动终止.
+    出招前自动回复技能 PP 用 ``use_skill_smart``(耗尽时以**中级活力药剂**(300017)回复后再出招).
     完整 API 见 docs/PySeer.md.
 """
 
@@ -75,6 +76,40 @@ def _pet_name(sid) -> str:
         except (OSError, ValueError, json.JSONDecodeError):
             pass
     return _PETBOOK.get(str(sid)) or "未知"
+
+
+# ---- 技能 id -> 最大 PP (skills.json 的 "pp" 字段, 懒加载) ----
+# 用于"技能出招前查 PP"场景: 技能**当前**剩余 PP 由服务器 2505 的 mySkillPP 同步,
+# 而技能**最大** PP 取自资源表 skills.json.
+_SKILL_MAX_PP = None   # {str 技能id: int 最大pp}
+
+
+def skill_max_pp(sid, *, _reload: bool = False) -> int:
+    """按技能 id 查**最大 PP**(skills.json 的 ``pp`` 字段); 查不到/出错返回 0.
+
+    :param sid: 技能 id (int 或可转 int 的字符串)
+    :param _reload: True 时强制重新读盘(忽略缓存)
+    :return: int 最大 PP (>=0); 数据缺失时 0(0 表示"不限 PP/未知", 不触发回复逻辑)
+    """
+    global _SKILL_MAX_PP
+    if _SKILL_MAX_PP is None or _reload:
+        _SKILL_MAX_PP = {}
+        try:
+            p = os.path.join(_DATA_DIR, "skills.json")
+            with open(p, "r", encoding="utf-8") as f:
+                d = json.load(f)
+            for k, v in d.items():
+                if isinstance(v, dict):
+                    _SKILL_MAX_PP[str(k)] = int(v.get("pp", 0) or 0)
+                else:
+                    _SKILL_MAX_PP[str(k)] = 0
+        except (OSError, ValueError, json.JSONDecodeError):
+            pass
+    return int(_SKILL_MAX_PP.get(str(sid), 0))
+
+
+# 用"赛尔豆"可购买的**中级活力药剂**物品 id (恢复技能 PP); 见 DrugBuyPanel 的 _itemList.
+PP_RESTORE_ITEM = 300017   # 中级活力药剂
 
 
 # ---- 后端地址自动发现 ----
@@ -345,6 +380,24 @@ class Seer:
         """
         pkt = self.recv(42399, [1, int(item_id)], timeout=timeout)
         return get_value(pkt, 2)
+
+    def buy_item(self, item_id, count=1, timeout=8.0) -> "Packet":
+        """用**赛尔豆**购买指定**物品 id** 的数量(药水/胶囊等).
+
+        发 ``2601(ITEM_BUY)`` 包体 ``[物品id, 数量]``(各 int32 大端).
+        游戏内购买药剂(体力/活力药剂、精灵胶囊)即此命令——见反编译的
+        ``com.robot.module.app.DrugBuyPanel``:
+            SocketConnection.send(CommandID.ITEM_BUY, itemId, count)
+        需满足 ``count * 单价 <= 当前赛尔豆``, 否则服务器会拒绝(客户端会先提示"赛尔豆不足")。
+
+        :param item_id: 物品 id (int)。药剂面板常用: 300013 高级体力药剂、300014 超级体力药剂、
+            300012 中级体力药剂、300016 初级活力药剂、300017 中级活力药剂、300002 中级精灵胶囊、300003 高级精灵胶囊
+        :param count: 购买数量 (int), 默认 1
+        :param timeout: 等 RECV 超时(秒), 默认 8
+        :return: 应答 ``Packet``(完整包体)
+        """
+        return self.recv(2601, [int(item_id), int(count)], timeout=timeout)
+
 
     # ---------- 换背包 (物种 id -> 物理重排 12 格) ----------
     def _get_json(self, path: str, *, _retry: bool = True) -> dict:
@@ -1079,6 +1132,63 @@ class Battle:
         snap = self.wait_round(timeout or self.entry_timeout)
         self._after_round()
         return snap
+
+    # ---------- 智能出招: 出招前检查并回复技能 PP ----------
+    def skill_pp(self, skill_id) -> int:
+        """取指定技能**当前剩余 PP**(服务器每个 2505 经 ``mySkillPP`` 同步给出).
+
+        首次出招(还没打过回合)时 ``mySkillPP`` 尚未同步, 返回 ``-1`` 表示"未知"。
+        **未知不等于 0**, 调用方据此不要误判为"PP 耗尽"。
+        """
+        m = self._snap.get("mySkillPP") or {}
+        v = m.get(str(skill_id))
+        if v is None:
+            v = m.get(int(skill_id))
+        if v is None:
+            return -1
+        return int(v)
+
+    def use_skill_smart(self, skill_id, *, pp_potion_id: int = PP_RESTORE_ITEM,
+                        refill: bool = True, timeout: float = None) -> dict:
+        """**出招前检查该技能 PP**, 耗尽时用**中级活力药剂**回复后再出招.
+
+        逻辑(按用户要求)::
+
+            检查该技能 id 的 (最大PP, 当前PP):
+              · 最大PP <= 0            -> 视为"不限/未知 PP", 直接出招(不做回复)。
+              · 当前PP > 0 (或有值)    -> PP 足够, 直接出招。
+              · 最大PP > 0 且 当前PP == 0 -> 进入回复流程:
+                    c = get_item_count(中级活力药剂)
+                    - c == 0: 先 buy_item 买 1 份 → use_item 喝掉 → 再出招
+                    - c  > 0: 先 use_item 喝掉 → 再 buy_item 补回 1 份(仓库保持有货) → 再出招
+
+        - ``当前PP`` 取自后端每回合同步的 ``mySkillPP``(2505 的 AttackValue.skillList,
+          服务器权威的剩余 PP); ``最大PP`` 取自资源表 ``data/skills.json`` 的 ``pp``。
+        - 出招用 ``use_skill(2405)``; 喝药用 ``use_item(2406)``; 买药用 ``buy_item(2601)``。
+        - 注意: ``buy_item``/``get_item_count`` 走的是**非对战**通道(``/api/send-recv``),
+          对战中能否直接买药取决于后端实现; 若对战中不可买, 可先在对战外囤好 ``中级活力药剂``。
+
+        :param skill_id: 要出招的技能 id (int)
+        :param pp_potion_id: 回复技能 PP 的药剂 id, 默认 300017(中级活力药剂)
+        :param refill: 当仓库里药剂**有货**时, 用完是否再买回 1 份(默认 True)
+        :param timeout: 出招等待超时(秒); 默认用 entry_timeout
+        :return: 出招后的最新对战快照 (同 use_skill)
+        """
+        max_pp = skill_max_pp(skill_id)
+        cur_pp = self.skill_pp(skill_id)
+        if max_pp > 0 and cur_pp == 0:
+            count = self._seer.get_item_count(pp_potion_id) or 0
+            if count <= 0:
+                # 没货 -> 先买再喝
+                self._seer.buy_item(pp_potion_id, 1)
+                self.use_item(pp_potion_id, timeout=timeout)
+            else:
+                # 有货 -> 先喝, 再补回 1 份
+                self.use_item(pp_potion_id, timeout=timeout)
+                if refill:
+                    self._seer.buy_item(pp_potion_id, 1)
+        # PP 已恢复(或本就足够/不限), 正式出招
+        return self.use_skill(skill_id, timeout=timeout)
 
     def capture(self, *params, timeout: float = None) -> dict:
         """捕捉(2409): 发包后**自动等待本回合结算(2505)**, 消耗一回合."""

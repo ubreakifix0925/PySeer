@@ -171,6 +171,20 @@ n = s.get_item_count(60001)     # 物品 id=60001 -> 返回数量(int)
 
 > 若应答取不到第 2 个参数抛 `SeerError`；`item_id` 为物品 id（int）。
 
+#### `buy_item(item_id, count=1, timeout=8.0) -> Packet`
+用**赛尔豆**购买指定**物品 id** 的数量（如药水/胶囊）。发 `2601(ITEM_BUY)` 包体 `[物品id, 数量]`（各 int32 大端，共 8 字节）。游戏内**买药水/胶囊**即此命令——依据反编译的 `DrugBuyPanel`：
+```actionscript
+SocketConnection.send(CommandID.ITEM_BUY, itemId, count);   // CommandID.ITEM_BUY = 2601
+```
+需满足 `count × 单价 <= 当前赛尔豆`，否则服务器拒绝（客户端会先提示"赛尔豆不足"）。
+
+```python
+pkt = s.buy_item(300017, 1)        # 买 1 份中级活力药剂(物品 id=300017)
+```
+
+> 药剂面板常见物品 id：`300013` 高级体力药剂、`300014` 超级体力药剂、`300012` 中级体力药剂、`300016` 初级活力药剂、`300017` 中级活力药剂、`300002` 中级精灵胶囊、`300003` 高级精灵胶囊。返回完整 `Packet`。
+> ⚠️ `buy_item`/`get_item_count` 走**非对战**通道（`/api/send-recv`），对战中能否直接购买取决于后端实现。
+
 ### 换背包：`set_bag(ids) -> dict`
 把背包**全部**切换成指定的**物种 id 列表**，**物理重排 12 格**（前 6 = 第一背包/出战，后 6 = 第二背包/待命）。
 
@@ -324,10 +338,12 @@ while not battle.finished:
 | `send(cmd, params=None, encode="pack")` | 任意发包（命令名或命令号；`encode="hex"` 原样十六进制）；**不自动等回合** |
 | `send_hex(hex_packet)` | 发送一条带 `cmdid` 的完整 HEX 包（后端重建 uid/序列号并加密封包） |
 | `use_skill(skill_id)` | 用技能(2405)：发包后**自动等本回合结算(2505)**，消耗一回合 |
+| `use_skill_smart(skill_id, *, pp_potion_id=300017, refill=True)` | **出招前检查该技能 PP**：耗尽时先用**中级活力药剂(300017)** 回复再出招；见下「智能出招」 |
 | `use_item(item_id, catchTime=None)` | 用道具(2406)：包体 `[我方catchTime, 物品id, 0]`，`catchTime` 默认取当前出战精灵；发包后自动等本回合(2505)，消耗一回合 |
 | `capture(*params)` | 捕捉(2409)：发包后自动等本回合(2505)，消耗一回合 |
 | `change_pet(species_id, catchTime=None, *, death=None)` | **换宠**(2407)：`death=None` 自动判断——当前精灵阵亡→**死亡切换**(不消耗回合)；还活着→**主动切换**(消耗一回合)。`death=True/False` 可强制；见下 |
 | `escape()` | 逃跑(2410)：发包后自动等对战结束(2506) |
+| `skill_pp(skill_id)` | 取该技能**当前剩余 PP**（服务器 2505 经 `mySkillPP` 同步）；未同步返回 `-1` 表示未知 |
 | `act(msg)` | 把一条脚本动作记入后端战报 |
 
 > 所有会消耗回合的动作返回**本回合后的最新快照**（含 `round`/`my`/`other`）。终局回合会顺带等到结束包(2506)置 `finished`。
@@ -382,6 +398,33 @@ SocketConnection.send(CommandID.USE_PET_ITEM,
 battle.use_item(300014)                       # 超级体力药剂, catchTime 自动取
 battle.use_item(300016, catchTime=12345678)   # 也可显式指定
 ```
+
+### 智能出招：`use_skill_smart(skill_id, *, pp_potion_id=300017, refill=True, timeout=None) -> dict`
+
+**出招前检查该技能 PP**，耗尽时自动用**中级活力药剂**回复后再出招。适用于"技能 PP 用尽就喝活力药剂补"的自动战斗。
+
+```python
+battle.use_skill_smart(10001)            # 用药回复 PP 后再自动出招
+```
+
+**判定逻辑**（照需求）：
+1. 读该技能 **最大 PP**：取自资源表 `data/skills.json` 的 `pp`（模块级 `skill_max_pp(sid)`）。
+2. 读该技能 **当前 PP**：`skill_pp(skill_id)`，由服务器每个 2505 的 `mySkillPP` 同步（权威剩余值）。
+3. 若 `最大PP <= 0`（不限/未知），或 `当前PP > 0`/未知(`-1`) → **直接出招**。
+4. 若 `最大PP > 0` 且 `当前PP == 0` → 回复流程：
+   - `c = get_item_count(300017)`
+   - **`c == 0`**（没货）：先 `buy_item(300017, 1)` 买一份 → `use_item` 喝掉 → **再出招**。
+   - **`c > 0`**（有货）：先 `use_item` 喝掉 → 再 `buy_item(300017, 1)` 补回一份（仓库保持有货）→ **再出招**。
+
+**参数**：
+- `pp_potion_id`：回复技能 PP 的药剂 id，默认 `300017`（中级活力药剂）。
+- `refill`：仓库有货时用完是否再补买一份（默认 `True`）。
+- `timeout`：出招等待超时（秒），默认用 `entry_timeout`。
+
+> 说明：
+> - 出招走 `use_skill(2405)`；喝药走 `use_item(2406)`（消耗一回合，自动补 `catchTime`）；买药走 `buy_item(2601)`。
+> - ⚠️ `buy_item`/`get_item_count` 走**非对战**通道；对战中能否直接买药取决于后端实现，若不可买可先在**对战外**囤好中级活力药剂（有货时默认走"先用再补买"分支）。
+> - `skill_pp(skill_id) -> int`：未同步时返回 `-1`（**未知 ≠ 0**，避免误判为"PP 耗尽"）。
 
 ### `run(decide, timeout=15.0) -> bool`
 
@@ -487,6 +530,18 @@ while not b.finished:
     print(f"敌方技能{foe.get('skillID')} 伤害{foe.get('lostHP')} 剩余HP {foe.get('remainHP')}/{foe.get('maxHp')}")
 ```
 
+### 示例四：技能 PP 用尽自动喝活力药剂再出招
+```python
+from PySeer import Battle
+b = Battle(BATTLE_HEX)
+while not b.finished:
+    # 用完自动判断: PP 耗尽就用中级活力药剂(300017)回复后再出招, 否则直接出招
+    b.use_skill_smart(b.skills[0])
+print("对战结束:", b.finished)
+```
+
+> 若想**只出招不补货**：`b.use_skill_smart(b.skills[0], refill=False)`。
+
 ---
 
 ## 9. 注意事项与边界
@@ -500,6 +555,7 @@ while not b.finished:
 7. **回合是“操作即回合”**：每发一个消耗回合的动作会**自动等待 2505**；只有 `change_pet`（死亡切换）不消耗回合，可在同一回合再出招。
 8. **异常统一 `SeerError`**：参数错/超时/未登录/越界都会抛 `SeerError`，捕获后处理即可。
 9. **运行时数据**：`_pet_name()` 等依赖 `data/petbook.json`（自更新）；`find_pet`/`set_bag` 依赖后端的背包/仓库/精英背包解析。
+10. **`use_skill_smart` 回复 PP 依赖活力药剂**：出招前检查技能 PP，耗尽时用中级活力药剂(300017)回复。其中 `buy_item`/`get_item_count` 走**非对战**通道（`/api/send-recv`）；对战中若不能直接买药，请先在**对战外**囤好活力药剂（有货时默认走"先用再补买"分支），或设 `refill=False` 只喝不补。
 
 ---
 
@@ -509,6 +565,8 @@ while not b.finished:
 |---|---|
 | `get_value(body, index)` | 从包体取第 `index` 个 int32 |
 | `discover_backend(...)` | 自动定位后端地址 |
+| `skill_max_pp(sid)` | 按技能 id 查**最大 PP**（`data/skills.json` 的 `pp`）；查不到返回 `0` |
+| `PP_RESTORE_ITEM` | 中级活力药剂物品 id `300017`（恢复技能 PP）；`use_skill_smart` 默认用它 |
 | `Packet` | RECV 包体对象 |
 | `SeerError` | 库调用异常 |
 | `DEFAULT_BASE` | 兜底后端地址 `http://127.0.0.1:8680` |

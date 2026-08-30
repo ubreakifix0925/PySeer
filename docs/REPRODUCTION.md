@@ -25,6 +25,7 @@
 | 命令号 map | `app/cmdmap.json`（由 `refs/seerpacket/Command.cs` 生成） |
 | 运行时数据（名字/属性/技能/魂印） | `app/assets_updater.py` 产出到 `data/*.json` |
 | 物品名提取 | `app/assets_updater.py::regenerate_item_names` → `data/item_names.json`（见 §7.1） |
+| 用赛尔豆购买药剂（2601 ITEM_BUY） | 见 §7.2（反编译 `DrugBuyPanel.swf` 确认） |
 | 抓包离线分析器 | `analysis/analyze_gamedump.py` + 产物 `analysis/gamedump4_*.txt/csv` |
 
 ---
@@ -357,6 +358,33 @@ UnityPy 若不是标准库，会自动 `pip install` 到 `vendor/unitypy`（不�
 - 复现要点：物品 id 相邻的 `u32` 可能是"数量/等级"等常量字段（如 999/1000/65536），
   需按**区间 + 去重**过滤（`_item_id_ok`：id∈[10000, 2×10⁷] 且非常量），
   宠物道具类则须限制在 300xxx 带内并逐字节定位，否则会错配到别的字段。
+
+### 7.2 用赛尔豆购买药剂（`2601 ITEM_BUY`）—— 已完整确认
+
+**购买药剂/胶囊**发 **`2601` = `ITEM_BUY`**，包体为**两个 int32 大端**：
+
+```
+[ itemId int32 BE ][ count int32 BE ]     # 共 8 字节
+例: 买 5 份中级活力药剂(300017) -> 000493ed 00000005
+```
+
+依据反编译的模块 SWF `https://seer.61.com/module/com/robot/module/app/DrugBuyPanel.swf`
+（`DrugBuyPanel.as:172`）：
+
+```actionscript
+SocketConnection.send(CommandID.ITEM_BUY,
+                      this._itemList[this._index],
+                      uint(this._confirm["count"].text));   // CommandID.ITEM_BUY = 2601
+```
+
+- **可买清单**（`DrugBuyPanel._itemList`）：`300013` 高级体力药剂、`300014` 超级体力药剂、
+  `300016` 初级活力药剂、`300017` 中级活力药剂、`300002` 中级精灵胶囊、`300003` 高级精灵胶囊。
+- **服务器校验**：客户端先判 `count × ItemXMLInfo.getPrice(itemId) > actorInfo.coins` → "赛尔豆不足"；
+  即需 `count × 单价 ≤ 当前赛尔豆`。数量受 `ItemXMLInfo.getMaxNum` 限，最多 4 位。
+- 面板买完即关，无独立响应回调（用 `ItemManager.upDateCollection` 刷新数量）。
+- 技能出招用 `2405 USE_SKILL`、用药用 `2406 USE_PET_ITEM`（见 §5.6）；技能**当前 PP** 由每个
+  `2505` 的 `AttackValue.skillList`（`[技能id, 当前pp]`）同步到 `Battle.mySkillPP`，配合
+  `use_skill_smart` 可实现在 **PP 耗尽时喝中级活力药剂(300017)回复后再出招**。
 
 ---
 

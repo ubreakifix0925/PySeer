@@ -182,6 +182,7 @@ print(pkt.ints, pkt.body, v)
 | `get_value(body, index)` | 从包体取第 `index` 个值（int32 大端） | `body`(Packet/hex/bytes)、`index` | int |
 | `get_recv_value(cmd, params, index, timeout=8)` | **一步"发包→等 RECV→取应答第 index 个值"**：等价 `get_value(recv(cmd,params), index)` | `cmd`、`params`(发送包体)、`index`(应答参数序号) | int |
 | `get_item_count(item_id, timeout=8)` | **获取指定物品 id 的数量**：发 `42399(MULTI_ITEM_LIST)` `[1,物品id]`，取应答包体(不含命令号)的**第 3 个参数**(索引2) | `item_id`(物品id) | int |
+| `buy_item(item_id, count=1, timeout=8)` | **用赛尔豆购买指定物品 id 的数量**（药水/胶囊）：发 `2601(ITEM_BUY)` 包体 `[物品id, 数量]`（各 int32 大端，8 字节）。游戏内**买药水/胶囊**即此命令（反编译 `DrugBuyPanel`：`send(CommandID.ITEM_BUY, itemId, count)`）；需 `count×单价≤赛尔豆` 否则服务器拒绝 | `item_id`(物品id)、`count`(数量) | `Packet` |
 | `set_bag(ids)` | 把背包**全部**切换为指定**物种id**列表，物理重排 12 格（前6=出战，后6=待命）；读背包+仓库+**精英背包**→全部存仓库(2304)→按列表从仓库/精英取回(2304)→设首发(2308)→摆正顺序(41462) | `ids`(物种id列表，≤12) | `{"ok":True,"target":ids}` |
 | `find_pet(ids)` | **查找**指定物种 id 是否存在及所在位置，在**背包(出战/待命)+仓库+精英背包**三类来源中搜索（精英背包=2361 GET_LOVE_PET_LIST） | `ids`(id 或 id 列表) | `{str(id):{"locations":[位置...],"count":n}}` |
 
@@ -241,12 +242,16 @@ while not battle.finished:
 | `finished` | 是否已收到结束包（2506），对战体据此终止 |
 | `send(cmd, params)` / `send_hex(hex)` | 任意发包（命令名或命令号 / 原始 HEX 包），**不自动等回合** |
 | `use_skill(sid)` | 用技能(2405)，发包后**自动等本回合结算(2505)**，消耗一回合 |
+| `use_skill_smart(sid, *, pp_potion_id=300017, refill=True)` | **出招前检查该技能 PP**：`最大PP>0`(取自 `data/skills.json` 的 `pp`)且 `当前PP==0`(取自后端每回合 `mySkillPP`) 时，用**中级活力药剂(300017)** 回复后再出招；没货先 `buy_item` 买1份再 `use_item` 喝，有货先 `use_item` 喝再 `buy_item` 补回1份。其余情况直接出招 |
 | `use_item(item_id, catchTime=None)` | 用道具(2406)，包体 `[我方catchTime, 物品id, 0]`，`catchTime` 默认取当前出战精灵；发包后**自动等本回合结算**，消耗一回合 |
 | `capture(...)` | 捕捉(2409)，发包后**自动等本回合结算**，消耗一回合 |
 | `change_pet(id)` | **换宠**(2407)：传**物种 id**，后端从当前对战阵容(`myTeam`)查一只可用该 id 精灵取 `catchTime` 发包（也可 `change_pet(None, catchTime=…)` 直接指定）。然后**等到新精灵真正成为我方当前出战**(`my.catchTime` 变化，可能被后续 2505 覆盖 `lastCmd` 或对端换宠不更新 `my`，因此不等 `lastCmd==2407`)。`death=None` 自动判断——当前精灵阵亡→**死亡切换**(不消耗回合，换完可继续出招)；还活着→**主动切换**(消耗一回合，等 2505)；`death=True/False` 可强制 |
 | `escape()` | 逃跑(2410)，发包后**自动等对战结束(2506)** |
+| `skill_pp(sid)` | 取该技能**当前剩余 PP**（服务器每回合 2505 经 `mySkillPP` 同步，权威值）；未同步返回 `-1` 表示未知（未知≠0，不误判为耗尽） |
 | `act(msg)` | 把一条脚本动作记入后端战报（便于观察/回放） |
 | `run(decide, t)` | **自动驱动**整场对战直到结束包：循环调用 `decide(this)`（回调里写复杂判断并出招），每个动作自动等回合，收到 2506 返回 `True` |
+
+> 模块级：`skill_max_pp(sid)` 按技能 id 查**最大 PP**（`data/skills.json` 的 `pp`，查不到返回 0）；`PP_RESTORE_ITEM=300017` 为**中级活力药剂**（恢复技能 PP）物品 id，`use_skill_smart` 默认用它。`use_skill_smart`/`skill_pp` 的完整说明见 `docs/PySeer.md`「智能出招」一节。
 
 **后端配套**：`_BATTLE` 新增 `finished` 字段（收到 2506 置 True；新一轮 2503、`/api/battle/clear`、
 **`/api/battle/hex`（发起对战）** 都会复位为 False），并在
