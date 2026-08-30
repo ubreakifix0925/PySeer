@@ -49,6 +49,13 @@ WebUI(http://127.0.0.1:8680)  ── 后台已登录的 SeerClient  ──▶ Py
 
 每份数据都由**同一 ConfigPackage bundle**（`cache/petbook/<fh>.bundle`，含 `petbook.bytes`/`monsters.bytes`/`skilltypes.bytes`/`moves.bytes`/`skill_effect.bytes`/`effecticon.bytes`/`effectag.bytes`）解析，随游戏版本自动刷新；状态文件：`.petbook_state.json` / `.pet_attr_state.json` / `.skills_state.json` / `.soulmarks_state.json`（均已加入 `.gitignore`）。
 
+> ⚠️ **版本获取的关键：CDN 缓存穿透**。官方 CDN 对「内容会变但 URL 不变」的
+> `PackageManifest_<Pkg>.version` 会返回**陈旧缓存**（不加任何参数拿到旧版，导致新精灵解不出）。
+> `assets_updater.py` 的 `_http_get()` **默认给每个 CDN 请求追加时间戳查询参数
+> `?_cb=<ms>`**，强制 CDN 回源，从而拿到**线上游戏实际版本**（这正是不依赖任何游戏本地文件、
+> 纯后端即可拿到正确资源的关键）。版本号是 `YYYYMMDDHHMMSS` 的**任意时间戳**，非整点，因此
+> 靠打网格探测不可靠；权威来源即缓存穿透后的 `.version`。
+
 ### 关键解析结构（来自真实 Solaris 解析器）
 
 **monsters.bytes**——每条记录各段均为可选，前面各带 1 字节布尔开关：
@@ -205,7 +212,7 @@ while not battle.finished:
         battle.change_pet(battle.my_team[1]['catchTime'])  # 死亡切换, 不消耗回合
         battle.use_skill(battle.skills[0])                  # 同一回合内继续出招
     elif my and (my.get('hp') or 0) < 300:
-        battle.use_item(70001)                 # 用药回血(消耗一回合)
+        battle.use_item(300014)                # 用药回血(消耗一回合)
     else:
         battle.use_skill(battle.skills[0])     # 使用技能(消耗一回合)
     rnd = battle.round                         # 本回合(2505)数据
@@ -234,7 +241,8 @@ while not battle.finished:
 | `finished` | 是否已收到结束包（2506），对战体据此终止 |
 | `send(cmd, params)` / `send_hex(hex)` | 任意发包（命令名或命令号 / 原始 HEX 包），**不自动等回合** |
 | `use_skill(sid)` | 用技能(2405)，发包后**自动等本回合结算(2505)**，消耗一回合 |
-| `use_item(...)` / `capture(...)` | 用道具(2406)/捕捉(2409)，发包后**自动等本回合结算**，消耗一回合 |
+| `use_item(item_id, catchTime=None)` | 用道具(2406)，包体 `[我方catchTime, 物品id, 0]`，`catchTime` 默认取当前出战精灵；发包后**自动等本回合结算**，消耗一回合 |
+| `capture(...)` | 捕捉(2409)，发包后**自动等本回合结算**，消耗一回合 |
 | `change_pet(id)` | **换宠**(2407)：传**物种 id**，后端从当前对战阵容(`myTeam`)查一只可用该 id 精灵取 `catchTime` 发包（也可 `change_pet(None, catchTime=…)` 直接指定）。然后**等到新精灵真正成为我方当前出战**(`my.catchTime` 变化，可能被后续 2505 覆盖 `lastCmd` 或对端换宠不更新 `my`，因此不等 `lastCmd==2407`)。`death=None` 自动判断——当前精灵阵亡→**死亡切换**(不消耗回合，换完可继续出招)；还活着→**主动切换**(消耗一回合，等 2505)；`death=True/False` 可强制 |
 | `escape()` | 逃跑(2410)，发包后**自动等对战结束(2506)** |
 | `act(msg)` | 把一条脚本动作记入后端战报（便于观察/回放） |
@@ -250,9 +258,15 @@ while not battle.finished:
 > 脚本端等待本场 2503 时会把它误判成“收到结束包”。已通过 **发起对战(`/api/battle/hex`)时复位
 > `finished`** 以及 **`Battle._wait_entry` 在本场进入前忽略遗留 `finished`** 双重修复。
 
-> 说明：`use_item`/`capture`/`escape` 默认发送**空包体**（与 WebUI 页面按钮行为一致）；若需自定义
+> 说明：`capture`/`escape` 默认发送**空包体**（与 WebUI 页面按钮行为一致）；若需自定义
 > 包体请用通用 `send(cmd, params)`。对战命令号 `2405/2406/2407/2409/2410/2503/2504/2505/2506`
 > 见 `app/cmdmap.json` 与 `docs/REPRODUCTION.md`。
+
+> ⚠️ **2406 用药的包体是三个 int32**：`[我方当前出战精灵 catchTime, 物品id, 0]`
+> （依据客户端 `refs/.../data/item/RenewBloodItemCategory.as` 的
+> `send(USE_PET_ITEM, playerMode.info.catchTime, itemID, 0)`）。
+> **只发物品 id 会被服务端判为非法操作** —— 实测立刻回 `2506 FIGHT_OVER` 并**断开连接**。
+> `use_item()` 已自动补 `catchTime`。
 
 ---
 

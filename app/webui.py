@@ -687,8 +687,14 @@ def _read_json_map(path):
         return {}
 
 
-set_pet_names(_read_json_map(_PETBOOK_FILE))   # 自动导出的图鉴名字 (基础)
-merge_pet_names(_read_json_map(_PETNAMES_FILE))  # 用户覆盖 (同名优先)
+# 全物种名兜底表 (monsters.bytes 的 def_name): 覆盖**全部**物种, 含 petbook 图鉴表
+# 没有的 id > 5000 的那些(如 5357/15003...)。否则它们有属性却没名字, 只能显示 (id=xxxx)。
+# 优先级: 本表(兜底) < 图鉴名(更正式) < 用户手工覆盖。
+_MONSTERNAMES_FILE = os.path.join(_DATA_DIR, "monster_names.json")
+
+set_pet_names(_read_json_map(_MONSTERNAMES_FILE))    # 底座: 全物种名
+merge_pet_names(_read_json_map(_PETBOOK_FILE))       # 图鉴名 (更正式, 覆盖同名)
+merge_pet_names(_read_json_map(_PETNAMES_FILE))      # 用户覆盖 (最优先)
 
 _PETATTR = _read_json_map(_PETATTR_FILE)  # {str 物种id: str 属性名}
 
@@ -705,6 +711,238 @@ def skill_of(mid):
     return _SKILLS.get(str(mid)) or _SKILLS.get(mid)
 
 
+# 物品名表 (物品id -> 中文名): 来自 itemsoptimizecatitems{N}.bytes / midleitems.bytes 等,
+# 由 assets_updater 自动导出 item_names.json. 对战页"用药"用它把物品 id 显示成中文名.
+_ITEMNAMES_FILE = os.path.join(_DATA_DIR, "item_names.json")
+_ITEM_NAMES = _read_json_map(_ITEMNAMES_FILE)   # {str 物品id: str 物品名}
+
+
+def item_name_of(iid):
+    """物品 id -> 物品名; 查不到返回 None."""
+    if iid is None:
+        return None
+    return _ITEM_NAMES.get(str(iid)) or _ITEM_NAMES.get(iid)
+
+
+# ---- 战斗可用药品 (2406 USE_PET_ITEM) ----
+# 权威名单来自客户端的"对战道具过滤表" ItemFilterXMLInfo:
+#   refs/RobotCoreDLL_assets/*ItemFilterXMLInfo_xmlClass*.bin (实为 UTF-8 XML)
+#   <Blood> 的**直属** <Item> = 战斗内可用的血药/PP药;  <Blood><Status> = 解状态药.
+#   (TopLevel/PeakJihad/GoblinKing 子分组只用于巅峰之战等特定模式, 不计入通用名单.)
+# 每项带 HP/PP/RemoveMonStat 属性, 可直接显示药效 (如 "HP+150" / "PP+10" / "解状态").
+# 该表是客户端静态快照, 可能漏掉之后新增的药品, 故再并上"按名称匹配"的兜底名单.
+_ITEMFILTER_GLOB = os.path.join(_PROJ, "refs", "RobotCoreDLL_assets",
+                                "*ItemFilterXMLInfo_xmlClass*.bin")
+
+
+def _load_battle_item_filter():
+    """读客户端 ItemFilterXMLInfo 配置表 -> {物品id: {"name","effect"}}; 读不到返回 {}.
+
+    失败(文件缺失/格式变)时返回空 dict, 调用方会用名称匹配名单兜底, 不会让功能不可用.
+    """
+    import glob as _glob
+    import xml.etree.ElementTree as _ET
+    try:
+        files = sorted(_glob.glob(_ITEMFILTER_GLOB))
+        if not files:
+            log("warn", "未找到战斗道具配置表(ItemFilterXMLInfo), 药品名单退回名称匹配")
+            return {}
+        root = _ET.parse(files[0]).getroot()
+    except Exception as e:
+        log("warn", f"读取战斗道具配置表失败({e}), 药品名单退回名称匹配")
+        return {}
+
+    def _effect(it, kind):
+        parts = []
+        if it.get("HP"):
+            parts.append("HP+" + str(it.get("HP")))
+        if it.get("PP"):
+            parts.append("PP+" + str(it.get("PP")))
+        return " ".join(parts) if parts else ("解状态" if kind == "cure" else "")
+
+    out = {}
+    blood = root.find("Blood")
+    if blood is not None:
+        for it in blood.findall("Item"):        # findall 只取直属, 不含子分组
+            try:
+                iid = int(it.get("ID"))
+            except (TypeError, ValueError):
+                continue
+            out[iid] = {"name": it.get("Name") or "", "effect": _effect(it, "hp")}
+        status = blood.find("Status")
+        if status is not None:
+            for it in status.findall("Item"):
+                try:
+                    iid = int(it.get("ID"))
+                except (TypeError, ValueError):
+                    continue
+                out.setdefault(iid, {"name": it.get("Name") or "",
+                                     "effect": _effect(it, "cure")})
+    return out
+
+
+# 名称匹配兜底: 宠物道具/药剂集中在 id 带 [280000, 330000]
+# (与 assets_updater.PET_ITEM_BAND 一致), 该带内同时混着养成/改造类道具
+# (精灵胶囊、学习力遗忘剂、上限提升药剂、专属改造药剂...), 这些战斗内**不会出现**, 需按名称排除.
+_BATTLE_MEDICINE_BAND = (280000, 330000)
+_BATTLE_MEDICINE_INCLUDE = ("体力药剂", "活力药剂")
+_BATTLE_MEDICINE_EXCLUDE = ("上限", "专属", "遗忘", "注入", "探测", "果实", "种子")
+
+
+def _battle_medicine_by_name():
+    """兜底名单: 按名称从物品名表挑血药/PP药 -> {物品id: 名称}."""
+    lo, hi = _BATTLE_MEDICINE_BAND
+    out = {}
+    for k, v in _ITEM_NAMES.items():
+        try:
+            iid = int(k)
+        except (TypeError, ValueError):
+            continue
+        if not (lo <= iid <= hi):
+            continue
+        name = str(v or "")
+        if not any(w in name for w in _BATTLE_MEDICINE_INCLUDE):
+            continue
+        if any(w in name for w in _BATTLE_MEDICINE_EXCLUDE):
+            continue
+        out[iid] = name
+    return out
+
+
+def battle_medicine_items():
+    """可在战斗中使用的药品: [{id, name, effect, source}] 按 id 升序.
+
+    - ``source="config"``: 来自客户端道具过滤表(权威, 带 effect);
+    - ``source="name"``:   名称匹配兜底(配置表之后新增的药品, 无 effect).
+
+    名单本身离线可用; 实际拥有数量由 /api/battle/items 用 42399 查询后回填.
+    """
+    out = {}
+    for iid, meta in _load_battle_item_filter().items():
+        out[iid] = {"id": iid,
+                    "name": meta.get("name") or item_name_of(iid) or f"物品{iid}",
+                    "effect": meta.get("effect") or "",
+                    "source": "config"}
+    for iid, name in _battle_medicine_by_name().items():
+        if iid not in out:
+            out[iid] = {"id": iid, "name": name, "effect": "", "source": "name"}
+    return [out[k] for k in sorted(out)]
+
+
+# 物品数量查询 (42399 MULTI_ITEM_LIST) 的串行锁:
+# 该命令的应答靠"RECV 序号变新"来识别, 并发查询会互相错配, 故同一时刻只允许一个查询.
+_LOCK_ITEMQ = threading.Lock()
+
+# 42399 应答里每条物品记录的 int32 个数 (实测: [id][数量][?][?][?])
+_ITEM_RECORD_INTS = 5
+
+# 42399 单次请求最多查几个物品:
+# 实测 56 个一次发 -> 服务端回**空包体**(等于没查); 35 个一次发 -> 正常返回.
+# 具体上限未探明, 取 20 留足余量; 超出部分自动分批(见 _query_item_counts).
+_ITEMQ_CHUNK = 20
+# 每批等待应答的超时(秒); 总预算由 _query_item_counts 的 timeout 控制
+_ITEMQ_BATCH_TIMEOUT = 2.5
+
+
+def _query_item_counts(ids, timeout: float = 4.0):
+    """批量查物品数量: 发 42399, 包体 ``[n, id1..idn]``; 返回 {物品id: 数量}.
+
+    ⚠️ **必须分批**: 服务端对单次请求的物品数有上限 —— 实测一次查 56 种会被直接无视
+    (回一个**空包体**), 35 种则正常返回。故按 ``_ITEMQ_CHUNK`` 切片逐批查询再合并,
+    全部批次共享 ``timeout`` 总预算, 不会因为分批而无限拉长.
+
+    依据实测封包 (analysis/gamedump4_cmds.csv):
+        请求 ``[3, 400064, 400065, 400063]`` ->
+        应答 ``[3, 400063, 4834, x, x, x, 400064, 410, x, x, x, 400065, 777, x, x, x]``
+    即应答首 int 为条数 n, 其后每 ``_ITEM_RECORD_INTS``(5) 个 int 为一条 [id, 数量, ...].
+    服务端**不保证**按请求顺序返回(上例中返回按 id 升序), 故按 id 匹配而非按位置取.
+
+    返回 dict 仅含应答里出现的 id; 查不到的 id 视为"没有该物品"(调用方按 0 处理).
+    """
+    ids = [int(i) for i in ids if i is not None]
+    if not ids:
+        return {}
+    with _LOCK:
+        cli = _ctx_client()
+    if cli is None:
+        return {}
+    out = {}
+    end_all = time.time() + max(0.5, timeout)
+    with _LOCK_ITEMQ:
+        for i in range(0, len(ids), _ITEMQ_CHUNK):
+            left = end_all - time.time()
+            if left <= 0.1:
+                log("warn", f"[物品查询] 总超时, 剩余 {len(ids) - i} 个物品未查询")
+                break
+            chunk = ids[i:i + _ITEMQ_CHUNK]
+            got = _query_item_count_batch(cli, chunk, min(_ITEMQ_BATCH_TIMEOUT, left))
+            if not got:
+                log("warn", f"[物品查询] 第 {i // _ITEMQ_CHUNK + 1} 批 "
+                            f"({len(chunk)} 个物品) 未取到应答")
+            out.update(got)
+    return out
+
+
+def _query_item_count_batch(cli, ids, timeout: float):
+    """发一次 42399 查**一批**物品的数量; 返回 {物品id: 数量} (调用方需持有 _LOCK_ITEMQ).
+
+    服务端可能先回一个 [0] 之类的空应答, 所以要等"条数 > 0 且长度够"的那一条;
+    条数少于请求数也认(服务端可能只回"拥有的"物品), 只要命中了本次请求的 id.
+    """
+    n = len(ids)
+    body = b"".join(int(i).to_bytes(4, "big") for i in [n] + ids)
+    with _LOCK_RECV:
+        before_seq = _RECV_SEQ.get(42399, 0)
+    try:
+        cli.send_game_packet(42399, body.hex())
+    except Exception as e:
+        log("error", f"[物品查询] 发送 42399 失败: {e}")
+        return {}
+    deadline = time.time() + max(0.3, timeout)
+    latest = None
+    idset = set(ids)
+    while time.time() < deadline:
+        with _LOCK_RECV:
+            if _RECV_SEQ.get(42399, 0) > before_seq:
+                latest = _RECV_LATEST.get(42399)
+                if latest:
+                    ints = decode_body(bytes.fromhex(latest), signed=False)["ints"]
+                    cnt = ints[0] if ints else 0
+                    # 跳过 [0]/空应答; 长度不足(还没收全)也继续等
+                    if cnt > 0 and len(ints) >= 1 + cnt * _ITEM_RECORD_INTS:
+                        recs = _parse_item_count_records(ints, cnt)
+                        # 条数吻合 -> 就是本次应答, 直接返回
+                        if cnt == n:
+                            return recs
+                        # 条数偏少: 服务端可能只回"拥有的"物品. 只要命中本次请求的
+                        # id 就认, 免得白等到超时(没返回的 id 由调用方按 0 处理).
+                        if idset & set(recs):
+                            return {i: recs.get(i, 0) for i in ids if i in recs}
+        time.sleep(0.05)
+    # 超时: 用最后一条应答尽力解析 (能解出几条算几条)
+    if latest:
+        try:
+            ints = decode_body(bytes.fromhex(latest), signed=False)["ints"]
+            if ints and ints[0] > 0:
+                return _parse_item_count_records(ints, ints[0])
+        except Exception:
+            pass
+    return {}
+
+
+def _parse_item_count_records(ints, n):
+    """解析 42399 应答的 n 条 [id, 数量, ...] 记录 -> {id: 数量}."""
+    out = {}
+    o = 1
+    per = _ITEM_RECORD_INTS
+    for _ in range(n):
+        if o + 1 >= len(ints):
+            break
+        out[ints[o]] = ints[o + 1]
+        o += per
+    return out
+
+
 # 魂印/专属特性表 (精灵物种id -> [魂印数据 {id,tags,desc,analyze,effectId,args}]):
 # 来自 effecticon.bytes + effectag.bytes, 由 assets_updater 自动导出 soulmarks.json.
 _SOULMARKS_FILE = os.path.join(_DATA_DIR, "soulmarks.json")
@@ -718,13 +956,15 @@ def _reload_data_maps():
     是在 main() 里(模块加载之后)才生成这些 json 的。全新克隆首次启动时, 模块加载时这些文件还不存在,
     若不重读, 界面会一直显示"无属性/无技能/无魂印"。此函数在启动更新后重新读一遍, 让首次部署即生效。
     """
-    global _PETATTR, _SKILLS, _SOULMARKS
+    global _PETATTR, _SKILLS, _SOULMARKS, _ITEM_NAMES
     try:
-        set_pet_names(_read_json_map(_PETBOOK_FILE))
+        set_pet_names(_read_json_map(_MONSTERNAMES_FILE))
+        merge_pet_names(_read_json_map(_PETBOOK_FILE))
         merge_pet_names(_read_json_map(_PETNAMES_FILE))
         _PETATTR = _read_json_map(_PETATTR_FILE)
         _SKILLS = _read_json_map(_SKILLS_FILE)
         _SOULMARKS = _read_json_map(_SOULMARKS_FILE)
+        _ITEM_NAMES = _read_json_map(_ITEMNAMES_FILE)
     except Exception as e:
         log("error", f"重读精灵数据失败: {e}")
 
@@ -1301,6 +1541,40 @@ class Handler(BaseHTTPRequestHandler):
                 b = dict(_b())
             b["client_present"] = _STATE.get("client") is not None
             self._send(200, "application/json", json.dumps(b, ensure_ascii=False).encode("utf-8"))
+        elif path == "/api/battle/items":
+            # 对战页"用药": 可在战斗中使用的药品一览 [{id, name, effect, source, count}].
+            # 名单来自客户端道具过滤表(离线可用); 数量用 42399 批量查询回填.
+            # 默认**只返回持有数>0 的药品** (?owned=0 可关掉, 用于查看完整名单);
+            # ?counts=0 跳过数量查询(离线/未登录时直接用); ?timeout=秒 调整等待.
+            q = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
+            want_counts = str(q.get("counts", ["1"])[0]).strip().lower() not in ("0", "false", "no")
+            owned_only = str(q.get("owned", ["1"])[0]).strip().lower() not in ("0", "false", "no")
+            try:
+                tmo = float(q.get("timeout", [""])[0] or 4.0)
+            except ValueError:
+                tmo = 4.0
+            items = battle_medicine_items()
+            with _LOCK:
+                online = _ctx_client() is not None
+            counts = {}
+            counted = False
+            if want_counts and online and items:
+                counts = _query_item_counts([it["id"] for it in items], timeout=tmo)
+                # 一个都没查到(服务端异常/超时/掉线)时, 视为"数量未知"而不是"一个都没有",
+                # 否则会把"查不到"误显示成"没有可用药品" —— 空列表比多显示几个更难排查.
+                counted = bool(counts)
+                if not counts:
+                    log("warn", "[药品一览] 数量查询未取到任何应答, 按'数量未知'返回全部候选名单")
+            for it in items:
+                # counted=True 时查不到即"没有该物品"(服务端可能只回拥有的), 记 0;
+                # 未查数量(离线/未登录)时记 None, 前端提示"数量未知".
+                it["count"] = counts.get(it["id"], 0) if counted else None
+            if owned_only and counted:
+                items = [it for it in items if (it.get("count") or 0) > 0]
+            self._send(200, "application/json", json.dumps(
+                {"ok": True, "items": items, "counted": counted, "online": online,
+                 "owned_only": owned_only, "total": len(items)},
+                ensure_ascii=False).encode("utf-8"))
         elif path.startswith("/api/pet-info"):
             # /api/pet-info?catchTime=X 返回缓存的单只 PetInfo
             q = urllib.parse.parse_qs(self.path.split("?", 1)[1] if "?" in self.path else "")
@@ -1940,6 +2214,50 @@ class Handler(BaseHTTPRequestHandler):
                 log("error", f"[对战] 换宠请求失败: {e}")
                 return self._send_json({"ok": False, "error": str(e)}, 400)
 
+        elif path == "/api/battle/use-item":
+            # 用药: 发 2406 USE_PET_ITEM, 包体 = [我方当前出战精灵 catchTime, 物品 id, 0].
+            # 依客户端反编译 (refs/.../data/item/RenewBloodItemCategory.as):
+            #     SocketConnection.send(USE_PET_ITEM, playerMode.info.catchTime, itemID, 0)
+            # 是**三个** int32 —— 早期只发物品 id 会被服务端判为非法操作,
+            # 直接回 2506 FIGHT_OVER 并断开连接(实测踩过). 这里必须带 catchTime.
+            # 参数: {id: 物品id}; 可选 {name: 物品名}、{catchTime: 覆盖(默认取当前出战精灵)}.
+            try:
+                iid_raw = str(data.get("id", "")).strip()
+                if not iid_raw:
+                    return self._send_json({"ok": False, "error": "缺少物品 id"}, 400)
+                iid = int(iid_raw)
+            except ValueError:
+                return self._send_json({"ok": False, "error": f"物品 id 不是整数: {iid_raw!r}"}, 400)
+            with _LOCK:
+                cli = _ctx_client()
+            if cli is None:
+                return self._send_json({"ok": False, "error": "尚未登录, 无法发包"}, 400)
+            try:
+                # 取我方当前出战精灵的 catchTime (与换宠 2407 同源)
+                catch_raw = str(data.get("catchTime", "")).strip()
+                if catch_raw:
+                    catch = int(catch_raw)
+                else:
+                    mine = _b().get("my") or {}
+                    catch = mine.get("catchTime")
+                if not catch:
+                    return self._send_json(
+                        {"ok": False,
+                         "error": "取不到我方当前出战精灵的 catchTime (未在对战中或还没收到 2503/2504)"}, 400)
+                name = str(data.get("name") or item_name_of(iid) or "")
+                body_hex = pack_body(f"{int(catch)} {iid} 0").hex()   # 3×int32 大端, 12B
+                cli.send_game_packet(2406, body_hex)
+                label = f"{name}({iid})" if name else str(iid)
+                log("info", f"[对战] 用药请求: 2406 USE_PET_ITEM 物品={label} "
+                            f"catchTime={catch} body={body_hex}")
+                _report(f"> 使用药品 {label}")
+                return self._send_json({"ok": True,
+                                        "sent": {"cmd": 2406, "id": iid, "name": name,
+                                                 "catchTime": int(catch), "body": body_hex}})
+            except Exception as e:
+                log("error", f"[对战] 用药请求失败: {e}")
+                return self._send_json({"ok": False, "error": str(e)}, 400)
+
         elif path == "/api/battle/wait":
             # 脚本库对战体用: 阻塞等待"对战状态变化" (version 递增 或 对战结束).
             # 返回最新 _b() 快照; changed=False 表示超时(该时段无新对战事件).
@@ -2420,6 +2738,7 @@ button.off:hover{background:var(--elev-2);border-color:var(--line-2)}
       <div id="battleOps" style="display:flex;flex-wrap:wrap;gap:8px"></div>
       <div id="battleActionStatus" style="font-size:12px;color:var(--muted);margin-top:6px">—</div>
       <div id="battleChangePetPicker" style="display:none;margin-top:8px;border:1px solid var(--line);background:var(--inset);border-radius:8px;padding:8px"></div>
+      <div id="battleItemPicker" style="display:none;margin-top:8px;border:1px solid var(--line);background:var(--inset);border-radius:8px;padding:8px"></div>
     </div>
   </div>
   <!-- 战报记录 -->
@@ -2894,21 +3213,31 @@ function renderBattleState(j){
     _forcedChangeOpened=false;
   }
   const ops=document.getElementById('battleOps'); ops.innerHTML='';
-  [['换宠(2407)',2407,true],['用药(2406)',2406,false],['逃跑(2410)',2410,false],['捕捉(2409)',2409,false]].forEach(([label,cmd,isChange])=>{
+  // mode: 'change'=弹出换宠选择; 'item'=弹出药品一览(用药包体为物品id, 不能发空包);
+  //        false=直接发无参命令
+  [['换宠(2407)',2407,'change'],['用药(2406)',2406,'item'],['逃跑(2410)',2410,false],['捕捉(2409)',2409,false]].forEach(([label,cmd,mode])=>{
     const b=document.createElement('button'); b.className='ops-btn'; b.textContent=label;
-    b.title='发送 cmd='+cmd;
-    if(isChange){ b.onclick=()=>openChangePetPicker(j, forced); }
+    b.title=(mode==='item') ? '选择药品后发送 2406 USE_PET_ITEM (包体=物品id)' : '发送 cmd='+cmd;
+    if(mode==='change'){ b.onclick=()=>openChangePetPicker(j, forced); }
+    else if(mode==='item'){ b.onclick=()=>openItemPicker(); }
     else{ b.onclick=()=>sendBattleCmd(cmd,[]); }
-    if(forced && !isChange) b.disabled=true;   // 强制换宠期间禁用非换宠操作
+    if(forced && mode!=='change') b.disabled=true;   // 强制换宠期间禁用非换宠操作
     ops.appendChild(b);
   });
+  // 强制换宠期间收起药品一览(此时不允许用药)
+  if(forced){
+    const ipk=document.getElementById('battleItemPicker');
+    if(ipk){ ipk.style.display='none'; ipk.innerHTML=''; }
+  }
   const bhi=document.getElementById('battleHexInfo');
   if(bhi) bhi.textContent=(j.active?('对战中 mode='+j.mode+' | 上次更新='+(j.lastCmd||'-')):'未在对战中');
   document.getElementById('battleHexBtn').disabled=!(j.client_present);
-  // 未在对战中时收起换宠选择框 (避免残留)
+  // 未在对战中时收起换宠/用药选择框 (避免残留)
   if(!j.active){
     const cpk=document.getElementById('battleChangePetPicker');
     if(cpk){ cpk.style.display='none'; cpk.innerHTML=''; }
+    const ipk=document.getElementById('battleItemPicker');
+    if(ipk){ ipk.style.display='none'; ipk.innerHTML=''; }
     _forcedChangeOpened=false;
   }
   // 战报
@@ -3052,6 +3381,130 @@ async function doChangePet(catchTime, chosen, st){
   }catch(e){
     if(st){ st.textContent='✘ 换宠出错: '+e; st.style.color='var(--red)'; }
     appendLog({t:now(),level:'error',msg:'换宠出错: '+e});
+  }
+}
+// ---- 用药 (2406 USE_PET_ITEM): 战斗可用药品一览 ----
+// 名单来自后端本地物品名表(离线可用), 数量由后端发 42399 批量查询后回填.
+let _BATTLE_ITEMS=null;         // 药品一览缓存 [{id,name,effect,source,count}]
+let _BATTLE_ITEMS_COUNTED=false;// 上次结果是否查到了持有数量(未登录时为 false)
+let _BATTLE_ITEMS_LOADING=false;
+async function fetchBattleItems(force){
+  if(force) _BATTLE_ITEMS=null;
+  if(_BATTLE_ITEMS) return _BATTLE_ITEMS;
+  if(_BATTLE_ITEMS_LOADING){
+    // 已有请求在飞: 等它结束即可, 避免重复请求被误判成"读取失败"
+    for(let i=0;i<50 && _BATTLE_ITEMS_LOADING;i++){ await new Promise(r=>setTimeout(r,100)); }
+    return _BATTLE_ITEMS;
+  }
+  _BATTLE_ITEMS_LOADING=true;
+  try{
+    const r=await fetch('/api/battle/items');
+    const j=await r.json();
+    if(j.ok){ _BATTLE_ITEMS=j.items||[]; _BATTLE_ITEMS_COUNTED=!!j.counted; return _BATTLE_ITEMS; }
+    appendLog({t:now(),level:'error',msg:'获取药品一览失败: '+(j.error||'')});
+  }catch(e){
+    appendLog({t:now(),level:'error',msg:'获取药品一览出错: '+e});
+  }finally{ _BATTLE_ITEMS_LOADING=false; }
+  return null;
+}
+// 拥有的(数量>0)排前面并按数量降序; 没有/未知数量的按 id 排在后面
+function _sortBattleItems(items){
+  return (items||[]).slice().sort((a,b)=>{
+    const ca=(a.count==null?-1:a.count), cb=(b.count==null?-1:b.count);
+    if(ca>0 && cb>0) return (cb-ca) || (a.id-b.id);
+    if(ca>0) return -1;
+    if(cb>0) return 1;
+    return a.id-b.id;
+  });
+}
+function _renderItemList(picker, items, counted){
+  picker.innerHTML='';
+  const head=document.createElement('div');
+  head.style.cssText='display:flex;justify-content:space-between;align-items:center;color:var(--accent);font:12px Menlo,monospace;margin-bottom:6px';
+  const ht=document.createElement('span');
+  ht.textContent=counted ? '选择要使用的药品 (仅显示持有数>0):' : '选择要使用的药品 (数量未知, 显示全部):';
+  head.appendChild(ht);
+  const rf=document.createElement('button'); rf.type='button'; rf.textContent='刷新';
+  rf.style.cssText='background:var(--elev);border:1px solid var(--line);border-radius:6px;color:var(--muted);padding:2px 8px;cursor:pointer;font:11px Menlo,monospace';
+  rf.onclick=()=>{ openItemPicker(true); };   // force=true: 重新查询数量
+  head.appendChild(rf);
+  picker.appendChild(head);
+  if(!items.length){
+    const d=document.createElement('div');
+    d.style.cssText='color:var(--muted);font:12px Menlo,monospace;margin-bottom:6px';
+    d.textContent=counted ? '（没有持有的药品 —— 背包里没有可用的战斗药剂）' : '（没有可使用的药品）';
+    picker.appendChild(d);
+    return;
+  }
+  if(!counted){
+    const w=document.createElement('div');
+    w.style.cssText='color:var(--amber);font:12px Menlo,monospace;margin-bottom:6px';
+    w.textContent='⚠ 未登录/未取到数量, 下面列出全部候选, 使用无效药品服务端可能判负';
+    picker.appendChild(w);
+  }
+  _sortBattleItems(items).forEach(it=>{
+    const b=document.createElement('button'); b.type='button'; b.className='ops-btn';
+    b.style.cssText=b.style.cssText+';flex:1 1 100%;text-align:left;display:block;margin-bottom:4px';
+    const cnt=(it.count==null)? '' : ('   ×'+it.count);
+    const eff=(it.effect? ('   '+it.effect) : '');
+    b.textContent=(it.name||('物品'+it.id))+'   id='+it.id+cnt+eff;
+    b.title='物品ID='+it.id+(it.effect?('  药效='+it.effect):'')+'  点击发送 2406 USE_PET_ITEM';
+    b.onclick=()=>{ picker.style.display='none'; picker.innerHTML=''; doUseItem(it); };
+    picker.appendChild(b);
+  });
+}
+async function openItemPicker(force){
+  const picker=document.getElementById('battleItemPicker');
+  if(!picker) return;
+  const st=document.getElementById('battleActionStatus');
+  // 同时只显示一个选择框: 打开药单一览时收起换宠框
+  const cpk=document.getElementById('battleChangePetPicker');
+  if(cpk){ cpk.style.display='none'; cpk.innerHTML=''; }
+  picker.style.display='block';
+  if(_BATTLE_ITEMS){
+    _renderItemList(picker,_BATTLE_ITEMS,_BATTLE_ITEMS_COUNTED);
+    if(st){ st.textContent='请选择要使用的药品'; st.style.color='var(--amber)'; }
+  }else{
+    picker.innerHTML='<div style="color:var(--muted);font:12px Menlo,monospace">正在读取药品一览...</div>';
+    if(st){ st.textContent='正在读取药品一览...'; st.style.color='var(--amber)'; }
+  }
+  const items=await fetchBattleItems(force);
+  if(!items){
+    picker.innerHTML='<div style="color:var(--red);font:12px Menlo,monospace">读取药品一览失败（需先登录）</div>';
+    if(st){ st.textContent='✘ 读取药品一览失败'; st.style.color='var(--red)'; }
+    return;
+  }
+  _renderItemList(picker, items, _BATTLE_ITEMS_COUNTED);
+  if(st){
+    st.textContent = _BATTLE_ITEMS_COUNTED
+      ? ('请选择要使用的药品 (持有 '+items.length+' 种)')
+      : ('请选择要使用的药品 (数量未知, 共 '+items.length+' 种候选)');
+    st.style.color='var(--amber)';
+  }
+  const cancel=document.createElement('button'); cancel.type='button';
+  cancel.style.cssText='flex:1 1 100%;background:var(--elev);border:1px solid var(--line);border-radius:8px;color:var(--red);padding:6px;cursor:pointer;font:12px Menlo,monospace';
+  cancel.textContent='取消';
+  cancel.onclick=()=>{ picker.style.display='none'; picker.innerHTML=''; };
+  picker.appendChild(cancel);
+}
+async function doUseItem(item){
+  const st=document.getElementById('battleActionStatus');
+  const label=(item.name||('物品'+item.id))+'('+item.id+')';
+  if(st){ st.textContent='发送用药 '+label+'...'; st.style.color='var(--amber)'; }
+  try{
+    const r=await fetch('/api/battle/use-item',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({id:item.id,name:item.name||''})});
+    const j=await r.json();
+    if(j.ok){
+      if(st){ st.textContent='✔ 已发送 2406 用药 '+label; st.style.color='var(--green)'; }
+      appendLog({t:now(),level:'ok',msg:'[对战] 已发送 2406 USE_PET_ITEM '+label+' body='+(j.sent.body||'')});
+      _BATTLE_ITEMS=null;   // 数量已变化, 下次打开重新查询
+    }else{
+      if(st){ st.textContent='✘ 用药失败: '+(j.error||''); st.style.color='var(--red)'; }
+      appendLog({t:now(),level:'error',msg:'用药失败: '+(j.error||'')});
+    }
+  }catch(e){
+    if(st){ st.textContent='✘ 用药出错: '+e; st.style.color='var(--red)'; }
+    appendLog({t:now(),level:'error',msg:'用药出错: '+e});
   }
 }
 async function sendBattleCmd(cmd, params){

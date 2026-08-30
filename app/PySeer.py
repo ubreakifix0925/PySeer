@@ -755,7 +755,7 @@ class Battle:
                 battle.change_pet(battle.my_team[1]['id'])  # 死亡切换(传物种id), 不消耗回合
                 battle.use_skill(battle.skills[0])                  # 同一回合内继续出招
             elif my and (my.get('hp') or 0) < 300:
-                battle.use_item(70001)                              # 用道具(消耗一回合)
+                battle.use_item(300014)                             # 用道具(消耗一回合)
             else:
                 battle.use_skill(battle.skills[0])                  # 使用技能(消耗一回合)
             rnd = battle.round                                      # 本回合(2505)数据
@@ -1058,9 +1058,24 @@ class Battle:
         self._after_round()
         return snap
 
-    def use_item(self, *params, timeout: float = None) -> dict:
-        """用道具(2406): 发包后**自动等待本回合结算(2505)**, 消耗一回合."""
-        self.send(2406, list(params))
+    def use_item(self, item_id, catchTime=None, timeout: float = None) -> dict:
+        """用道具(2406): 发包后**自动等待本回合结算(2505)**, 消耗一回合.
+
+        2406 的包体是 **[我方当前出战精灵 catchTime, 物品id, 0]** 三个 int32
+        (依客户端 ``RenewBloodItemCategory.as``::
+        ``send(USE_PET_ITEM, playerMode.info.catchTime, itemID, 0)``)。
+        只发物品 id 会被服务端判为非法操作 —— 实测会立刻回 2506 FIGHT_OVER
+        并**断开连接**。故这里默认自动取当前出战精灵的 catchTime 补齐;
+        也可显式传 ``catchTime=``。
+
+        :param item_id: 物品 id (如 300014 超级体力药剂)
+        :param catchTime: 目标精灵 catchTime; 默认取 ``my.catchTime``
+        """
+        if catchTime is None:
+            catchTime = (self._snap.get("my") or {}).get("catchTime")
+        if not catchTime:
+            raise SeerError("取不到我方当前出战精灵的 catchTime, 无法用药 (未在对战中?)")
+        self.send(2406, [int(catchTime), int(item_id), 0])
         snap = self.wait_round(timeout or self.entry_timeout)
         self._after_round()
         return snap

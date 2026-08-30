@@ -273,7 +273,7 @@ while not battle.finished:
         battle.change_pet(battle.my_team[1]['id'])   # 死亡切换(传物种id), 不消耗回合
         battle.use_skill(battle.skills[0])            # 同一回合内继续出招
     elif my and (my.get('hp') or 0) < 300:
-        battle.use_item(70001)                        # 用道具(消耗一回合)
+        battle.use_item(300014)                       # 用道具(消耗一回合)
     else:
         battle.use_skill(battle.skills[0])            # 使用技能(消耗一回合)
     rnd = battle.round                                # 本回合(2505)数据
@@ -324,7 +324,7 @@ while not battle.finished:
 | `send(cmd, params=None, encode="pack")` | 任意发包（命令名或命令号；`encode="hex"` 原样十六进制）；**不自动等回合** |
 | `send_hex(hex_packet)` | 发送一条带 `cmdid` 的完整 HEX 包（后端重建 uid/序列号并加密封包） |
 | `use_skill(skill_id)` | 用技能(2405)：发包后**自动等本回合结算(2505)**，消耗一回合 |
-| `use_item(*params)` | 用道具(2406)：发包后自动等本回合(2505)，消耗一回合 |
+| `use_item(item_id, catchTime=None)` | 用道具(2406)：包体 `[我方catchTime, 物品id, 0]`，`catchTime` 默认取当前出战精灵；发包后自动等本回合(2505)，消耗一回合 |
 | `capture(*params)` | 捕捉(2409)：发包后自动等本回合(2505)，消耗一回合 |
 | `change_pet(species_id, catchTime=None, *, death=None)` | **换宠**(2407)：`death=None` 自动判断——当前精灵阵亡→**死亡切换**(不消耗回合)；还活着→**主动切换**(消耗一回合)。`death=True/False` 可强制；见下 |
 | `escape()` | 逃跑(2410)：发包后自动等对战结束(2506) |
@@ -360,6 +360,28 @@ battle.change_pet(5000, death=False)          # 或省略 death=None 自动按�
 
 > 若阵容里找不到该 id（或就是当前出战/已阵亡），后端返回明确错误并 `SeerError`。
 > `death` 默认自动判断通常够用；想强制某一种行为就显式传 `death=True` 或 `death=False`。
+
+**用药（2406 USE_PET_ITEM）的包体是三个 int32**，不是只有物品 id：
+
+```
+[我方当前出战精灵 catchTime, 物品 id, 0]
+```
+
+依据客户端反编译 `refs/.../data/item/RenewBloodItemCategory.as`：
+
+```actionscript
+SocketConnection.send(CommandID.USE_PET_ITEM,
+                      FighterModelFactory.playerMode.info.catchTime, itemID, 0);
+```
+
+> ⚠️ **只发物品 id 会被服务端判为非法操作** —— 实测立刻回 `2506 FIGHT_OVER` 并**断开游戏连接**。
+> `use_item()` 已自动补 `catchTime`（取 `my.catchTime`），直接传物品 id 即可；
+> 取不到 catchTime（未在对战 / 还没收到 2503·2504）会抛 `SeerError` 而**不会**发错包。
+
+```python
+battle.use_item(300014)                       # 超级体力药剂, catchTime 自动取
+battle.use_item(300016, catchTime=12345678)   # 也可显式指定
+```
 
 ### `run(decide, timeout=15.0) -> bool`
 
@@ -443,7 +465,7 @@ def decide(b):
             b.escape()
     elif (my.get('hp') or 0) < 300:                 # 残血 -> 用药(耗一回合)
         b.act("> 血量偏低, 用药")
-        b.use_item()                                # 按实际道具包体传参
+        b.use_item(300014)                          # 超级体力药剂(catchTime 自动补)
     else:
         b.use_skill(b.skills[0])                    # 正常出招(耗一回合)
 
@@ -473,7 +495,7 @@ while not b.finished:
 2. **`set_bag` 会发真实游戏命令**（2304/2308/41462），会物理重排背包；请用安全/可恢复的列表。
 3. **对战需要真实触发包**：`Battle(hex)` 的 `hex` 是带 `cmdid` 的完整封包（从游戏抓包或已记录包得到）；包无效则 `_wait_entry` 无法等到进场，超时抛 `SeerError`。
 4. **进场充分等待**：`_wait_entry` 会等 `active`+双方当前精灵**连续稳定约 0.8s** 才返回；上一场遗留的 `finished=True` 会被忽略，避免“二次运行即报错”。
-5. **`use_item`/`capture`/`escape` 默认空包体**：与 WebUI 页面按钮一致；若要自定义包体请用通用 `send(cmd, params)`。
+5. **`use_item` 会自动补 `catchTime`**：2406 包体是 `[catchTime, 物品id, 0]`（见上文「用药」一节），只发物品 id 会导致服务端回 2506 并**断线**。`capture`/`escape` 仍按原样发包（`capture` 需自行传胶囊物品 id；若要完全自定义包体请用通用 `send(cmd, params)`）。
 6. **换宠按 id**：后端从当前对战阵容解析 `catchTime`；若该 id 不在阵容（或就是当前出战/已阵亡），会返回“阵容中找不到”错误。
 7. **回合是“操作即回合”**：每发一个消耗回合的动作会**自动等待 2505**；只有 `change_pet`（死亡切换）不消耗回合，可在同一回合再出招。
 8. **异常统一 `SeerError`**：参数错/超时/未登录/越界都会抛 `SeerError`，捕获后处理即可。

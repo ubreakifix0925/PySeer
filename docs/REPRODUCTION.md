@@ -313,6 +313,23 @@ WebUI 的精灵名字/属性/技能/魂印/物品名全部**从游戏资源自�
 每个产物有**版本状态文件**（`data/.xx_state.json`），命中版本即跳过。
 UnityPy 若不是标准库，会自动 `pip install` 到 `vendor/unitypy`（不污染系统）。
 
+### 7.0 数据源与"实际游戏版本"（关键）
+
+> ⚠️ **官方 CDN 对 `PackageManifest_<Pkg>.version` 会返回陈旧的缓存副本**。直接拉
+> `https://newseer.61.com/Assets/StandaloneWindows64/<Pkg>/PackageManifest_<Pkg>.version`
+> 会拿到**旧版**（实测 08-21 / 08-20），导致新精灵（如 4937 星光·雷纳多、4938 塞壬斯、
+> 4939 决囚钢骨）解不出。
+>
+> **解决**：给请求 URL 追加一个**时间戳查询参数**（如 `?..._cb=<ms>`）强制 CDN 回源，即可拿到
+> **线上游戏实际版本**（实测 Config=20260828154058、Default=20260829163444）。`assets_updater.py`
+> 的 `_http_get()` 默认对每个 CDN 请求都加该参数。这也正是"后端不走游戏本体、纯靠 CDN 即可
+> 拿到正确资源"的关键——**不需要读取任何游戏本地文件**。
+>
+> - 版本号是 `YYYYMMDDHHMMSS` 的**任意时间戳**（如 15:40:58），不是整点，因此**靠"打网格探测"
+>   不可靠**；唯一权威来源就是 CDN 上缓存失效后的 `PackageManifest_<Pkg>.version`。
+> - 复现：`PYTHONPATH=vendor/unitypy python3 app/assets_updater.py --force` 即可经 CDN 刷新到含新精灵的
+>   名字/属性/头像/技能/物品数据。
+
 ### 7.1 物品名提取（`data/item_names.json`）
 
 物品定义是 C# 风格二进制表（`[bool][int32][string(u16+UTF-8)]` 序列化），分布在

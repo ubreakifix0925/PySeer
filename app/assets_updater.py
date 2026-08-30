@@ -43,6 +43,16 @@ BUNDLE_GLOB = "_pet_head_"  # 匹配"精灵头像" bundle 名
 # ---- petbook (精灵图鉴名字) 相关 ----
 PETBOOK_FILE = Path(os.environ.get("SEER_PETBOOK_OUT", _DATA_DIR / "petbook.json"))
 PETBOOK_STATE = Path(os.environ.get("SEER_PETBOOK_STATE", _DATA_DIR / ".petbook_state.json"))
+
+# 全物种名兜底表 (monster_names.json):
+# petbook.bytes 是"图鉴"表, 只覆盖 id <= 5000 的 4901 个物种; 而 monsters.bytes 里
+# 还有大量 id > 5000 的物种(如 5357/15003...), 它们**有属性但没名字**, 界面只能显示 (id=xxxx)。
+# monsters.bytes 每条记录都带 def_name, 用它可以把这些名字补齐 —— 与图鉴名并存,
+# 由 webui 按优先级合并(图鉴名 > 本表)。
+MONSTER_NAMES_FILE = Path(os.environ.get(
+    "SEER_MONSTERNAMES_OUT", _DATA_DIR / "monster_names.json"))
+MONSTER_NAMES_STATE = Path(os.environ.get(
+    "SEER_MONSTERNAMES_STATE", _DATA_DIR / ".monster_names_state.json"))
 CONFIG_PKG = os.environ.get("SEER_PETBOOK_PKG", "ConfigPackage")
 CONFIG_BASE = os.environ.get(
     "SEER_PETBOOK_BASE",
@@ -166,7 +176,17 @@ def _path_is_int_name(p):
 
 
 # ---------------- HTTP (stdlib) ----------------
-def _http_get(url, timeout=30.0):
+def _http_get(url, timeout=30.0, bust=True):
+    """拉取 CDN 资源; 默认加**时间戳查询参数**绕过 CDN 缓存.
+
+    实测(2026-08): 官方 CDN 对 `PackageManifest_<Pkg>.version` 这类"内容会变但 URL 不变"的
+    静态文件会返回**陈旧的缓存副本**(不加任何参数拿到 08-21/08-20, 而加时间戳参数拿到正确的
+    08-28/08-29——后者才是线上游戏实际版本, 含 4937-4939 等新精灵)。给 URL 追加一个时间戳
+    查询参数即强制 CDN 回源取最新。
+    """
+    if bust:
+        sep = "&" if "?" in url else "?"
+        url = f"{url}{sep}_cb={int(time.time() * 1000)}"
     req = urllib.request.Request(url, headers={"User-Agent": UA, "Referer": REFERER})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
@@ -180,6 +200,7 @@ def _http_get(url, timeout=30.0):
 
 
 def get_remote_version():
+    # 走 CDN(已加时间戳参数绕过缓存), 拿到线上游戏实际版本.
     url = f"{REMOTE_BASE}PackageManifest_{PKG}.version"
     try:
         return _http_get(url).decode("utf-8", "replace").strip()
@@ -260,8 +281,7 @@ def parse_manifest(data):
 def get_remote_manifest():
     version = get_remote_version()
     url = f"{REMOTE_BASE}PackageManifest_{PKG}_{version}.bytes"
-    data = _http_get(url)
-    m = parse_manifest(data)
+    m = parse_manifest(_http_get(url))
     m["remote_version"] = version
     return m
 
@@ -507,6 +527,11 @@ def _extract_id(text):
     return int(nums[-1]) if nums else None
 
 
+def _asset_name(r):
+    """取一个 Unity 对象的名字: Sprite/Texture 的 id 常放在 m_Name, 而非 name."""
+    return getattr(r, "m_Name", "") or getattr(r, "name", "") or ""
+
+
 def extract_pet_avatars(cache_dir, out_dir):
     """用 UnityPy 把 cache_dir 里的 pet_head_*.bundle 解析成 out_dir/<id>.png.
     返回导出的图片数量."""
@@ -541,11 +566,12 @@ def extract_pet_avatars(cache_dir, out_dir):
             img = getattr(r, "image", None)
             if img is None:
                 continue
-            pid = _extract_id(str(path)) or _extract_id(getattr(r, "name", ""))
-            candidates.append((pid, str(path), getattr(r, "name", ""), img))
+            nm = _asset_name(r)
+            pid = _extract_id(str(path)) or _extract_id(nm)
+            candidates.append((pid, str(path), nm, img))
         except Exception as e:
             log(f"container 处理失败 {path}: {e}")
-    # 2) 遍历全部对象 (子资源可能不在 container)
+    # 2) 遍历全部对象 (子资源可能不在 container, 只有 m_Name 带 id)
     for obj in env.objects:
         try:
             if obj.type not in types:
@@ -554,16 +580,19 @@ def extract_pet_avatars(cache_dir, out_dir):
             img = getattr(r, "image", None)
             if img is None:
                 continue
-            pid = _extract_id(getattr(r, "name", "")) or _extract_id(str(obj.path))
-            candidates.append((pid, str(getattr(obj, "path", "")), getattr(r, "name", ""), img))
+            nm = _asset_name(r)
+            pid = _extract_id(nm) or _extract_id(str(obj.path))
+            candidates.append((pid, str(getattr(obj, "path", "")), nm, img))
         except Exception as e:
             log(f"对象处理失败: {e}")
 
     written = 0
     seen = set()
+    skipped = 0
     for pid, path, name, img in candidates:
         if pid is None:
-            log(f"[跳过] 无法解析 id: path={path!r} name={name!r}")
+            # 该项多为非宠物/无法定位 id 的资源; 逐条刷屏意义不大, 仅计数
+            skipped += 1
             continue
         if pid in seen:
             continue
@@ -575,7 +604,7 @@ def extract_pet_avatars(cache_dir, out_dir):
             written += 1
         except Exception as e:
             log(f"[失败] id={pid} path={path!r}: {e}")
-    log(f"解析导出完成: {written} 张 -> {out_dir}")
+    log(f"解析导出完成: {written} 张 -> {out_dir}" + (f" (另跳过 {skipped} 个无法定位 id 的资源)" if skipped else ""))
     return written
 
 
@@ -690,6 +719,7 @@ def ensure_petbook(force=False):
     便于调用方从中再取 monsters.bytes 等其它资源.
     """
     _ensure_data_dirs()
+    # 走 CDN(已加时间戳参数绕过缓存), 拿到线上游戏实际版本
     try:
         cfg_version = _http_get(
             f"{CONFIG_BASE}PackageManifest_{CONFIG_PKG}.version").decode().strip()
@@ -1400,6 +1430,38 @@ def regenerate_pet_attr_from_bytes(pb, attr_names=None):
     return {"ok": True, "count": len(attr)}
 
 
+def regenerate_pet_names_from_bytes(pb):
+    """从 monsters.bytes 生成**全物种名兜底表** monster_names.json: {物种id: def_name}.
+
+    与 petbook.json 的区别:
+      - petbook.json(图鉴表) 只覆盖 id <= 5000 的 4901 个物种, 名字更"正式";
+      - monsters.bytes 覆盖**全部**物种(含 id > 5000 的 1500+ 个), 每条带 def_name。
+    两者互补: 界面优先用图鉴名, 图鉴没有的再用本表兜底, 避免出现 (id=5357) 这样的占位。
+
+    仅收 real_id==0 的基表记录(与 pet_attr 同一口径), 跳过空名。
+    """
+    _ensure_data_dirs()
+    if not pb:
+        return {"ok": False, "error": "monsters.bytes 为空"}
+    try:
+        monsters = parse_monsters(pb)
+    except Exception as e:
+        return {"ok": False, "error": f"解析 monsters.bytes 失败: {e}"}
+    names = {}
+    for r in monsters:
+        if r.get("real_id") != 0:
+            continue
+        sid = r.get("id")
+        nm = (r.get("def_name") or "").strip()
+        if isinstance(sid, int) and nm:
+            names[str(sid)] = nm
+    if not names:
+        return {"ok": False, "error": "从 monsters.bytes 未解析到精灵名"}
+    _write_json_file(MONSTER_NAMES_FILE, names)
+    log(f"monster_names 已从 monsters.bytes 生成: {len(names)} 个精灵名 -> {MONSTER_NAMES_FILE}")
+    return {"ok": True, "count": len(names)}
+
+
 def regenerate_pet_attr(monsters_json_path=MONSTERS_JSON):
     """从 refs/monsters.json (别人解析好的 monsters.bytes) 生成 pet_attr.json: {物种id: 属性名}.
 
@@ -1474,24 +1536,43 @@ def ensure_pet_avatars(force=False):
             except Exception as e:
                 log(f"解析 skilltypes.bytes 属性名失败, 用内置映射: {e}")
 
-            # 精灵属性表 pet_attr.json
+            # 精灵属性表 pet_attr.json + 全物种名兜底表 monster_names.json
+            # (两者同源 monsters.bytes, 合并一次读取; 各自独立记录版本)
             _st = _read_json(PET_ATTR_STATE)
-            if (not force and _st.get("source") == "monsters.bytes+skilltypes.bytes"
-                    and _st.get("version") == cfg_version and PET_ATTR_FILE.exists()):
-                log(f"pet_attr 已是最新 (版本 {cfg_version}), 跳过")
-            else:
+            _mst = _read_json(MONSTER_NAMES_STATE)
+            need_attr = not (not force
+                             and _st.get("source") == "monsters.bytes+skilltypes.bytes"
+                             and _st.get("version") == cfg_version and PET_ATTR_FILE.exists())
+            need_names = not (not force
+                              and _mst.get("source") == "monsters.bytes"
+                              and _mst.get("version") == cfg_version
+                              and MONSTER_NAMES_FILE.exists())
+            if need_attr or need_names:
                 mb = _get_asset_bytes(cache_path, MONSTERS_ASSET)
-                rr = regenerate_pet_attr_from_bytes(mb, attr_names=attr_names)
-                if rr.get("ok"):
-                    _write_json_file(PET_ATTR_STATE, {
-                        "version": cfg_version,
-                        "source": "monsters.bytes+skilltypes.bytes",
-                        "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
-                    })
-                    log(f"pet_attr 已同步 monsters.bytes (版本 {cfg_version})")
-                else:
-                    log(f"从 monsters.bytes 生成 pet_attr 失败, 回退 monsters.json: {rr.get('error')}")
-                    regenerate_pet_attr()
+                if need_attr:
+                    rr = regenerate_pet_attr_from_bytes(mb, attr_names=attr_names)
+                    if rr.get("ok"):
+                        _write_json_file(PET_ATTR_STATE, {
+                            "version": cfg_version,
+                            "source": "monsters.bytes+skilltypes.bytes",
+                            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        })
+                        log(f"pet_attr 已同步 monsters.bytes (版本 {cfg_version})")
+                    else:
+                        log(f"从 monsters.bytes 生成 pet_attr 失败, 回退 monsters.json: {rr.get('error')}")
+                        regenerate_pet_attr()
+                if need_names:
+                    nr = regenerate_pet_names_from_bytes(mb)
+                    if nr.get("ok"):
+                        _write_json_file(MONSTER_NAMES_STATE, {
+                            "version": cfg_version,
+                            "source": "monsters.bytes",
+                            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        })
+                    else:
+                        log(f"monster_names 生成失败: {nr.get('error')}")
+            else:
+                log(f"pet_attr / monster_names 已是最新 (版本 {cfg_version}), 跳过")
 
             # 技能表 skills.json (moves.bytes + skill_effect.bytes + 属性名)
             _ss = _read_json(SKILLS_STATE)
