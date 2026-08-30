@@ -14,6 +14,7 @@
 import hashlib
 import json
 import os
+import re
 import shlex
 import struct
 import subprocess
@@ -21,6 +22,8 @@ import sys
 import time
 import urllib.request
 from pathlib import Path
+
+ITEM_NAME_CJK = re.compile(r"[\u4e00-\u9fff]")
 
 # ---- 可配置 ---- (可用环境变量覆盖)
 PKG = os.environ.get("SEER_AVATAR_PKG", "DefaultPackage")
@@ -69,6 +72,24 @@ PET_ATTR_STATE = Path(os.environ.get(
     "SEER_PETATTR_STATE", _DATA_DIR / ".pet_attr_state.json"))
 MONSTERS_JSON = Path(os.environ.get(
     "SEER_MONSTERS_JSON", _PROJ / "refs" / "monsters.json"))
+
+# ---- 物品名 (itemsoptimizecatitems{N}.bytes) 相关 ----
+# 物品定义分布在 ConfigPackage bundle 的 assets/game/configs/bytes/itemsoptimizecatitems{N}.bytes,
+# 每条记录含"物品id(int32 小端)"与"物品名(u16 长度前缀 UTF-8)"。
+ITEM_NAMES_FILE = Path(os.environ.get(
+    "SEER_ITEMNAMES_OUT", _DATA_DIR / "item_names.json"))
+ITEM_NAMES_STATE = Path(os.environ.get(
+    "SEER_ITEMNAMES_STATE", _DATA_DIR / ".item_names_state.json"))
+ITEM_ASSET_PREFIX = "assets/game/configs/bytes/itemsoptimizecatitems"
+ITEM_RESOURCE_ASSET = "assets/game/configs/bytes/itemsoptimizecatitems0.bytes"  # 资源/货币类(小序号id)
+# 与 itemsoptimizecatitems{0..27} 同类、也是固定"id+名字"二元表的补充物品表(中间物品/交换物品)
+ITEM_EXTRA_ASSETS = (
+    "assets/game/configs/bytes/midleitems.bytes",          # 中间物品(合成材料/中间产物, ~2.1 万条)
+    "assets/game/configs/bytes/midleexchangeitems.bytes",  # 中间交换物品
+)
+# 宠物道具/药剂(主道具表 itemsoptimizecatitems3)的记录为可变长字段, id 落在该区间(见 _parse_pet_item_records)
+PET_ITEM_BAND = (280000, 330000)
+ITEM_ID_LO = 10000        # 标准物品 id 的下限(更小的属于资源/货币等特殊 id)
 
 # 属性类型编号 -> 中文名 (来自 skilltypes.bytes, 单体 1-20 + 复合 21-132)
 PET_ATTR_NAMES = {
@@ -1157,6 +1178,196 @@ def regenerate_soulmarks(icon_pb, tag_pb=None):
     return {"ok": True, "count": len(out)}
 
 
+# ---------------- 物品名 (itemsoptimizecatitems{N}.bytes) ----------------
+def _list_asset_bytes(bundle_path, prefix=None, extra_assets=()):
+    """从 bundle 里取出所有路径以 prefix 开头的资产, 及 extra_assets 指定的具体资产: {asset_path: bytes}."""
+    from UnityPy import Environment
+    env = Environment()
+    env.load_file(Path(bundle_path).read_bytes(), name=Path(bundle_path).name)
+    out = {}
+    for path, pptr in env.container.items():
+        if (prefix and path.lower().startswith(prefix)) or path in extra_assets:
+            s = pptr.deref().read().m_Script
+            data = s.encode("utf-8", "surrogateescape") if isinstance(s, str) else bytes(s)
+            out[path] = data
+    return out
+
+
+def _item_names_and_prefixes(data):
+    """返回 [(name_len_prefix_offset, name_str)], 名字以汉字开头且含>=2 个汉字."""
+    out = []
+    for i in range(len(data) - 2):
+        ln = struct.unpack_from("<H", data, i)[0]
+        if not (2 <= ln <= 40) or i + 2 + ln > len(data):
+            continue
+        try:
+            s = data[i + 2:i + 2 + ln].decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        if len(ITEM_NAME_CJK.findall(s)) >= 2 and "\u4e00" <= s[0] <= "\u9fff":
+            out.append((i, s))
+    return out
+
+
+def _item_id_ok(v):
+    """标准物品 id 的保守区间."""
+    return ITEM_ID_LO <= v <= 20000000
+
+
+def _item_best_offset(data, anchors):
+    """在候选 K(4..40 步长4)里选"干净"的: 命中数最多, 且命中 id 不完全相同."""
+    best = None
+    for k in range(4, 41, 4):
+        vals = []
+        for i, _ in anchors:
+            o = i - k
+            if o >= 0 and o + 4 <= len(data):
+                v = struct.unpack_from("<I", data, o)[0]
+                if _item_id_ok(v):
+                    vals.append(v)
+        if not vals:
+            continue
+        # 退化: 命中过多但 id 几乎全同(多为数量/常量字段), 跳过
+        if len(set(vals)) <= max(1, len(vals) // 10):
+            continue
+        cand = (len(vals), k)
+        if best is None or cand > best:
+            best = cand
+    return best
+
+
+def _parse_pet_item_records(data):
+    """按 [id][u32][u32][u16 前缀][前缀][i32][u16 名][名] 布局解析宠物道具带内记录.
+
+    宠物道具/药剂(itemsoptimizecatitems3)的记录为可变长字段, id 落在 PET_ITEM_BAND 且
+    可能出现在任意字节位置(记录含变长串, 边界不按 4 字节对齐)。逐字节定位 u32 并向前解出,
+    校验(前缀/名字长度合法、名字为汉字)后返回 [(id, name)]。
+    """
+    lo, hi = PET_ITEM_BAND
+    out = []
+    seen = set()
+    n = len(data)
+    i = 0
+    while i + 4 <= n:
+        v = struct.unpack_from("<I", data, i)[0]
+        if not (lo <= v <= hi) or v % 65536 == 0 or (v & (v - 1)) == 0:
+            i += 1
+            continue
+        try:
+            p = i + 4 + 4 + 4            # id + x1 + x2
+            plen = struct.unpack_from("<H", data, p)[0]
+            p += 2
+            if not (0 <= plen <= 12) or p + plen > n:
+                i += 1
+                continue
+            p += plen                    # 前缀串(如 "1895")
+            p += 4                        # i32
+            nlen = struct.unpack_from("<H", data, p)[0]
+            p += 2
+            if not (1 <= nlen <= 40) or p + nlen > n:
+                i += 1
+                continue
+            name = data[p:p + nlen].decode("utf-8", "replace")
+            if len(ITEM_NAME_CJK.findall(name)) >= 2 and "\u4e00" <= name[0] <= "\u9fff":
+                if v not in seen:
+                    seen.add(v)
+                    out.append((v, name))
+        except (struct.error, UnicodeDecodeError):
+            pass
+        i += 1
+    return out
+
+
+def _extract_item_pairs(data):
+    """对一个 itemsoptimizecatitems{N} 文件提取 [(id, name)].
+
+    多数类用"固定 K"对齐(id 恰在名字长度前缀前 K 字节, ~100% 命中); 匹配率过低则回退到
+    宠物道具可变长记录解析(_parse_pet_item_records)。
+    """
+    anchors = _item_names_and_prefixes(data)
+    if not anchors:
+        return None
+    best = _item_best_offset(data, anchors)
+    if best is not None:
+        count, k = best
+        if count >= len(anchors) * 0.6:
+            pairs = []
+            seen = set()
+            for i, s in anchors:
+                o = i - k
+                if o >= 0 and o + 4 <= len(data):
+                    v = struct.unpack_from("<I", data, o)[0]
+                    if _item_id_ok(v) and v not in seen:
+                        seen.add(v)
+                        pairs.append((v, s))
+            return {"k": k, "count": len(pairs), "pairs": pairs}
+    pet_pairs = _parse_pet_item_records(data)
+    if pet_pairs:
+        return {"k": "petitem", "count": len(pet_pairs), "pairs": pet_pairs}
+    return None
+
+
+def _extract_resource_names(data):
+    """解析资源/货币类(itemsoptimizecatitems0): 每项 id 为资源小序号(名字长度前缀前 12 字节).
+
+    返回 {资源id(小整数): 资源名}。这类资源(赛尔豆/钻石/燃料...)是独立的资源/货币系统,
+    其 id 为 1..15 的小序号, 与标准物品 id(≥10000)不冲突。
+    """
+    anchors = _item_names_and_prefixes(data)
+    out = {}
+    for i, s in anchors:
+        o = i - 12
+        if o >= 0 and o + 4 <= len(data):
+            rid = struct.unpack_from("<I", data, o)[0]
+            if 1 <= rid <= 100:
+                out[rid] = s
+    return out
+
+
+def regenerate_item_names(bundle_path):
+    """从 ConfigPackage bundle 解析全部物品名, 生成 data/item_names.json: {物品id: 物品名}.
+
+    覆盖:
+      - itemsoptimizecatitems{N} 各物品大类(固定 K 对齐) + 宠物道具(可变长记录解析)
+      - midleitems / midleexchangeitems(中间物品/交换物品, 同为"id+名字"二元表)
+      - 资源/货币(itemsoptimizecatitems0, id 为 1..15 小序号)
+    失败时返回 {"ok": False, ...}。
+    """
+    _ensure_data_dirs()
+    try:
+        assets = _list_asset_bytes(bundle_path, ITEM_ASSET_PREFIX, extra_assets=ITEM_EXTRA_ASSETS)
+    except Exception as e:
+        return {"ok": False, "error": f"枚举物品资产失败: {e}"}
+    if not assets:
+        return {"ok": False, "error": "bundle 里没有 itemsoptimizecatitems* 资产"}
+    merged = {}
+    detail = {}
+
+    def _absorb(asset, data):
+        name = Path(asset).name
+        if asset == ITEM_RESOURCE_ASSET:
+            rnames = _extract_resource_names(data)
+            for rid, nm in rnames.items():
+                merged.setdefault(rid, nm)
+            detail[name] = {"n": len(rnames), "k": "resource"}
+            return
+        res = _extract_item_pairs(data)
+        if res is None:
+            detail[name] = {"n": 0, "k": "skip"}
+            return
+        for v, s in res["pairs"]:
+            merged.setdefault(v, s)
+        detail[name] = {"n": len(res["pairs"]), "k": res["k"]}
+
+    for asset, data in assets.items():
+        _absorb(asset, data)
+    if not merged:
+        return {"ok": False, "error": "未解析到任何物品名"}
+    _write_json_file(ITEM_NAMES_FILE, {str(k): v for k, v in merged.items()})
+    log(f"item_names 已生成: {len(merged)} 个物品名 -> {ITEM_NAMES_FILE}")
+    return {"ok": True, "count": len(merged), "detail": detail}
+
+
 def regenerate_pet_attr_from_bytes(pb, attr_names=None):
     """直接从 monsters.bytes 自解析生成 pet_attr.json: {物种id: 属性名}.
 
@@ -1325,6 +1536,26 @@ def ensure_pet_avatars(force=False):
                         log(f"soulmarks 生成失败: {smr.get('error')}")
                 except Exception as e:
                     log(f"soulmarks 更新失败: {e}")
+
+            # 物品名表 item_names.json (itemsoptimizecatitems{N}.bytes)
+            _in = _read_json(ITEM_NAMES_STATE)
+            if (not force and _in.get("source") == "itemsoptimizecatitems*.bytes"
+                    and _in.get("version") == cfg_version and ITEM_NAMES_FILE.exists()):
+                log(f"item_names 已是最新 (版本 {cfg_version}), 跳过")
+            else:
+                try:
+                    inr = regenerate_item_names(cache_path)
+                    if inr.get("ok"):
+                        _write_json_file(ITEM_NAMES_STATE, {
+                            "version": cfg_version,
+                            "source": "itemsoptimizecatitems*.bytes",
+                            "updated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+                        })
+                        log(f"item_names 已同步 (版本 {cfg_version})")
+                    else:
+                        log(f"item_names 生成失败: {inr.get('error')}")
+                except Exception as e:
+                    log(f"item_names 更新失败: {e}")
         else:
             log("未获得 ConfigPackage bundle, pet_attr 回退 monsters.json")
             regenerate_pet_attr()

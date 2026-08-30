@@ -39,10 +39,12 @@ app/multi.py
 !data/pet_attr.json
 !data/skills.json
 !data/soulmarks.json
+!data/item_names.json
 !data/.petbook_state.json
 !data/.pet_attr_state.json
 !data/.skills_state.json
 !data/.soulmarks_state.json
+!data/.item_names_state.json
 
 # ---- 仍要忽略的运行产物/字节码 (即便目录保留) ----
 *.pyc

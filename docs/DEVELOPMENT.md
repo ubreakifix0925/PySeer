@@ -37,6 +37,15 @@ WebUI(http://127.0.0.1:8680)  ── 后台已登录的 SeerClient  ──▶ Py
 | `skills.json` | `moves.bytes` + `skill_effect.bytes` | `parse_moves` / `parse_skill_effects` / `regenerate_skills` | 技能 id → 名/PP/属性/威力/命中/暴击/必中/先制/效果（27206 条） |
 | `soulmarks.json` | `effecticon.bytes` + `effectag.bytes` | `parse_effect_icons` / `parse_effect_tags` / `regenerate_soulmarks` | 精灵 id → 专属特性魂印列表（1993 只） |
 | `data/effecticon/*.png` | DefaultPackage `effecticon_1..5.bundle` | `ensure_effect_icons` | 魂印/效果图标（2114 张，按 icon_id 命名） |
+| `item_names.json` | `itemsoptimizecatitems{N}.bytes` + `midleitems.bytes` + `midleexchangeitems.bytes` | `assets_updater.regenerate_item_names` | 物品 id → 物品名（32055 条，时装/收藏/主道具/宠物道具/中间物品/资源等） |
+
+> 物品名提取（已并入 `assets_updater.py` 的自更新管线，输出 `data/item_names.json` + `.item_names_state.json`）：
+> 物品定义为 C# 风格二进制表，多数类用"固定 K"对齐（物品 id 恰在名字长度前缀前 K 字节，
+> K∈{8,12,16}，实测 ~100% 命中）；宠物道具/药剂（`itemsoptimizecatitems3`）记录内为可变长字段，
+> 布局 `[id][u32][u32][u16 前缀][前缀][i32][u16 名][名]...`，改用逐字节定位带内(300xxx)id 并向前解出；
+> `midleitems`/`midleexchangeitems`（中间/交换物品，含合成材料与"购买/一键…"类杂项物品）同为"id+名字"二元表；
+> 资源/货币类（`itemsoptimizecatitems0`，赛尔豆/钻石/燃料…）id 为 1..15 的小序号（独立资源 id 系统）。
+> 也可独立刷新：`PYTHONPATH=vendor/unitypy python3 analysis/extract_item_names.py`（读缓存 bundle，不联网）。
 
 每份数据都由**同一 ConfigPackage bundle**（`cache/petbook/<fh>.bundle`，含 `petbook.bytes`/`monsters.bytes`/`skilltypes.bytes`/`moves.bytes`/`skill_effect.bytes`/`effecticon.bytes`/`effectag.bytes`）解析，随游戏版本自动刷新；状态文件：`.petbook_state.json` / `.pet_attr_state.json` / `.skills_state.json` / `.soulmarks_state.json`（均已加入 `.gitignore`）。
 
