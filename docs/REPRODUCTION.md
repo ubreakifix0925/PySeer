@@ -24,6 +24,7 @@
 | 战斗相关包（2503/2504/2505/2506/2404/2407/…） | `app/seer/fightinfo.py` |
 | 命令号 map | `app/cmdmap.json`（由 `refs/seerpacket/Command.cs` 生成） |
 | 运行时数据（名字/属性/技能/魂印） | `app/assets_updater.py` 产出到 `data/*.json` |
+| 物品名提取 | `app/assets_updater.py::regenerate_item_names` → `data/item_names.json`（见 §7.1） |
 | 抓包离线分析器 | `analysis/analyze_gamedump.py` + 产物 `analysis/gamedump4_*.txt/csv` |
 
 ---
@@ -297,7 +298,7 @@ lockedSkillArr(5×u32), commonChangeFaceValue.
 
 ## 7. 运行时数据管线（`app/assets_updater.py`）
 
-WebUI 的精灵名字/属性/技能/魂印全部**从游戏资源自更新**，不依赖静态他人表：
+WebUI 的精灵名字/属性/技能/魂印/物品名全部**从游戏资源自更新**，不依赖静态他人表：
 
 | 产物(在 `data/`) | 数据源(bundle 内) | 解析 |
 |---|---|---|
@@ -305,11 +306,40 @@ WebUI 的精灵名字/属性/技能/魂印全部**从游戏资源自更新**，�
 | `pet_attr.json` | `monsters.bytes` + `skilltypes.bytes` | `parse_monsters`/`parse_skill_types` |
 | `skills.json` | `moves.bytes` + `skill_effect.bytes` | `parse_moves`/`parse_skill_effects` |
 | `soulmarks.json` | `effecticon.bytes` + `effectag.bytes` | 魂印 |
+| `item_names.json` | `itemsoptimizecatitems{N}.bytes` + `midleitems.bytes` + `midleexchangeitems.bytes` | `regenerate_item_names` |
 | `head/*.png` | DefaultPackage `_pet_head_*.bundle` | `extract_pet_avatars` |
 | `effecticon/*.png` | DefaultPackage `_effecticon_*.bundle` | `ensure_effect_icons` |
 
 每个产物有**版本状态文件**（`data/.xx_state.json`），命中版本即跳过。
 UnityPy 若不是标准库，会自动 `pip install` 到 `vendor/unitypy`（不污染系统）。
+
+### 7.1 物品名提取（`data/item_names.json`）
+
+物品定义是 C# 风格二进制表（`[bool][int32][string(u16+UTF-8)]` 序列化），分布在
+`assets/game/configs/bytes/` 下的若干 `.bytes`。每条记录含**物品 id(int32 小端)** + **物品名**。
+多数表用**固定 K 对齐**即可解出：物品 id 恰好位于**名字长度前缀前 K 字节**处（实测 K∈{8,12,16}，
+~100% 命中）：
+
+```
+[ ... 字段 ... ][id u32][ (K-4) 字节 ... ][name_len u16][name UTF-8][ 字段 ... ]
+```
+
+按数据源分类：
+
+| 数据源 | 结构 | 解析 |
+|---|---|---|
+| `itemsoptimizecatitems{N}`（时装/收藏/主道具/…） | 固定 K（8/12/16） | `_item_best_offset` + `_extract_item_pairs` |
+| `itemsoptimizecatitems3`（宠物道具/药剂） | 可变长字段 `[id][u32][u32][u16 前缀][前缀][i32][u16 名][名]…`，id 逐字节定位 | `_parse_pet_item_records`（带内 300xxx） |
+| `midleitems` / `midleexchangeitems`（中间/交换物品） | 固定 K=8 `[id][u32][名]` | `_extract_item_pairs` |
+| `itemsoptimizecatitems0`（资源/货币） | 资源小序号 id（名字长度前缀前 12 字节，1..15） | `_extract_resource_names` |
+
+- **`data/item_names.json`** = `{"<物品id>": "<物品名>"}`，约 **32055** 条，覆盖全部物品大类 +
+  中间物品 + 资源/货币（赛尔豆 id=1、钻石 id=5、燃料 id=15 等）。
+- **`data/item_names.json` 命中版本即跳过**（`.item_names_state.json`），随 `ensure_pet_avatars()`
+  与其它表一并刷新；也可独立离线刷新：`PYTHONPATH=vendor/unitypy python3 analysis/extract_item_names.py`。
+- 复现要点：物品 id 相邻的 `u32` 可能是"数量/等级"等常量字段（如 999/1000/65536），
+  需按**区间 + 去重**过滤（`_item_id_ok`：id∈[10000, 2×10⁷] 且非常量），
+  宠物道具类则须限制在 300xxx 带内并逐字节定位，否则会错配到别的字段。
 
 ---
 
@@ -322,6 +352,8 @@ PYTHONPATH=vendor/unitypy nohup python3 -u app/webui.py --port 8680 >/tmp/webui8
 
 # ② 手动刷新游戏数据
 PYTHONPATH=vendor/unitypy python3 app/assets_updater.py --force
+# （也可单独刷新物品名，不联网读本地缓存 bundle）
+PYTHONPATH=vendor/unitypy python3 analysis/extract_item_names.py
 
 # ③ 脚本库自检（后端已登录后；会刷背包并打印 43706 包体）
 PYTHONPATH=vendor/unitypy python3 -m app.PySeer
