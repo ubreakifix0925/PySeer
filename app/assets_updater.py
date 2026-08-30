@@ -144,7 +144,7 @@ class UpdaterError(Exception):
 
 
 def log(msg):
-    print(f"[头像更新] {msg}", flush=True)
+    print(f"[资源更新] {msg}", flush=True)
 
 
 def _ensure_data_dirs():

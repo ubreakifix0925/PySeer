@@ -4185,13 +4185,13 @@ def main():
             if _upd.get("skipped"):
                 log("info", f"头像已是最新 (版本 {_upd.get('version')}), 跳过更新")
             elif _upd.get("ok"):
-                log("info", f"头像更新完成 (版本 {_upd.get('version')})")
+                log("info", f"资源更新完成 (版本 {_upd.get('version')})")
             if _upd.get("error"):
-                print(f"[头像更新] 警告: {_upd['error']}")
-                log("warn", f"头像更新未完成: {_upd['error']} (继续使用现有头像)")
+                print(f"[资源更新] 警告: {_upd['error']}")
+                log("warn", f"资源更新未完成: {_upd['error']} (继续使用现有头像)")
         except Exception as e:   # 任何异常都不阻断服务启动
-            print(f"[头像更新] 未执行更新: {e}")
-            log("warn", f"头像更新未执行: {e}")
+            print(f"[资源更新] 未执行更新: {e}")
+            log("warn", f"资源更新未执行: {e}")
     # 启动更新(或已是最新)后重读精灵数据, 让全新克隆首次部署即能看到属性/技能/魂印等
     _reload_data_maps()
     try:
