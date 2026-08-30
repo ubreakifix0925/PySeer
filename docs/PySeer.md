@@ -185,6 +185,42 @@ pkt = s.buy_item(300017, 1)        # 买 1 份中级活力药剂(物品 id=30001
 > 药剂面板常见物品 id：`300013` 高级体力药剂、`300014` 超级体力药剂、`300012` 中级体力药剂、`300016` 初级活力药剂、`300017` 中级活力药剂、`300002` 中级精灵胶囊、`300003` 高级精灵胶囊。返回完整 `Packet`。
 > ⚠️ `buy_item`/`get_item_count` 走**非对战**通道（`/api/send-recv`），对战中能否直接购买取决于后端实现。
 
+#### `get_map_players(timeout=8.0) -> list`
+拉取**当前地图上所有玩家**（`2003 LIST_MAP_PLAYER`，空请求）。按 `UserInfo.setForPeoleInfo` 逐字段解析每个玩家，返回 `list[dict]`：
+
+```python
+players = s.get_map_players()
+# [{userID, nick, pos:[x,y], fireBuff, actionType, teamID, coreCount, vip}, ...]
+```
+
+- **`fireBuff`**：对方"绿火/圣火"等级（`0`=无火；实测地图上常见 `5` 为某种火）。借火时据此挑目标。
+- **`userID`**：给 `borrow_fire` 用的米米号。
+- 每条记录已用真实 33 人应答做成**逐字节精确消耗**验证（含一个坑：`decorateList` 恒为 5 条，`_loc15_` 不作循环上界）。
+
+#### `borrow_fire(uid, timeout=8.0) -> Packet`
+向指定玩家**借火**（`4292 FIRE_ACT_COPY`）：请求包体 `[uid:int32]`。`uid` 来自 `get_map_players` 的 `userID`。
+
+```python
+pkt = s.borrow_fire(947177385)     # 向该玩家借绿火
+```
+
+#### `auto_borrow_fire(target_fire=DEFAULT_BORROW_FIRE, *, max_borrow=1, exclude_self=True, timeout=8.0) -> dict`
+**借火自动脚本一步**：拉当前地图玩家 → 挑 `fireBuff` 符合者 → 逐个借火。
+
+- `target_fire`：目标 fireBuff 值（int 或一组值）；**默认借绿火 `fireBuff==5`**（`DEFAULT_BORROW_FIRE`，实测地图最常见）；`None` 时自动取地图上**最常见的非 0 火**。
+- 排除自己（`exclude_self`）与 `userID==0`，逐个 `borrow_fire`，最多 `max_borrow` 个。
+
+```python
+r = s.auto_borrow_fire()                            # 默认借绿火(5), 借 1 个
+r = s.auto_borrow_fire(max_borrow=3)                # 借绿火, 最多 3 个
+r = s.auto_borrow_fire(target_fire=8, max_borrow=2) # 借别的火(值在 FIRE_TYPES 校准)
+# -> {"total":33, "target":[5], "candidates":[...], "borrowed":[...每个含 userID/nick/fireBuff/pkt或error]}
+```
+
+> 火焰类型见模块级 `FIRE_TYPES`（`{0:无火, 5:绿火}`，**已确认 5=绿火**；蓝/紫/金未实测，请按实际补充）。
+> 默认借的是最常见的那种=绿火(`DEFAULT_BORROW_FIRE=5`)。
+> ⚠️ `2003`/`4292` 走非对战通道（`/api/send-recv`）；借火前需先登录且**在某个地图里**（否则拉不到同屏玩家）。
+
 ### 换背包：`set_bag(ids) -> dict`
 把背包**全部**切换成指定的**物种 id 列表**，**物理重排 12 格**（前 6 = 第一背包/出战，后 6 = 第二背包/待命）。
 
@@ -567,6 +603,9 @@ print("对战结束:", b.finished)
 | `discover_backend(...)` | 自动定位后端地址 |
 | `skill_max_pp(sid)` | 按技能 id 查**最大 PP**（`data/skills.json` 的 `pp`）；查不到返回 `0` |
 | `PP_RESTORE_ITEM` | 中级活力药剂物品 id `300017`（恢复技能 PP）；`use_skill_smart` 默认用它 |
+| `parse_map_player_list(body)` | 解析 `2003 LIST_MAP_PLAYER` 应答 → `[{userID,nick,pos,fireBuff,…}]`（`UserInfo.setForPeoleInfo`） |
+| `FIRE_TYPES` | `{0:无火, 5:绿火}`（已确认 5=绿火；蓝/紫/金未实测） |
+| `DEFAULT_BORROW_FIRE` | 借火默认目标值 `5`（绿火，地图最常见） |
 | `Packet` | RECV 包体对象 |
 | `SeerError` | 库调用异常 |
 | `DEFAULT_BASE` | 兜底后端地址 `http://127.0.0.1:8680` |

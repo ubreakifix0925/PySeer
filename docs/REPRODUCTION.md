@@ -26,6 +26,7 @@
 | 运行时数据（名字/属性/技能/魂印） | `app/assets_updater.py` 产出到 `data/*.json` |
 | 物品名提取 | `app/assets_updater.py::regenerate_item_names` → `data/item_names.json`（见 §7.1） |
 | 用赛尔豆购买药剂（2601 ITEM_BUY） | 见 §7.2（反编译 `DrugBuyPanel.swf` 确认） |
+| 借火（借绿火，4291/4292） | `analysis/借火功能协议分析.md`（OtherUserInfoPanel 界面 + 2051/2052 取数 + UserInfo.fireBuff + 4291 实锤/4292 借火；玩家来源=2003 LIST_MAP_PLAYER 同地图列表） |
 | 抓包离线分析器 | `analysis/analyze_gamedump.py` + 产物 `analysis/gamedump4_*.txt/csv` |
 
 ---
@@ -385,6 +386,31 @@ SocketConnection.send(CommandID.ITEM_BUY,
 - 技能出招用 `2405 USE_SKILL`、用药用 `2406 USE_PET_ITEM`（见 §5.6）；技能**当前 PP** 由每个
   `2505` 的 `AttackValue.skillList`（`[技能id, 当前pp]`）同步到 `Battle.mySkillPP`，配合
   `use_skill_smart` 可实现在 **PP 耗尽时喝中级活力药剂(300017)回复后再出招**。
+
+### 7.3 借火（借绿火）：`4291 FIRE_ACT_NOTICE` / `4292 FIRE_ACT_COPY`（已实锤 / 推断）
+
+借火 = 向好友借"绿火（圣火）"战斗加持。功能挂在 **`OtherUserInfoPanel`**（`resource/appRes/2015/0619/OtherUserInfoPanel.swf`，
+反编译含 `mcFire` 绿火显示 + `btnFire` 借火按钮）。**取他人信息** 走 `2051 GET_SIM_USERINFO` / `2052 GET_MORE_USERINFO`
+（请求体 `[uid]`，`UserInfoManager.as` 实锤）；应答 `UserInfo` 里有 **`fireBuff`（1 字节绿火等级，`UserInfo.as` 三处
+`readUnsignedByte()` 实锤）**；借到后 `actorInfo.fireBuff` 被设置 → `BasePeoleModel.updateFireBuff()` 按等级播火焰，加对战属性。
+
+命令对：
+
+| cmd | 命令名 | 方向 | 包体 |
+|---|---|---|---|
+| 4291 | `FIRE_ACT_NOTICE` | S→C（被动推送） | `[好友 uid:int32][fireBuff:byte]` —— 5 字节 |
+| 4292 | `FIRE_ACT_COPY` | C→S（借火请求） | `[好友 uid:int32]` —— 4 字节（**推断**） |
+
+**4291（已实锤）**：服务端推送"好友火况"（无需客户端请求）；7 条真实包：
+`3869945e05`(uid=0x3869945E,fb=0x05)、`389e435300`(0x389E4353,0x00)、`35eacf6400`(0x35EACF64,0x00)、
+`35eacf6405`(同 uid,0x05)、`394c71b900`(0x394C71B9,0x00)、`1e2821b300`(0x1E2821B3,0x00)、
+`049b593c00`(0x049B593C,0x00)。**uid** = 点亮绿火的好友用户 id；**fireBuff** = 绿火等级
+（`0x00`=无火，`0x05`=火5；同一 uid 两种取值随火况变化，与 `UserInfo.fireBuff` 字节一致）。
+
+**4292（推断，按用户提供 `{userid}`）**：客户端"借火"（复制该好友的绿火），请求包体 = `[好友 uid:int32]`，
+与 4291 推送的 uid 对齐。本仓库未抓到 4292 实包；若有额外状态位则可能为 `[uid][fireBuff]`（5 字节）——待实锤。
+
+完整流程与字段语义见 `analysis/借火功能协议分析.md`。
 
 ---
 

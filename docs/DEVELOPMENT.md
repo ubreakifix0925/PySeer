@@ -183,6 +183,9 @@ print(pkt.ints, pkt.body, v)
 | `get_recv_value(cmd, params, index, timeout=8)` | **一步"发包→等 RECV→取应答第 index 个值"**：等价 `get_value(recv(cmd,params), index)` | `cmd`、`params`(发送包体)、`index`(应答参数序号) | int |
 | `get_item_count(item_id, timeout=8)` | **获取指定物品 id 的数量**：发 `42399(MULTI_ITEM_LIST)` `[1,物品id]`，取应答包体(不含命令号)的**第 3 个参数**(索引2) | `item_id`(物品id) | int |
 | `buy_item(item_id, count=1, timeout=8)` | **用赛尔豆购买指定物品 id 的数量**（药水/胶囊）：发 `2601(ITEM_BUY)` 包体 `[物品id, 数量]`（各 int32 大端，8 字节）。游戏内**买药水/胶囊**即此命令（反编译 `DrugBuyPanel`：`send(CommandID.ITEM_BUY, itemId, count)`）；需 `count×单价≤赛尔豆` 否则服务器拒绝 | `item_id`(物品id)、`count`(数量) | `Packet` |
+| `get_map_players(timeout=8)` | **拉当前地图所有玩家**：发 `2003 LIST_MAP_PLAYER`（空请求），按 `UserInfo.setForPeoleInfo` 逐字段解析 → 每个玩家 `{userID,nick,pos,fireBuff,teamID,…}`。**`fireBuff`=绿火等级（0=无火；实测地图上常为 5）；`userID` 供借火**（真实 33 人应答逐字节验证：`decorateList` 恒为 5 条，`_loc15_` 不作上界） | 无 | `list[dict]` |
+| `borrow_fire(uid, timeout=8)` | **向指定玩家借火**（`4292 FIRE_ACT_COPY`）：包体 `[uid:int32]` | `uid`(玩家米米号) | `Packet` |
+| `auto_borrow_fire(target_fire=DEFAULT_BORROW_FIRE, *, max_borrow=1, exclude_self=True)` | **借火自动脚本一步**：`get_map_players()` → 挑 `fireBuff==target_fire`（**默认借绿火 `5`**；`None`=取地图最常见非0火）→ 排除自己 → 逐个 `borrow_fire` | `target_fire`(int 或一组值)、`max_borrow`、`exclude_self` | `{total,target,candidates,borrowed}` |
 | `set_bag(ids)` | 把背包**全部**切换为指定**物种id**列表，物理重排 12 格（前6=出战，后6=待命）；读背包+仓库+**精英背包**→全部存仓库(2304)→按列表从仓库/精英取回(2304)→设首发(2308)→摆正顺序(41462) | `ids`(物种id列表，≤12) | `{"ok":True,"target":ids}` |
 | `find_pet(ids)` | **查找**指定物种 id 是否存在及所在位置，在**背包(出战/待命)+仓库+精英背包**三类来源中搜索（精英背包=2361 GET_LOVE_PET_LIST） | `ids`(id 或 id 列表) | `{str(id):{"locations":[位置...],"count":n}}` |
 

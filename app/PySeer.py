@@ -111,6 +111,10 @@ def skill_max_pp(sid, *, _reload: bool = False) -> int:
 # 用"赛尔豆"可购买的**中级活力药剂**物品 id (恢复技能 PP); 见 DrugBuyPanel 的 _itemList.
 PP_RESTORE_ITEM = 300017   # 中级活力药剂
 
+# 借火默认目标 fireBuff 值: **绿火 (fireBuff==5)** —— 实测地图最常见, 默认借它.
+# 需在 `Seer` 类定义前, 因类方法默认参数在类体执行时求值.
+DEFAULT_BORROW_FIRE = 5    # 绿火
+
 
 # ---- 后端地址自动发现 ----
 
@@ -397,6 +401,92 @@ class Seer:
         :return: 应答 ``Packet``(完整包体)
         """
         return self.recv(2601, [int(item_id), int(count)], timeout=timeout)
+
+    # ---------- 借火: 拉当前地图玩家(2003) -> 挑指定 fireBuff -> 借火(4292) ----------
+    def get_map_players(self, timeout: float = 8.0) -> list:
+        """拉取**当前地图上所有玩家** (``2003 LIST_MAP_PLAYER``), 逐条解析.
+
+        发 ``2003`` 空包体; 应答 ``[count u32][count × UserInfo(setForPeoleInfo)]``,
+        按 `UserInfo.setForPeoleInfo` 逐字段解析, 每个玩家返回 dict::
+
+            {"userID","nick","pos":[x,y],"fireBuff","actionType",
+             "teamID","coreCount", "vip"}
+
+        其中 **``fireBuff`` 是对方绿火/圣火等级** (0=无火; 实测地图上常见 ``5`` 为某种火),
+        ``userID`` 即借火时给 4292 用的米米号.
+
+        :param timeout: 等 RECV 超时(秒)
+        :return: list[dict]; 每个玩家一条
+        """
+        pkt = self.recv(2003, [], timeout=timeout)
+        return parse_map_player_list(pkt.get("body") or pkt.raw)
+
+    def borrow_fire(self, uid, timeout: float = 8.0) -> "Packet":
+        """向指定玩家**借火** (``4292 FIRE_ACT_COPY``): 请求包体 ``[uid:int32]``.
+
+        :param uid: 目标玩家的米米号 (来自 ``get_map_players`` 的 ``userID``)
+        :param timeout: 等 RECV 超时(秒)
+        :return: 应答 ``Packet``
+        """
+        return self.recv(4292, [int(uid)], timeout=timeout)
+
+    def auto_borrow_fire(self, target_fire=DEFAULT_BORROW_FIRE, *, max_borrow: int = 1,
+                         exclude_self: bool = True, timeout: float = 8.0) -> dict:
+        """**借火自动脚本一步**: 拉当前地图玩家 → 挑 ``fireBuff`` 符合者 → 逐个借火.
+
+        流程:
+          1) ``get_map_players()`` 拿到当前地图所有玩家 (uid + fireBuff)。
+          2) 按 ``fireBuff`` 过滤: 目标类型。``target_fire`` 可以是单个值/一组值;
+             默认为 ``DEFAULT_BORROW_FIRE``(绿火, fireBuff==5); 传 ``None`` 则取地图上
+             **最多的非 0 fireBuff** 值 (即"大家都在用哪种火"就借哪种)。
+          3) 排除自己 (``exclude_self``) 与已是火0的, 逐个 ``borrow_fire(uid)``,
+             最多借 ``max_borrow`` 个。
+
+        :param target_fire: 目标 fireBuff 值 (int) 或一组值 (set/list); 默认借绿火(5); None=自动挑最常见非0火
+        :param max_borrow: 最多借几个 (默认 1)
+        :param exclude_self: 是否排除自己 (默认 True)
+        :param timeout: 等应答超时(秒)
+        :return: {"total":N, "target": <fireBuff>, "candidates":[...], "borrowed":[...]}
+        """
+        players = self.get_map_players(timeout=timeout)
+
+        # 确定目标 fireBuff
+        if target_fire is None:
+            from collections import Counter as _C
+            c = _C(p["fireBuff"] for p in players if p["fireBuff"] > 0)
+            target_fire = c.most_common(1)[0][0] if c else None
+
+        if isinstance(target_fire, (list, tuple, set)):
+            targets = set(int(x) for x in target_fire)
+        else:
+            targets = {int(target_fire)} if target_fire is not None else set()
+
+        # 过滤候选
+        cands = []
+        for p in players:
+            if p["fireBuff"] not in targets:
+                continue
+            if exclude_self and p["userID"] == getattr(self, "account", None):
+                continue
+            if p["userID"] == 0:
+                continue
+            cands.append(p)
+
+        # 逐个借
+        borrowed = []
+        for p in cands[:max_borrow]:
+            try:
+                r = self.borrow_fire(p["userID"], timeout=timeout)
+                borrowed.append({"userID": p["userID"], "nick": p["nick"],
+                                 "fireBuff": p["fireBuff"], "pkt": r})
+            except SeerError as e:
+                borrowed.append({"userID": p["userID"], "nick": p["nick"],
+                                 "fireBuff": p["fireBuff"], "error": str(e)})
+
+        return {"total": len(players), "target": sorted(targets) if targets else None,
+                "candidates": [{"userID": p["userID"], "nick": p["nick"], "fireBuff": p["fireBuff"]}
+                               for p in cands],
+                "borrowed": borrowed}
 
 
     # ---------- 换背包 (物种 id -> 物理重排 12 格) ----------
@@ -1259,6 +1349,130 @@ class Battle:
     def act(self, msg: str) -> dict:
         """把一条脚本动作记入后端战报(便于观察/回放). 返回后端应答 dict."""
         return self._seer._post("/api/battle/action", {"msg": str(msg)})
+
+
+# ---------- 借火: 当前地图玩家列表解析 (2003 LIST_MAP_PLAYER, UserInfo.setForPeoleInfo) ----------
+# 火焰类型 -> fireBuff 值 (0=无火)。**已确认: fireBuff==5 是绿火**(实测地图最常见, 默认借它)。
+# 蓝火/紫火/金火对应哪个值**尚未实测**, 请按实际在下面补充。
+FIRE_TYPES = {
+    0: "无火",
+    5: "绿火",
+    # 6: "蓝火", 7: "紫火", 8: "金火",   # 未实测, 请按游戏实际校准
+}
+
+
+def _fb_u32(b, o):
+    return int.from_bytes(b[o:o + 4], "big")
+
+
+def _fb_u16(b, o):
+    return int.from_bytes(b[o:o + 2], "big")
+
+
+def _fb_u8(b, o):
+    return b[o]
+
+
+def _fb_utf(b, o, n):
+    return b[o:o + n].decode("utf-8", "replace")
+
+
+def _parse_map_player_one(b, o):
+    """解析一条 2003 玩家 (UserInfo.setForPeoleInfo). 返回 (dict, next_offset)."""
+    o += 4                              # sysTime
+    user_id = _fb_u32(b, o); o += 4
+    nick = _fb_utf(b, o, 16); o += 16
+    o += 4                              # curTitle
+    o += 4                              # color
+    o += 4                              # texture
+    o += 4                              # jobTitle
+    o += 4                              # isFamous
+    o += 4                              # vipTitle
+    _v = _fb_u32(b, o); o += 4          # vip bit0 / viped bit1
+    vip = _v & 1
+    o += 1                              # isExtremeNono (u8)
+    o += 4                              # vipStage
+    action_type = _fb_u32(b, o); o += 4
+    pos_x = _fb_u32(b, o); o += 4
+    pos_y = _fb_u32(b, o); o += 4
+    o += 4                              # action
+    o += 4                              # direction
+    o += 4                              # changeShape
+    o += 4                              # darkLight
+    o += 4                              # luoboteStatus
+    o += 4                              # aresUnionTeam
+    o += 4                              # aiErFuAndMiYouLaStatus
+    o += 4                              # usersCamp
+    o += 4                              # spiritTime
+    o += 4                              # spiritID
+    o += 4                              # isBright
+    o += 4                              # specialBright
+    o += 4                              # otherPetID
+    o += 4                              # otherBright
+    o += 4                              # otherEatBright
+    o += 4                              # fightFlag
+    o += 4                              # teacherID
+    o += 4                              # studentID
+    o += 4                              # nonoState bits (u32)
+    o += 4                              # nonoColor
+    o += 4                              # superNono
+    o += 4                              # nonoChangeToPet
+    o += 4                              # transId
+    o += 4                              # transDuration
+    n_cnt = _fb_u32(b, o); o += 4       # pet-open flag count
+    o += 4 * n_cnt                      # pet-open flags (u32 × n_cnt)
+    o += 4                              # mountId
+    o += 2 + 4 + 4                      # groupIDInfo: svrID(u16)+seqID(u32)+time(u32)
+    o += 4                              # leaderID
+    o += 16                             # groupName UTFBytes(16)
+    o += 1                              # sctID (u8)
+    o += 1                              # pointID (u8)
+    team_id = _fb_u32(b, o); o += 4
+    core_count = _fb_u32(b, o); o += 4
+    o += 4                              # isShow
+    o += 2 + 2 + 2 + 2                  # logoBg/logoIcon/logoColor/txtColor (u16)
+    o += 4                              # logoWord UTFBytes(4)
+    cl = _fb_u32(b, o); o += 4          # clothes count
+    o += 8 * cl                         # clothes: (u32,u32) × cl
+    o += 4                              # topFightEffect
+    fire_buff = _fb_u8(b, o); o += 1    # KEY: 绿火/圣火等级
+    o += 4                              # tangyuan
+    o += 4                              # foolsdayMask
+    o += 4                              # tigerFightTeam
+    o += 4                              # tigerFightScore
+    o += 4                              # crackCupTeamId
+    o += 4                              # lordOfWarTeamId
+    o += 4                              # _loc15_ (read but unused as bound)
+    o += 4 * 5                          # decorateList: ALWAYS 5 entries (while _loc16_<5)
+    o += 4                              # trailing readUnsignedInt()
+    return {"userID": user_id, "nick": nick, "pos": [pos_x, pos_y],
+            "fireBuff": fire_buff, "actionType": action_type,
+            "teamID": team_id, "coreCount": core_count, "vip": vip}, o
+
+
+def parse_map_player_list(body) -> list:
+    """解析 ``2003 LIST_MAP_PLAYER`` 应答 → 玩家列表.
+
+    ``body`` 可为 ``Packet``/hex ``str``/``bytes``。返回 ``[{userID,nick,pos,fireBuff,...}]``;
+    遇到包体截断/异常时解析到哪算哪(不会抛)。
+    """
+    if isinstance(body, Packet):
+        body = body.raw
+    if isinstance(body, str):
+        body = _hex(body)
+    body = bytes(body)
+    if len(body) < 4:
+        return []
+    count = _fb_u32(body, 0)
+    o = 4
+    out = []
+    for _ in range(count):
+        try:
+            p, o = _parse_map_player_one(body, o)
+        except (IndexError, ValueError):
+            break
+        out.append(p)
+    return out
 
 
 # ---------- 取值函数 (模块级) ----------
