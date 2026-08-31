@@ -134,6 +134,9 @@ app/                    # 程序文件
 ├── mock_server.py      # 模拟网关
 ├── cmdmap.json         # 命令 id -> 命令名
 ├── requirements.txt
+├── petplans/           # 出招模式(技能循环)配置, 供脚本 import; 故意不放 scripts/ 以免误执行
+│   ├── __init__.py     # 解析 + Runner + 名称查询 (模块 docstring 即使用说明)
+│   └── 默认.py         # PLANS = {精灵物种id: 出招顺序}
 └── seer/               # 协议客户端包 (后端)
     ├── algorithm.py    # MD5/加解密/序列号
     ├── body.py         # 包体打包/拆分
@@ -158,6 +161,22 @@ deploy.sh               # 从零一键部署
 - [`docs/PySeer.md`](./docs/PySeer.md) — 第三方库 `PySeer` 完整 API
 - [`docs/REPRODUCTION.md`](./docs/REPRODUCTION.md) — 协议技术复现
 - [`docs/DEVELOPMENT.md`](./docs/DEVELOPMENT.md) — 开发成果整理
+
+## 常见问题
+
+**启动很久没反应 / Ctrl+C 打出一屏红字？**
+资源 CDN（`newseer.61.com`）的 DNS 会返回多个节点，其中某个节点可能变成"黑洞"（TCP 不拒绝也不回应）。
+Python 是按 DNS 顺序**串行**尝试的，撞上就要干等满超时（30s）才换下一个 IP，几十个请求叠起来就像卡死。
+工具已内置**节点探测**：首次访问先用 2s 短超时逐个试连，把通的排前面并缓存，启动时会打印
+`[资源更新] newseer.61.com: N 个节点可用, M 个不通(已自动跳过不通的)`。
+- 仍想跳过启动更新：`--no-update`
+- 关掉探测：环境变量 `SEER_CDN_PROBE_OFF=1`
+- 启动阶段按 Ctrl+C 只会跳过更新并**继续启动**，不再打 traceback。
+
+**脚本页看不到我的脚本？** 脚本必须是 `app/scripts/` 下的 `.py` **文件**（只扫这一层）。
+反过来，像 `app/petplans/` 这种"只给脚本 import 的配置"就该放在 `scripts/` 外面，避免被误点运行。
+
+**换了精灵/技能要改脚本？** 出招循环写在 `app/petplans/<名字>.py` 里，脚本只引用文件名，改配置不用动脚本。
 
 ## 合规
 

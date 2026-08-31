@@ -4482,6 +4482,11 @@ def main():
             if _upd.get("error"):
                 print(f"[资源更新] 警告: {_upd['error']}")
                 log("warn", f"资源更新未完成: {_upd['error']} (继续使用现有头像)")
+        except KeyboardInterrupt:
+            # 更新是网络操作, 可能慢. Ctrl+C 只跳过更新, **不应该**打一屏 traceback 或中止启动.
+            print("\n[资源更新] 已按 Ctrl+C 跳过本次资源更新, 继续用现有数据启动"
+                  " (想每次都跳过就加 --no-update)")
+            log("warn", "资源更新被用户中断, 继续使用现有数据启动")
         except Exception as e:   # 任何异常都不阻断服务启动
             print(f"[资源更新] 未执行更新: {e}")
             log("warn", f"资源更新未执行: {e}")
@@ -4530,4 +4535,8 @@ if os.path.isfile(os.path.join(_SRC_DIR, "multi.py")):
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:            # 启动阶段 Ctrl+C: 干净退出, 不打 traceback
+        print("\n已取消启动。")
+        raise SystemExit(130)

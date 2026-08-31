@@ -56,6 +56,29 @@ WebUI(http://127.0.0.1:8680)  ── 后台已登录的 SeerClient  ──▶ Py
 > 纯后端即可拿到正确资源的关键）。版本号是 `YYYYMMDDHHMMSS` 的**任意时间戳**，非整点，因此
 > 靠打网格探测不可靠；权威来源即缓存穿透后的 `.version`。
 
+> ⚠️ **CDN 节点黑洞：Python 会干等满一个超时**（2026-08 实测，已在 `_http_get()` 里修掉）。
+> `newseer.61.com` 的 DNS 会返回多个 IP，其中**某个节点会变成黑洞**——TCP connect 不拒绝也不回应：
+> ```
+> 111.42.117.187  connect OK    0.004s
+> 111.42.116.238  connect 失败  5.005s: timed out
+> ```
+> `curl` 有 Happy-Eyeballs 式并发尝试所以无感；而 Python 的 `socket.create_connection` 是
+> **按 DNS 顺序串行尝试**，撞上黑洞就要干等满 `timeout`（默认 30s）才退到下一个 IP。DNS 顺序轮询
+> ⇒ 约一半请求 +30s（同一 URL 连拉 3 次实测：0.17s / **30.16s** / **30.14s**），更新器要发几十个请求
+> ⇒ 启动看起来"卡死"。
+>
+> **解法**（`_prefer_reachable()` + `_patched_getaddrinfo()`）：首次访问某主机时逐个候选 IP 做
+> **2s 短超时探测**，把连得通的排到前面并缓存（TTL 300s），通过一个**只对探测过的主机生效**的
+> `socket.getaddrinfo` 包装器接进 urllib。**只重排序、不丢弃**任何地址（好节点将来也挂了仍能退回原行为）；
+> 调用方指定协议族/类型时按其过滤，过滤后为空就退回系统解析；其它主机完全不受影响。
+> 开关：`SEER_CDN_PROBE_OFF=1` 关闭，`SEER_CDN_PROBE_TIMEOUT` / `SEER_CDN_PROBE_TTL` 可调。
+> 效果：首次含探测 0.20s，之后 5 次共 0.62s（原来平均每次 ~15s）；启动打印
+> `[资源更新] newseer.61.com: 1 个节点可用, 1 个不通(已自动跳过不通的)`。
+>
+> 配套：`webui.py` 的启动更新块补了 `except KeyboardInterrupt`（Ctrl+C 只跳过更新、**照常启动服务**，
+> 不再打一屏 traceback——`KeyboardInterrupt` 是 `BaseException`，原来的 `except Exception` 捕不到），
+> `__main__` 也加了顶层兜底。想每次都跳过更新用 `--no-update`。
+
 ### 关键解析结构（来自真实 Solaris 解析器）
 
 **monsters.bytes**——每条记录各段均为可选，前面各带 1 字节布尔开关：
@@ -278,7 +301,94 @@ while not battle.finished:
 
 ---
 
-## 6. 目录结构（与本成果相关）
+## 6. 活动脚本：泰坦矿洞（NewTaiTanHole）全自动通关
+
+**`app/scripts/泰坦矿洞.py`** —— 目前最完整的活动脚本，覆盖"选难度 → 4 个阶段 → 领奖"全流程。
+逆向依据与命令表见 [`analysis/NewTaiTanHole流程分析.md`](../analysis/NewTaiTanHole流程分析.md)，
+迷宫算法见 [`analysis/NewTaiTanHole迷宫脚本化与收益最大化.md`](../analysis/NewTaiTanHole迷宫脚本化与收益最大化.md)。
+
+### 6.1 协议要点（已核实，纠正过早期误判）
+| 命令 | 包体 | 用途 |
+|---|---|---|
+| `42395` | `[104,1,hard,0]` | **选难度开始**（1简单/2普通/3困难）——早期误判成"挖第 N 个矿坑" |
+| `42395` | `[104,2,index+1,0]` | 迷宫走一格 |
+| `42395` | `[104,3/4/5/6/7,...]` | 重置 / 双倍开关 / 领奖 / 一键扫荡 / 记忆作战模组勾选 |
+| `42396` | `[104,hard,level]` | 发起本阶段 Boss 战 → 标准对战流 2503-2506，转 HEX 交给 `Battle` |
+| `46046` | `[n, id...]` | 读活动状态（daily_forver） |
+| `42023` | `[n, id...]` | 读 bit 值；**应答 = u32 个数 + n 个字节**（不是 int32 数组） |
+
+状态位打包：`state`=阶段<<8\|难度、`state2`=已杀boss<<8\|已用回合、`state3`=(当前格+1)<<8\|已走步数、
+`posState0/1` 每格 1 bit、`mapreward0..6` 每格 4 bit、`reward0..4` 每 u32 拆 4 字节 = 已获得的 reward id 列表。
+
+### 6.2 工程要点
+- **命令应答自标定**：活动私有命令是否回同号包未知。`act()` 第一次用 `recv` 等应答，超时就记下
+  "该命令不回包"、之后改用 `send`，且**绝不重发**（`recv` 已经把包发出去了，重发 = 多走一格/多点一次）。
+- **每步重读状态**再决策，不猜服务器的推进规则；配合"连续 3 步状态无变化即停"的卡死保护和领奖次数保护。
+- **分阶段阵容** `STAGE_TEAM`：列表顺序 = 上场/替补顺序；只有阵容变化才发 `set_bag`
+  （阶段2 连打 6 场不会反复搬背包）；`set_bag` 找不到精灵时原本 `SystemExit` 会杀掉脚本，已改为抛 `SeerError` 干净停止。
+- **迷宫求解**：连通性剪枝贪心（多次随机重启）+ 分支限界；保证**恰好走满步数**同时最大化权重。
+  实测简单/普通可**穷尽证明最优**，困难 4s 内 ≈99.7%。
+- CLI：`--status` / `--hard` / `--all` / `--dry-run` / `--reset` / `--plan`。
+
+### 6.3 配套产物
+| 文件 | 作用 |
+|---|---|
+| `analysis/taitan_rewards.py` | 从 Config.xml + `data/item_names.json` + `CountermarkXMLInfo` 生成奖励总表 |
+| `refs/NewTaiTanHole/rewards_named.md` / `.json` | 68 条 reward id → 物品/**刻印**名称（刻印名取自 `<MintMark Des="...">`，`item_names.json` 里查不到） |
+| `analysis/taitan_selftest.py` | 离线自检（不连后端）：邻接规则对照 AS 源码、路径合法/走满步数、位解码、战利品解码、出招模式引擎、阶段阵容 |
+| `analysis/taitan_maze_bench.py` | 权重效果基准：随机地图上看"被放弃的是不是低优先级格" |
+
+---
+
+## 7. 出招模式包（`app/petplans/`）
+
+把"某只精灵怎么出招"固定成文件，**多个脚本共用**。
+
+### 7.1 为什么不放在 `app/scripts/`
+WebUI 的脚本列表 = `app/scripts` 下的 `*.py`（`webui.py::list_scripts`，只扫这一层的**文件**），
+放那里会被当成可运行脚本、容易误点执行。`app/petplans/` 只被 `import`，不会出现在脚本列表里；
+而 `app` 本来就在脚本子进程的 `PYTHONPATH` 上（`webui.py::_script_env`），所以 `import petplans` 直接可用。
+
+### 7.2 文件格式
+```python
+# app/petplans/默认.py
+PLANS = {
+    4648: {"rotation": [(5, 37381), 37383], "note": "5次浪打千击, 之后一直闪击"},
+    3022: {"rotation": 19248},
+    3437: 31116,
+}
+```
+
+| 写法 | 含义 |
+|---|---|
+| `37383` | 一直用这个技能（裸整数） |
+| `(5, 37381)` | 用 5 次 |
+| `[(5, 37381), 37383]` | 按顺序：5 次 37381，然后一直 37383 |
+| `{"skill":37381,"times":5}` | 同上，可另加 `"note"` |
+
+裸整数=一直用，只能放最后（放中间会告警并截断）；步骤用完后**重复最后一个技能**；
+次数非正整数、技能 id 非法等写法在加载时直接报错，不会带着错配置上战场。
+
+### 7.3 API
+```python
+import petplans
+runner = petplans.load_runner("默认")      # 或传路径
+print(runner.describe())                   # 打印带精灵名/技能名的出招表
+
+runner.reset()                             # 每场对战开始清零
+sid = runner.next_skill(pid, battle.skills, fallback=battle.skills[0])
+battle.use_skill_smart(sid)
+runner.advance(pid)                        # 出招成功后推进计数
+```
+
+- 计数按 **每场对战 × 每只精灵** 独立：换宠再换回来**接着数**，新的一场 `reset()` 清零。
+- `pet_name(id)` / `skill_name(id)` 从 `data/monster_names.json` / `data/skills.json` 懒加载
+  （skills.json 约 16MB，只在第一次真正需要时读一次并**只留名字**）。
+- 未配置的精灵走 `fallback`；配置的技能当前不可用时自动退回并告警。
+
+---
+
+## 8. 目录结构（与本成果相关）
 
 ```
 seer-login-test/
@@ -294,7 +404,11 @@ seer-login-test/
 │   │   ├── body.py           # pack_body / decode_body / parse_parts
 │   │   ├── petinfo.py        # PetInfo 各段解析 (依据 refs/*.as)
 │   │   └── ...               # client/session/tcp_client/ws_client/packet/algorithm/misc/fightinfo
+│   ├── petplans/             # ★ 出招模式包 (只被 import, 不会出现在 WebUI 脚本列表)
+│   │   ├── __init__.py       #   解析/Runner/名称查询, 模块 docstring 即使用说明
+│   │   └── 默认.py           #   PLANS = {物种id: rotation}
 │   └── scripts/              # "脚本"页默认脚本存放目录 (用户把 .py 放进来即可在页面运行)
+│       └── 泰坦矿洞.py       # ★ 泰坦矿洞全自动通关 (阵容/出招/迷宫最优路径/领奖)
 ├── data/                     # 运行时下载/生成的资源 (gitignore)
 │   ├── head/                 # 精灵头像(<物种id>.png)
 │   ├── effecticon/           # 魂印/效果图标(按 icon_id 命名)
@@ -314,6 +428,10 @@ seer-login-test/
 │   ├── analyze_gamedump.py   # 抓包离线分析器
 │   ├── extract_pet_heads.py  # 从 bundle 解精灵头像入口
 │   ├── crack_seed*.py        # 离线反推 gamedump4 会话密钥
+│   ├── taitan_rewards.py     # ★ 泰坦矿洞奖励表生成器 -> refs/NewTaiTanHole/rewards_named.md/.json
+│   ├── taitan_selftest.py    # ★ 泰坦矿洞脚本离线自检 (不连后端)
+│   ├── taitan_maze_bench.py  # ★ 迷宫权重效果基准 (随机地图)
+│   ├── NewTaiTanHole*.md     # ★ 活动流程分析 / 迷宫算法与收益最大化
 │   └── gamedump4_*.txt/csv、postlogin_*.txt、cracked_session.txt 等产物
 ├── cache/                    # 下载缓存 (get-pip.py / 各 .bundle, gitignore)
 ├── vendor/                   # 本地 pip 用具 (UnityPy/pip_tool, gitignore)
@@ -326,7 +444,7 @@ seer-login-test/
 
 ---
 
-## 7. 数据文件说明
+## 9. 数据文件说明
 
 - **petbook.json**：`{"<物种id>": "<名字>"}`，来源于 petbook.bytes，供界面回填名字。
 - **pet_attr.json**：`{"<物种id>": "<属性名>"}`，如 `"1":"草"`, `"502":"水 龙"`，来源于 monsters.bytes 基表 `type` 字段。
@@ -335,7 +453,7 @@ seer-login-test/
 
 ---
 
-## 8. 常用启动/验证
+## 10. 常用启动/验证
 
 ```bash
 # 启动 WebUI(后台, 已登录后生效); 在项目根目录运行
@@ -355,10 +473,16 @@ PYTHONPATH=vendor/unitypy python3 -m app.PySeer
 
 ---
 
-## 9. 待办/可扩展
+## 11. 待办/可扩展
 
 - 背包↔背包移动命令（仓库→背包用 2304 已确定；背包↔背包用 41462 目标空位 catchTime=0 为推断，需实测确认）。
 - 更立体的“技能/专属特性”富文本（`analyze` 中的颜色/图标标记）渲染。
 - 在 `PySeer.py` 基础上封装更高层 API：读背包（`set_bag`/`find_pet`）与**战斗**（`Battle` 对战体，
   见上）已有；后续可再封装“自动练级/刷BOSS”等复合策略（需真实对战触发 HEX 包）。
 - `refs/monsters.json`/`refs/monsters.txt` 已基本被自解析取代，仅作参照。
+- 泰坦矿洞仍待一次**真实抓包**确认的两点（脚本已按"不依赖猜测 + 能自愈"的方式写）：
+  ① `42396` 打完后 `state/state2/fightnum` 的确切推进时机；② `openPro` 的确切语义
+  （"已通关难度数" vs "已完成阶段数"）——脚本不拿它做决策，只在 `canreward>0` 时领奖并打印出来供核对。
+- 出招模式目前是"固定循环"；后续可扩展条件式（按对方属性/血量/异常状态选招），
+  格式上预留了 `{"skill":..,"times":..}` 的字典写法便于加字段。
+- 简单/普通难度的 `MAZE_WEIGHT` 仍是默认值，待按需求排序后回填。

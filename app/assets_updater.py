@@ -16,10 +16,13 @@ import json
 import os
 import re
 import shlex
+import socket
 import struct
 import subprocess
 import sys
+import threading
 import time
+import urllib.parse
 import urllib.request
 from pathlib import Path
 
@@ -175,6 +178,97 @@ def _path_is_int_name(p):
     return bool(p.suffix.lower() == ".png" and p.stem.isdigit())
 
 
+# ---------------- CDN 节点探测: 绕开"黑洞 IP" ----------------
+# 背景(2026-08 实测): newseer.61.com 的 DNS 会返回多个 IP(如 111.42.117.187 / 111.42.116.238),
+# 其中**某个节点会变成黑洞**——TCP connect 不拒绝也不回应, 一直挂到超时为止。
+#   curl 有 Happy-Eyeballs 式的并发尝试, 所以感觉不到;
+#   而 Python 的 socket.create_connection 是**按 DNS 顺序逐个串行尝试**, 撞上黑洞 IP 就要
+#   干等满一个 timeout(默认 30s) 才会退到下一个 IP。DNS 轮询顺序随机 => 大约一半的请求 +30s,
+#   更新器要发几十个请求 => 启动看起来"卡死"(实测: 同一个 URL 连拉 3 次 = 0.17s / 30.16s / 30.14s)。
+# 解决: 第一次访问某个主机时逐个 IP 做**短超时探测**, 把连得通的排到前面并缓存;
+#       只做"重新排序"不丢弃任何地址, 所以即使当前的好节点之后也挂了, 仍能退回原有行为。
+_REAL_GETADDRINFO = socket.getaddrinfo          # 必须保存原函数, 探测时不能走补丁
+_ADDR_LOCK = threading.Lock()
+_ADDR_CACHE = {}                                # (host, port) -> (排好序的 addrinfo 列表, 时间戳)
+_ADDR_TTL = float(os.environ.get("SEER_CDN_PROBE_TTL", "300"))    # 缓存多久重探一次(秒)
+_PROBE_TIMEOUT = float(os.environ.get("SEER_CDN_PROBE_TIMEOUT", "2.0"))
+_PROBE_OFF = os.environ.get("SEER_CDN_PROBE_OFF", "") not in ("", "0", "false", "False")
+_PATCHED = False
+
+
+def _probe_host(host, port):
+    """逐个候选地址短超时试连, 返回 (可连通的在前的 addrinfo 列表, 通的数量, 不通的数量)."""
+    try:
+        infos = _REAL_GETADDRINFO(host, port, 0, socket.SOCK_STREAM)
+    except OSError:
+        return None, 0, 0
+    seen, uniq = set(), []
+    for info in infos:                          # 去重(同一 IP 常出现多条)
+        key = info[4][:2]
+        if key not in seen:
+            seen.add(key)
+            uniq.append(info)
+    good, bad = [], []
+    for info in uniq:
+        af, st, proto, _canon, sa = info
+        s = socket.socket(af, st, proto)
+        s.settimeout(_PROBE_TIMEOUT)
+        try:
+            s.connect(sa)
+            good.append(info)
+        except OSError:
+            bad.append(info)
+        finally:
+            try:
+                s.close()
+            except OSError:
+                pass
+    return (good + bad), len(good), len(bad)
+
+
+def _patched_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):   # noqa: A002
+    """只对探测过的主机改变**顺序**; 其它主机原样走系统解析."""
+    with _ADDR_LOCK:
+        hit = _ADDR_CACHE.get((host, port))
+    if hit and (time.time() - hit[1]) < _ADDR_TTL:
+        # 调用方指定了协议族/类型时按其过滤; 过滤后为空就退回系统解析, 绝不返回错误的结果
+        out = [i for i in hit[0]
+               if (not family or i[0] == family) and (not type or i[1] == type)]
+        if out:
+            return out
+    return _REAL_GETADDRINFO(host, port, family, type, proto, flags)
+
+
+def _prefer_reachable(url):
+    """确保该 URL 的主机已探测过(每 TTL 探一次). 出任何问题都静默跳过, 不影响原有行为."""
+    if _PROBE_OFF:
+        return
+    global _PATCHED
+    try:
+        parts = urllib.parse.urlsplit(url)
+        host = parts.hostname
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+        if not host:
+            return
+        with _ADDR_LOCK:
+            hit = _ADDR_CACHE.get((host, port))
+            fresh = hit and (time.time() - hit[1]) < _ADDR_TTL
+        if fresh:
+            return
+        order, ngood, nbad = _probe_host(host, port)
+        if not order:
+            return
+        with _ADDR_LOCK:
+            _ADDR_CACHE[(host, port)] = (order, time.time())
+            if not _PATCHED:
+                socket.getaddrinfo = _patched_getaddrinfo
+                _PATCHED = True
+        if nbad:
+            print(f"[资源更新] {host}: {ngood} 个节点可用, {nbad} 个不通(已自动跳过不通的)")
+    except Exception:                                       # noqa: BLE001
+        return
+
+
 # ---------------- HTTP (stdlib) ----------------
 def _http_get(url, timeout=30.0, bust=True):
     """拉取 CDN 资源; 默认加**时间戳查询参数**绕过 CDN 缓存.
@@ -187,6 +281,7 @@ def _http_get(url, timeout=30.0, bust=True):
     if bust:
         sep = "&" if "?" in url else "?"
         url = f"{url}{sep}_cb={int(time.time() * 1000)}"
+    _prefer_reachable(url)          # 先把黑洞 IP 排到后面, 避免每个请求白等一个 timeout
     req = urllib.request.Request(url, headers={"User-Agent": UA, "Referer": REFERER})
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:

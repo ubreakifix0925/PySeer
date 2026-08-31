@@ -17,6 +17,7 @@
 7. [常用命令号速查](#7-常用命令号速查)
 8. [完整示例](#8-完整示例)
 9. [注意事项与边界](#9-注意事项与边界)
+10. [配套：出招模式 petplans](#10-配套出招模式-petplansapppetplans)
 
 ---
 
@@ -594,6 +595,52 @@ print("对战结束:", b.finished)
 8. **异常统一 `SeerError`**：参数错/超时/未登录/越界都会抛 `SeerError`，捕获后处理即可。
 9. **运行时数据**：`_pet_name()` 等依赖 `data/petbook.json`（自更新）；`find_pet`/`set_bag` 依赖后端的背包/仓库/精英背包解析。
 10. **`use_skill_smart` 回复 PP 依赖活力药剂**：出招前检查技能 PP，耗尽时用中级活力药剂(300017)回复。其中 `buy_item`/`get_item_count` 走**非对战**通道（`/api/send-recv`）；对战中若不能直接买药，请先在**对战外**囤好活力药剂（有货时默认走"先用再补买"分支），或设 `refill=False` 只喝不补。
+
+---
+
+## 10. 配套：出招模式 `petplans`（`app/petplans/`）
+
+`PySeer` 负责"怎么打"，`petplans` 负责"用什么招"——把某只精灵的技能循环固定成文件，多个脚本共用。
+它**不属于 `PySeer`**，是并列的一个包；放在 `app/petplans/` 而不是 `app/scripts/`，
+是因为 WebUI 的脚本列表只扫 `app/scripts` 这一层的 `.py` 文件，放那里会被误点运行。
+
+```python
+# app/petplans/默认.py
+PLANS = {
+    4648: {"rotation": [(5, 37381), 37383], "note": "5次浪打千击, 之后一直闪击"},
+    3022: {"rotation": 19248},
+    3437: 31116,
+}
+```
+
+| API | 说明 |
+|---|---|
+| `petplans.load_runner(name)` | 读 `app/petplans/<name>.py`（也接受路径）→ `Runner` |
+| `petplans.load(name)` | 返回 `(plans, meta)`；`plans={物种id:[(次数 or None, 技能id),...]}` |
+| `petplans.available()` | 列出本目录可用的出招模式文件名 |
+| `Runner.reset()` | **每场对战开始**清零计数 |
+| `Runner.next_skill(pid, avail=None, fallback=None)` | 这一手该用的技能 id |
+| `Runner.advance(pid)` | 出招成功后推进该精灵的计数 |
+| `Runner.describe()` | 打印带精灵名/技能名的出招表 |
+| `petplans.pet_name(id)` / `skill_name(id)` | 懒加载 `data/monster_names.json` / `data/skills.json` 查名字 |
+
+```python
+import petplans
+from PySeer import Battle
+
+runner = petplans.load_runner("默认")
+battle = Battle(hex_packet)
+runner.reset()
+while not battle.finished:
+    pid = (battle.my or {}).get("id")
+    sid = runner.next_skill(pid, battle.skills, fallback=battle.skills[0])
+    battle.use_skill_smart(sid)
+    runner.advance(pid)
+```
+
+写法：裸整数 = 一直用（只能放最后）；`(次数, 技能id)` = 用 N 次；`{"skill":..,"times":..}` 等价且可加 `"note"`。
+计数按 **每场对战 × 每只精灵** 独立，换宠再换回来接着数；步骤用完后重复最后一个技能。
+完整说明见 `app/petplans/__init__.py` 的模块 docstring。
 
 ---
 
