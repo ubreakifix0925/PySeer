@@ -54,6 +54,11 @@ _passive_reconnect_lock = threading.Lock()
 _passive_reconnect_pending = False   # 是否已有一个被动重连在看守(防重复)
 _passive_reconnect_at = 0.0          # 最近一次被动掉线的时刻(用于计算剩余等待)
 
+# ---- 对战结束后的自动暂停 ----
+# 每次收到对战结束包(2506)后, 后端监听线程自动暂停这么多秒, 给服务器缓冲,
+# 防止脚本立刻开启下一场导致"卡死"。
+BATTLE_END_PAUSE_SECONDS = 5
+
 _LOG_MAX = 5000
 # 源码目录 (本项目程序文件所在 app/) 与项目根目录 (其上一级)
 _SRC_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -62,6 +67,8 @@ _DATA_DIR = os.path.join(_PROJ, "data")
 _LOG_DIR = os.path.join(_PROJ, "webui_logs")
 _CRED_FILE = os.path.join(_DATA_DIR, "webui_credentials.json")
 _FILTER_FILE = os.path.join(_DATA_DIR, "webui_filter.json")
+_SCRIPT_COUNTS_FILE = os.path.join(_DATA_DIR, "script_counts.json")  # 各脚本执行次数(持久化)
+_SCRIPT_ORDER_FILE = os.path.join(_DATA_DIR, "script_order.json")    # 脚本执行顺序(拖拽排序后持久化)
 _CMDMAP_FILE = os.path.join(_SRC_DIR, "cmdmap.json")
 # 后端实际监听地址写到这里, 供 PySeer 脚本运行时自动定位 (见 PySeer.discover_backend)
 _ADDR_FILE = os.path.join(_DATA_DIR, "webui_addr.json")
@@ -72,6 +79,9 @@ SCRIPTS_DIR = os.path.join(_SRC_DIR, "scripts")
 
 # 当前正在运行的用户脚本子进程 (供"脚本"页启动/停止)
 _SCRIPT_PROC = None
+
+# 批处理(重复/全部执行)的"停止"标志: _stop_script() 置 True, 打断后续脚本
+_SCRIPT_STOP = False
 
 _SEQ = 0  # 日志单调递增序号, 前端按它去重
 _FILTER_DEFAULT = {40002, 2192, 41228, 4047, 4475, 41080, 9134, 2604, 9019,
@@ -98,6 +108,93 @@ def _save_filter(ids):
     except OSError as e:
         print(f"保存过滤名单失败: {e}")
         return False
+
+
+def _load_script_counts():
+    """读取各脚本的执行次数 (script_counts.json); 无文件/损坏时返回空 dict."""
+    try:
+        with open(_SCRIPT_COUNTS_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return {}
+    out = {}
+    if isinstance(d, dict):
+        for k, v in d.items():
+            try:
+                n = int(v)
+            except (TypeError, ValueError):
+                continue
+            if n < 1:
+                n = 1
+            if n > 1000:
+                n = 1000
+            out[str(k)] = n
+    return out
+
+
+def _save_script_counts(counts):
+    """把各脚本执行次数写入 script_counts.json."""
+    try:
+        with open(_SCRIPT_COUNTS_FILE, "w", encoding="utf-8") as f:
+            json.dump(counts, f, ensure_ascii=False, indent=2)
+        return True
+    except OSError as e:
+        print(f"保存脚本执行次数失败: {e}")
+        return False
+
+
+def _merge_script_counts(incoming):
+    """把前端上报的 {名:次数} 合并进已保存的次数, 写盘后返回完整 map."""
+    counts = _load_script_counts()
+    for k, v in (incoming or {}).items():
+        try:
+            n = int(v)
+        except (TypeError, ValueError):
+            continue
+        if n < 1:
+            n = 1
+        if n > 1000:
+            n = 1000
+        counts[str(k)] = n
+    _save_script_counts(counts)
+    return counts
+
+
+def _load_script_order():
+    """读取脚本执行顺序 (script_order.json); 无文件/损坏时返回空 list."""
+    try:
+        with open(_SCRIPT_ORDER_FILE, "r", encoding="utf-8") as f:
+            d = json.load(f)
+    except (OSError, json.JSONDecodeError, ValueError):
+        return []
+    if isinstance(d, dict):
+        d = d.get("order", [])
+    if not isinstance(d, list):
+        return []
+    return [str(x) for x in d]
+
+
+def _save_script_order(order):
+    """把脚本执行顺序写入 script_order.json (仅保留当前目录里仍存在的脚本)."""
+    cur = set(list_scripts())
+    pruned = [n for n in order if n in cur]
+    try:
+        with open(_SCRIPT_ORDER_FILE, "w", encoding="utf-8") as f:
+            json.dump({"order": pruned}, f, ensure_ascii=False, indent=2)
+        return True
+    except OSError as e:
+        print(f"保存脚本顺序失败: {e}")
+        return False
+
+
+def _effective_script_order():
+    """合并已存顺序与当前目录: 已存顺序里仍存在的脚本在前, 新脚本按名追加在后."""
+    cur = list_scripts()            # 当前目录下的 .py 脚本(已按名排序)
+    cur_set = set(cur)
+    saved = _load_script_order()
+    out = [n for n in saved if n in cur_set]          # 保留已存顺序里仍存在的
+    out += [n for n in cur if n not in set(out)]      # 追加新出现的脚本(目录序)
+    return out
 
 
 _FILTER_IDS = _load_filter()  # 运行时可改, 同时持久化到 webui_filter.json
@@ -504,6 +601,10 @@ def _update_battle(cmd, hex_body, me_id):
                                 "_ready_sent_mode": None, "lastCmd": 2506})
                 _b()["version"] += 1
             log("info", "对战(2506): 对战结束, 已重置对战状态")
+            # 收到对战结束包后**自动暂停**几秒(默认 5s): 给服务器缓冲, 防止脚本立即
+            # 开启下一场而导致"卡死"。此处在监听线程里 sleep, 结束后该线程会暂停,
+            # 下一场 2503/2504 会稍后处理(脚本端 wait/wait_round 未受影响)。
+            time.sleep(BATTLE_END_PAUSE_SECONDS)
         elif cmd in (2405, 2394, 2410, 2507, 2508, 2404):
             # 其它回合/技能相关包: 仅更新状态, 不进精简战报
             with _LOCK:
@@ -1226,12 +1327,8 @@ def _script_env():
     return env
 
 
-def _run_script(name, path):
-    """后台线程: 用 subprocess 运行选中脚本, 把 stdout/stderr 实时打进"脚本输出"控制台.
-
-    每个输出都走 log("script", ...) 通道, 前端把这级日志单独渲染到"脚本输出"控制台,
-    不混进封包日志. error 也单独记录到封包日志.
-    """
+def _run_one(name, path):
+    """运行单个脚本子进程, 把 stdout/stderr 实时打进"脚本输出"控制台."""
     global _SCRIPT_PROC
     import subprocess, sys
     log("script", f"▶ 开始运行脚本 {name} ...")
@@ -1257,9 +1354,32 @@ def _run_script(name, path):
         _SCRIPT_PROC = None
 
 
+def _run_script(name, path):
+    """后台线程: 运行单个脚本(兼容旧接口)."""
+    global _SCRIPT_STOP
+    _SCRIPT_STOP = False
+    _run_one(name, path)
+
+
+def _run_script_batch(jobs):
+    """后台线程: **依次**运行一批脚本 ``[(name, path), ...]``; 每个跑完才跑下一个.
+
+    支持"重复执行"与"全部执行": 调用方把要跑的脚本按顺序放进 ``jobs`` 即可。
+    运行中若点了"停止脚本", 打断后续所有脚本。
+    """
+    global _SCRIPT_STOP
+    _SCRIPT_STOP = False
+    for name, path in jobs:
+        if _SCRIPT_STOP:
+            break
+        _run_one(name, path)
+    log("script", "✔ 批处理(重复/全部)执行完毕")
+
+
 def _stop_script():
-    """终止当前正在运行的脚本子进程 (若有)."""
-    global _SCRIPT_PROC
+    """终止当前正在运行的脚本子进程 (若有), 并打断后续批处理(重复/全部)脚本."""
+    global _SCRIPT_PROC, _SCRIPT_STOP
+    _SCRIPT_STOP = True
     proc = _SCRIPT_PROC
     if proc is not None and proc.poll() is None:
         try:
@@ -1632,11 +1752,12 @@ class Handler(BaseHTTPRequestHandler):
             else:
                 self._send(404, "text/plain", b"not found")
         elif path == "/api/scripts":
-            # "脚本"页: 默认脚本目录下的脚本列表 + 当前是否在运行
+            # "脚本"页: 默认脚本目录下的脚本列表 + 当前是否在运行 + 各脚本执行次数
             running = _SCRIPT_PROC is not None and _SCRIPT_PROC.poll() is None
             self._send(200, "application/json",
                        json.dumps({"ok": True, "dir": SCRIPTS_DIR,
-                                   "scripts": list_scripts(), "running": running},
+                                   "scripts": _effective_script_order(), "running": running,
+                                   "counts": _load_script_counts()},
                                   ensure_ascii=False).encode("utf-8"))
         elif path == "/api/stream":
             self.handle_sse()
@@ -2097,9 +2218,50 @@ class Handler(BaseHTTPRequestHandler):
             threading.Thread(target=_run_script, args=(name, target), daemon=True).start()
             return self._send_json({"ok": True, "name": name})
 
+        elif path == "/api/scripts/run_batch":
+            # 重复执行 / 全部执行: 按顺序跑一批脚本 (每个跑完才跑下一个)。
+            # 请求: {names:[...]} 依次执行这些脚本; 或 {name, repeat:N} 把同一个脚本重复 N 次。
+            base = os.path.realpath(SCRIPTS_DIR)
+            names = [str(n).strip() for n in (data.get("names") or []) if str(n).strip()]
+            repeat = int(data.get("repeat", 1) or 1)
+            name = str(data.get("name", "")).strip()
+            if name:
+                if repeat < 1:
+                    repeat = 1
+                names = [name] * min(repeat, 1000)
+            if not names:
+                return self._send_json({"ok": False, "error": "缺少脚本名"}, 400)
+            jobs = []
+            for nm in names:
+                tgt = os.path.realpath(os.path.join(SCRIPTS_DIR, nm))
+                if os.path.commonpath([base, tgt]) != base or not os.path.isfile(tgt):
+                    return self._send_json({"ok": False, "error": f"非法或不存在脚本: {nm}"}, 400)
+                jobs.append((nm, tgt))
+            if len(jobs) > 2000:
+                return self._send_json({"ok": False, "error": f"执行队列过长(>{len(jobs)}次), 请调小执行次数"}, 400)
+            if _SCRIPT_PROC is not None and _SCRIPT_PROC.poll() is None:
+                return self._send_json({"ok": False, "error": "已有脚本在运行"}, 400)
+            threading.Thread(target=_run_script_batch, args=(jobs,), daemon=True).start()
+            return self._send_json({"ok": True, "total": len(jobs), "names": [n for n, _ in jobs]})
+
         elif path == "/api/scripts/stop":
             # 停止当前正在运行的脚本子进程
             return self._send_json({"ok": True, "stopped": _stop_script()})
+
+        elif path == "/api/scripts/counts":
+            # 保存各脚本执行次数(前端每次改动后自动上报), 持久化到 script_counts.json
+            incoming = data.get("counts") or {}
+            counts = _merge_script_counts(incoming)
+            return self._send_json({"ok": True, "counts": counts})
+
+        elif path == "/api/scripts/order":
+            # 保存脚本执行顺序(拖拽排序后自动上报), 持久化到 script_order.json
+            incoming = data.get("order") or []
+            if not isinstance(incoming, list):
+                incoming = []
+            order = [str(x) for x in incoming]
+            _save_script_order(order)   # 内部会裁剪掉已不存在的脚本
+            return self._send_json({"ok": True, "order": _effective_script_order()})
 
         elif path == "/api/battle/send":
             # 对战页发包: {cmd, body, encode} (命令号可为任意对战命令, 用当前连接发送)
@@ -2400,10 +2562,17 @@ button.off:hover{background:var(--elev-2);border-color:var(--line-2)}
 .filterbar button{margin:0}
 
 /* ---- 脚本列表 ---- */
-.script-item{display:block;width:100%;text-align:left;padding:8px 12px;border:0;border-bottom:1px solid var(--line);
+.script-item{display:flex;align-items:center;gap:8px;width:100%;text-align:left;padding:8px 12px;border:0;border-bottom:1px solid var(--line);
   background:transparent;color:var(--text);font:12.5px var(--mono);cursor:pointer;transition:background .12s}
 .script-item:hover{background:var(--elev)}
 .script-item.sel{background:linear-gradient(90deg,rgba(91,157,255,.16),rgba(91,157,255,.04));color:var(--accent)}
+.script-item .script-name{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;user-select:none}
+.script-item .script-count{width:58px;flex:none;text-align:center;padding:3px 4px;background:var(--inset);border:1px solid var(--line);color:var(--text);border-radius:5px;font:12px var(--mono)}
+.script-item .script-count:focus{outline:1px solid var(--accent)}
+.script-item .script-grip{flex:none;width:18px;text-align:center;color:var(--muted);cursor:grab;user-select:none;font-size:14px;line-height:1}
+.script-item .script-grip:active{cursor:grabbing}
+.script-item.dragging{opacity:.4}
+.script-item.dragover{outline:2px solid var(--accent);outline-offset:-2px}
 
 /* ---- 对战页 ---- */
 .fight-side{display:flex;gap:12px;align-items:center}
@@ -2639,6 +2808,11 @@ button.off:hover{background:var(--elev-2);border-color:var(--line-2)}
           <div style="color:var(--muted);padding:8px">等待加载...</div>
         </div>
         <button id="scriptRunBtn" disabled>运行选中脚本</button>
+        <div style="display:flex;gap:8px;align-items:center;margin-top:6px">
+          <button id="scriptRepeatBtn" class="off" disabled title="把选中的脚本按其右侧设置的次数依次重复执行">重复执行</button>
+          <button id="scriptAllBtn" class="off" disabled title="按列表顺序依次执行所有脚本, 各按其右侧设置的次数">全部执行</button>
+        </div>
+        <div style="font-size:11px;color:var(--muted);margin-top:4px">每个脚本右侧可单独设置执行次数：重复执行=选中脚本按次数跑，全部执行=所有脚本各按次数跑</div>
         <button id="scriptStopBtn" class="off" style="display:none">停止脚本</button>
         <div id="scriptStatus" style="font-size:12px;color:var(--muted);margin-top:6px">—</div>
       </div>
@@ -3056,34 +3230,130 @@ document.querySelectorAll('.tabs .tab').forEach(t=>{
 
 // ---- "脚本"页: 列出默认目录脚本, 可选择运行 ----
 let scriptsList=[];
+let dragSrcName=null;  // 拖拽排序时记录被拖动的脚本名
+let scriptCounts={};   // {脚本名: 执行次数} —— 列表里每个脚本单独设置(持久化在后端 script_counts.json)
+// 执行次数改动后自动上报后端; 加载时由 /api/scripts 返回的 counts 初始化
+function _saveScriptCounts(){
+  fetch('/api/scripts/counts',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({counts:scriptCounts})}).catch(()=>{});
+}
+// 拖拽排序后自动上报后端; 列表从上到下的顺序即为执行次序(持久化在后端 script_order.json)
+function _saveScriptOrder(){
+  fetch('/api/scripts/order',{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({order:scriptsList})}).catch(()=>{});
+}
 const scriptRunBtn=document.getElementById('scriptRunBtn');
 const scriptStopBtn=document.getElementById('scriptStopBtn');
 const scriptStatusEl=document.getElementById('scriptStatus');
+const scriptRepeatBtn=document.getElementById('scriptRepeatBtn');
+const scriptAllBtn=document.getElementById('scriptAllBtn');
+let _runPollTimer=null;   // 运行中轮询 /api/scripts, 检测结束后复位按钮
+function _markScriptRunning(on){
+  scriptRunBtn.disabled=on || !scriptRunBtn.dataset.name;
+  scriptRepeatBtn.disabled=on || !scriptRunBtn.dataset.name;
+  scriptAllBtn.disabled=on || !scriptsList.length;
+  scriptStopBtn.style.display=on?'inline-block':'none';
+  if(on){
+    clearInterval(_runPollTimer);
+    _runPollTimer=setInterval(async()=>{
+      try{
+        const r=await fetch('/api/scripts'); const j=await r.json();
+        if(!j.running){
+          clearInterval(_runPollTimer); _runPollTimer=null;
+          _markScriptRunning(false);
+          scriptStatusEl.textContent='✔ 已执行完毕'; scriptStatusEl.style.color='var(--green)';
+        }
+      }catch(e){}
+    },2000);
+  }else{ clearInterval(_runPollTimer); _runPollTimer=null; }
+}
+function _runBatch(payload){
+  scriptOutEl.innerHTML='';   // 每次运行前清空输出控制台
+  scriptStatusEl.textContent='正在启动批处理 ...'; scriptStatusEl.style.color='var(--amber)';
+  _markScriptRunning(true);
+  fetch('/api/scripts/run_batch',{method:'POST',headers:{'Content-Type':'application/json'},
+        body:JSON.stringify(payload)})
+    .then(r=>r.json())
+    .then(j=>{
+      if(j.ok){ scriptStatusEl.textContent='已启动 '+(j.total||0)+' 次执行: '+(j.names||[]).slice(0,6).join(', ')+(j.total>6?' …':''); scriptStatusEl.style.color='var(--green)'; }
+      else{ scriptStatusEl.textContent='启动失败: '+(j.error||''); scriptStatusEl.style.color='var(--red)'; _markScriptRunning(false); }
+    })
+    .catch(e=>{ scriptStatusEl.textContent='启动出错: '+e; scriptStatusEl.style.color='var(--red)'; _markScriptRunning(false); });
+}
 async function loadScripts(){
   try{
     const r=await fetch('/api/scripts'); const j=await r.json();
     document.getElementById('scriptDir').textContent=j.dir||'—';
     scriptsList=j.scripts||[];
-    const box=document.getElementById('scriptList');
-    box.innerHTML='';
-    if(!scriptsList.length){
-      const d=document.createElement('div'); d.style.cssText='color:var(--muted);padding:8px';
-      d.textContent='（该目录暂无脚本, 把 .py 脚本放进上面所示的目录即可）'; box.appendChild(d);
-    }
-    scriptsList.forEach(nm=>{
-      const b=document.createElement('div');
-      b.className='script-item'; b.textContent=nm; b.dataset.name=nm;
-      b.onclick=()=>{
-        document.querySelectorAll('#scriptList .script-item').forEach(x=>x.classList.remove('sel'));
-        b.classList.add('sel');
-        scriptRunBtn.disabled=false;
-        scriptRunBtn.dataset.name=nm;
-        scriptStatusEl.textContent='已选择: '+nm; scriptStatusEl.style.color='var(--muted)';
-      };
-      box.appendChild(b);
-    });
-    if(j.running){ scriptStopBtn.style.display='inline-block'; }
+    if(j.counts && typeof j.counts==='object') scriptCounts=Object.assign({}, j.counts);  // 从后端恢复已存次数
+    renderScriptItems();
+    scriptAllBtn.disabled = false;
+    // 按后端是否在运行来复位按钮(刷新时); 未在运行则恢复可点
+    _markScriptRunning(!!j.running);
   }catch(e){}
+}
+// 把 scriptsList(已是执行顺序) 渲染成可拖拽的脚本项; 拖拽/次数改动后由各自回调处理
+function renderScriptItems(){
+  const box=document.getElementById('scriptList');
+  box.innerHTML='';
+  if(!scriptsList.length){
+    const d=document.createElement('div'); d.style.cssText='color:var(--muted);padding:8px';
+    d.textContent='（该目录暂无脚本, 把 .py 脚本放进上面所示的目录即可）'; box.appendChild(d);
+    return;
+  }
+  scriptsList.forEach(nm=>{
+    if(!(nm in scriptCounts)) scriptCounts[nm]=1;
+    const b=document.createElement('div');
+    b.className='script-item'; b.dataset.name=nm; b.draggable=true;
+    const grip=document.createElement('span');
+    grip.className='script-grip'; grip.textContent='⠿'; grip.title='拖拽调整执行顺序';
+    const name=document.createElement('span');
+    name.className='script-name'; name.textContent=nm; name.title=nm;
+    const cnt=document.createElement('input');
+    cnt.type='number'; cnt.className='script-count'; cnt.min='1'; cnt.step='1';
+    cnt.value=String(scriptCounts[nm]); cnt.title='该脚本执行次数(1=只跑一次)';
+    cnt.onclick=(e)=>e.stopPropagation();   // 点次数框不要误触发整行"选中"
+    cnt.oninput=()=>{ let v=parseInt(cnt.value,10); if(!v||v<1) v=1; if(v>1000) v=1000; scriptCounts[nm]=v; _saveScriptCounts(); };
+    cnt.onchange=()=>{ let v=parseInt(cnt.value,10); if(!v||v<1) v=1; if(v>1000) v=1000; scriptCounts[nm]=v; cnt.value=String(v); _saveScriptCounts(); };
+    b.appendChild(grip); b.appendChild(name); b.appendChild(cnt);
+    b.onclick=()=>{
+      document.querySelectorAll('#scriptList .script-item').forEach(x=>x.classList.remove('sel'));
+      b.classList.add('sel');
+      scriptRunBtn.disabled=false;
+      scriptRunBtn.dataset.name=nm;
+      scriptRepeatBtn.disabled=false;
+      scriptStatusEl.textContent='已选择: '+nm; scriptStatusEl.style.color='var(--muted)';
+    };
+    // —— 拖拽排序 ——
+    b.ondragstart=(e)=>{
+      if(e.target.tagName==='INPUT'){ e.preventDefault(); return; }   // 从次数框起手不触发拖拽
+      dragSrcName=nm; b.classList.add('dragging');
+      e.dataTransfer.effectAllowed='move';
+      try{ e.dataTransfer.setData('text/plain', nm); }catch(_){}
+    };
+    b.ondragover=(e)=>{ e.preventDefault(); e.dataTransfer.dropEffect='move'; };
+    b.ondragenter=(e)=>{ e.preventDefault(); b.classList.add('dragover'); };
+    b.ondragleave=()=>{ b.classList.remove('dragover'); };
+    b.ondrop=(e)=>{
+      e.preventDefault(); b.classList.remove('dragover');
+      if(!dragSrcName || dragSrcName===nm) return;
+      const rect=b.getBoundingClientRect();
+      const after=(e.clientY - rect.top) > rect.height/2;   // 落在上半→插前面, 下半→插后面
+      let from=scriptsList.indexOf(dragSrcName);
+      if(from<0) return;
+      scriptsList.splice(from,1);                            // 先从原位置移除
+      let to=scriptsList.indexOf(nm);                        // 在缩短后的列表里找目标位置
+      if(to<0) to=scriptsList.length;
+      if(after) to=to+1;
+      scriptsList.splice(to,0,dragSrcName);
+      dragSrcName=null;
+      renderScriptItems();
+      _saveScriptOrder();                                   // 顺序自动持久化到后端
+    };
+    b.ondragend=()=>{ b.classList.remove('dragging'); dragSrcName=null;
+      document.querySelectorAll('#scriptList .script-item').forEach(x=>x.classList.remove('dragover')); };
+    box.appendChild(b);
+  });
 }
 document.getElementById('scriptRefreshBtn').onclick=loadScripts;
 scriptRunBtn.onclick=async()=>{
@@ -3091,12 +3361,35 @@ scriptRunBtn.onclick=async()=>{
   if(!nm){ appendLog({t:now(),level:'tip',msg:'请先选择要运行的脚本'}); return; }
   scriptOutEl.innerHTML='';   // 每个脚本运行前清空输出控制台, 只显示本次运行
   scriptStatusEl.textContent='正在启动 '+nm+' ...'; scriptStatusEl.style.color='var(--amber)';
+  _markScriptRunning(true);
   try{
     const r=await fetch('/api/scripts/run',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({name:nm})});
     const j=await r.json();
-    if(j.ok){ scriptStatusEl.textContent='已启动 '+nm; scriptStatusEl.style.color='var(--green)'; scriptStopBtn.style.display='inline-block'; }
-    else{ scriptStatusEl.textContent='启动失败: '+(j.error||''); scriptStatusEl.style.color='var(--red)'; scriptStopBtn.style.display='none'; }
-  }catch(e){ scriptStatusEl.textContent='启动出错: '+e; scriptStatusEl.style.color='var(--red)'; }
+    if(j.ok){ scriptStatusEl.textContent='已启动 '+nm; scriptStatusEl.style.color='var(--green)'; }
+    else{ scriptStatusEl.textContent='启动失败: '+(j.error||''); scriptStatusEl.style.color='var(--red)'; _markScriptRunning(false); }
+  }catch(e){ scriptStatusEl.textContent='启动出错: '+e; scriptStatusEl.style.color='var(--red)'; _markScriptRunning(false); }
+};
+// 按每个脚本各自的"执行次数"展开成待执行队列(顺序: 脚本A跑nA次, 再脚本B跑nB次 ...)
+function _expandCounts(list){
+  const out=[];
+  for(const nm of list){
+    let n=parseInt(scriptCounts[nm],10);
+    if(!n || n<1) n=1;
+    if(n>1000) n=1000;            // 单脚本上限, 防止误填过大
+    for(let k=0;k<n;k++) out.push(nm);
+  }
+  return out;
+}
+// 重复执行: 把选中的脚本按其右侧设置的次数依次重复跑
+scriptRepeatBtn.onclick=()=>{
+  const nm=scriptRunBtn.dataset.name;
+  if(!nm){ appendLog({t:now(),level:'tip',msg:'请先选择要运行的脚本'}); return; }
+  _runBatch({names:_expandCounts([nm])});
+};
+// 全部执行: 按列表顺序依次跑所有脚本, 各按其右侧设置的次数
+scriptAllBtn.onclick=()=>{
+  if(!scriptsList.length){ appendLog({t:now(),level:'tip',msg:'该目录没有脚本'}); return; }
+  _runBatch({names:_expandCounts(scriptsList)});
 };
 scriptStopBtn.onclick=async()=>{
   try{ await fetch('/api/scripts/stop',{method:'POST',headers:{'Content-Type':'application/json'},body:'{}'}); }catch(e){}

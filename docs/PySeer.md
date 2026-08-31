@@ -310,13 +310,15 @@ s.reconnect(timeout=40)            # 立刻重新登录(若在线先断, 再重�
 - **换宠例外**：`change_pet`（当前精灵阵亡时的**死亡切换**）**不消耗回合**——换上新精灵后可在**同一回合**继续出招；而对**还活着的精灵主动换宠**则**消耗一回合**（见 `change_pet` 的 `death` 参数）。
 - **结束自动终止**：收到结束包(2506) 后 `finished` 置 `True`，循环自动退出。
 
-### `Battle(hex_packet=None, base=None, timeout=30.0, probe=True, entry_timeout=15.0)`
+### `Battle(hex_packet=None, base=None, timeout=30.0, probe=True, entry_timeout=15.0, heal=True)`
 - `hex_packet`：带 `cmdid` 的完整 HEX 包（对战进入输入）。给则构造时自动 `start`。
 - `entry_timeout`：进入对战/单次等待超时。
+- `heal`（默认 `True`）：**每次真正发起新对战前**，先发 `47136 PET_CURE_FREE`（免费治疗背包，空包体）把出战/待命精灵 HP/PP 全满再开战；`False` 则不治疗。治疗应答超时/失败不会阻塞开战。
 
 ```python
 from PySeer import Battle
 battle = Battle("带cmdid的完整HEX包")     # 发送对战包 + 自动进场; 失败抛 SeerError
+battle = Battle(hex, heal=False)         # 若不想要每次对战前治疗
 while not battle.finished:
     my, other = battle.my, battle.other
     if my and (my.get('hp') or 0) <= 0:
@@ -603,6 +605,7 @@ print("对战结束:", b.finished)
 | `discover_backend(...)` | 自动定位后端地址 |
 | `skill_max_pp(sid)` | 按技能 id 查**最大 PP**（`data/skills.json` 的 `pp`）；查不到返回 `0` |
 | `PP_RESTORE_ITEM` | 中级活力药剂物品 id `300017`（恢复技能 PP）；`use_skill_smart` 默认用它 |
+| `PET_CURE_FREE` | 免费治疗背包(HP/PP 全满)命令 `47136`（空包体）；`Battle(heal=True)` 每次对战前自动发它 |
 | `parse_map_player_list(body)` | 解析 `2003 LIST_MAP_PLAYER` 应答 → `[{userID,nick,pos,fireBuff,…}]`（`UserInfo.setForPeoleInfo`） |
 | `FIRE_TYPES` | `{0:无火, 5:绿火}`（已确认 5=绿火；蓝/紫/金未实测） |
 | `DEFAULT_BORROW_FIRE` | 借火默认目标值 `5`（绿火，地图最常见） |

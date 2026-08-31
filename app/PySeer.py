@@ -111,6 +111,9 @@ def skill_max_pp(sid, *, _reload: bool = False) -> int:
 # 用"赛尔豆"可购买的**中级活力药剂**物品 id (恢复技能 PP); 见 DrugBuyPanel 的 _itemList.
 PP_RESTORE_ITEM = 300017   # 中级活力药剂
 
+# 免费治疗背包全部精灵(HP/PP 全满)的命令, 空包体; 见 PetManager.as: PET_CURE_FREE
+PET_CURE_FREE = 47136      # 治疗背包
+
 # 借火默认目标 fireBuff 值: **绿火 (fireBuff==5)** —— 实测地图最常见, 默认借它.
 # 需在 `Seer` 类定义前, 因类方法默认参数在类体执行时求值.
 DEFAULT_BORROW_FIRE = 5    # 绿火
@@ -419,7 +422,7 @@ class Seer:
         :return: list[dict]; 每个玩家一条
         """
         pkt = self.recv(2003, [], timeout=timeout)
-        return parse_map_player_list(pkt.get("body") or pkt.raw)
+        return parse_map_player_list(pkt.body or pkt.raw)
 
     def borrow_fire(self, uid, timeout: float = 8.0) -> "Packet":
         """向指定玩家**借火** (``4292 FIRE_ACT_COPY``): 请求包体 ``[uid:int32]``.
@@ -921,9 +924,10 @@ class Battle:
         return bool(snap.get("active") and snap.get("my") and snap.get("other"))
 
     def __init__(self, hex_packet=None, base=None, timeout: float = 30.0, probe: bool = True,
-                 entry_timeout: float = 15.0):
+                 entry_timeout: float = 15.0, heal: bool = True):
         self._seer = Seer(base=base, timeout=timeout, probe=probe)
         self.entry_timeout = entry_timeout   # 进入对战/单次等待的超时
+        self.heal = bool(heal)               # 是否**每次对战前**免费治疗背包(47136)
         self._hex = hex_packet
         self._version = 0         # 已观察到的后端对战版本号 (用于 wait 判断"新事件")
         self._snap = {}           # 最近一次 _BATTLE 快照
@@ -957,6 +961,14 @@ class Battle:
         self._snap = pre
         if self._battle_ready(pre):                   # 本来就在对战 -> 直接认为已就绪
             return pre
+        # 是否治疗(默认 True): 每次**真正发起**新对战前, 先发 47136 PET_CURE_FREE 免费治疗背包,
+        # 让出战/待命精灵 HP/PP 全满再开战, 防止残血/PP不足卡住。
+        # 已在对战(pre ready)时不治疗; 治疗应答超时/失败不阻塞开战。
+        if self.heal:
+            try:
+                self._seer.recv(PET_CURE_FREE, [], timeout=4.0)
+            except SeerError:
+                pass
         j = self._seer._post("/api/battle/hex", {"hex": self._hex})
         if not j.get("ok"):
             raise SeerError(j.get("error", "发送对战进入包失败"))
@@ -994,15 +1006,35 @@ class Battle:
         """阻塞直到收到一回合结果(2505 NOTE_USE_SKILL)或对**战结束**, 返回该回合快照; 超时抛 SeerError.
 
         会自动跳过非回合事件(如 2404 应答/2507 更新等), 直到真正解出一回合.
+
+        判定"一回合"用 **回合计数 ``round``** 而非 ``lastCmd``: 服务器在 2505 之后常紧跟
+        ``2394 PET_BOOK_UPDATE``/``2407 换宠`` 等 NOTE, 会把 ``lastCmd`` 覆盖成非 2505,
+        导致只看 ``lastCmd==2505`` 会漏掉已到的一回合(敌人死亡切换后尤为常见)。
+        因此这里: ``round`` 一旦 > 等前值, 即视为收到新回合(即使 ``lastCmd`` 已被后续 NOTE 覆盖)。
         """
+        start_round = (self._snap or {}).get("round", 0)
         end = _time.time() + timeout
         while _time.time() < end:
             self.wait(2.0)
             if self._finished:
                 return self._snap
-            if (self._snap or {}).get("lastCmd") == 2505:
-                return self._snap
-        raise SeerError("等待回合结果(2505)超时")
+            s = self._snap or {}
+            if s.get("lastCmd") == 2505:
+                return s
+            if (s.get("round") or 0) > start_round:
+                return s          # 新回合已到(round 递增), 即使 lastCmd 被后续 NOTE 覆盖
+        # 超时: 附上当前对战状态便于定位 (是否真的在对战/是否已结束/技能/血量)
+        _snap = self._snap or {}
+        _my = _snap.get("my") or {}
+        raise SeerError(
+            f"等待回合结果(2505)超时 [{timeout}s]。当前对战状态: "
+            f"active={_snap.get('active')} finished={_snap.get('finished')} "
+            f"lastCmd={_snap.get('lastCmd')} rounds={_snap.get('round')} "
+            f"my.hp={_my.get('hp')}/{_my.get('maxHp')} my.catchTime={_my.get('catchTime')} "
+            f"skills={_snap.get('mySkills')}。"
+            "通常原因: ①对战触发包不是真实对战(cmd 应为 41129 MIBAO_FIGHT 等), 导致未进入可出招的对战; "
+            "②当前精灵已阵亡或无法行动(需先 change_pet); ③技能 id 无效。"
+        )
 
     # ---- 内部: 面向"自动回合"的等待 ----
     def _wait_entry(self, timeout: float = None):
